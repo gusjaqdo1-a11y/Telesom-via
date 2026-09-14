@@ -1,22 +1,19 @@
-# TELESOMBOT COMPANY SYSTEM
+# Telesombot — Auto Local Payment + Telesom Website Sync
 
-Telegram-only telecom company management system.
-
-## Required environment
+## ENV
 - BOT_TOKEN
 - MONGO_URI
 - ADMIN_ID
+- DB_NAME (optional)
+- PORT (optional; Render provides this)
 
-## Render
-Build: `pip install -r requirements.txt`
-Start: `python bot.py`
-Service: Web Service
+## Start
+python bot.py
 
-## Customer UI
-Customers use buttons for Numbers, VIP Numbers, Virtual Numbers, eSIM, Physical SIM, Data, Voice, SMS, Recharge, Wallet, Orders, Payments, Offers, Referral, Support, Profile and Language.
+## Local payment
+When a user selects Golis or Telesom, the bot does not display the USSD code. It creates a PAY NOW button with a `tel:` link containing the selected amount, e.g. `*883*0907868526*2#` or `*880*0907868526*2#`.
 
-## Admin UI
-Main admin opens the button-based `🛠️ ADMIN PANEL TELESOM` and gets 30 control panels. Sensitive orders/payments/requests use Confirm/Reject workflows and are logged.
+The phone's dialer/payment screen decides whether the USSD can be executed directly. Telegram/Android security restrictions can prevent fully automatic submission; the bot cannot bypass those restrictions.
 
-## Important
-This system manages catalog, inventory, orders, approvals and manual fulfillment. Real operator-side provisioning (eSIM activation, SIM activation, live balance/recharge, etc.) requires an authorized operator/API integration. The bot does not falsely claim that manual approval is automatic telecom provisioning.
+## Telesom website sync
+The bot periodically reads public Telesom pages for publicly visible products/prices and any publicly exposed SIM numbers. It does not invent inventory. Telesom's public website does not guarantee a complete live-number inventory API, so a true 100% live inventory feed would require an official Telesom API/authorized integration.
