@@ -1,0 +1,13 @@
+TEXT={
+'lang':{'so':'Luqad dooro: 🇸🇴 Somali | 🇬🇧 English | 🇸🇦 العربية','en':'Choose language: 🇸🇴 Somali | 🇬🇧 English | 🇸🇦 Arabic','ar':'اختر اللغة: 🇸🇴 الصومالية | 🇬🇧 الإنجليزية | 🇸🇦 العربية'},
+'welcome':{'so':'Ku soo dhawoow TelesomBot. Isticmaal /help si aad u aragto dhammaan adeegyada.','en':'Welcome to TelesomBot. Use /help to see all services.','ar':'مرحباً بك في TelesomBot. استخدم /help لرؤية جميع الخدمات.'},
+'help':{'so':'''📚 TelesomBot Commands\n/start — Bilow\n/help — Caawimaad\n/lang ama /language — Beddel luqadda\n/products — Kaararka iyo VIP numbers\n/cards — Virtual/VIP cards\n/vip — VIP numbers\n/buy <product_id> <method> — Iibso\n/pay <order_id> — Hel tilmaamaha lacag bixinta\n/confirm <order_id> <reference> — Gudbi caddeynta\n/orders — Dalabaadkayga\n/status <order_id> — Xaaladda dalabka\n/support <fariin> — La xiriir support\n/profile — Xogta account-ka''','en':'''📚 TelesomBot Commands\n/start — Start\n/help — Help\n/lang or /language — Change language\n/products — Cards and VIP numbers\n/cards — Virtual/VIP cards\n/vip — VIP numbers\n/buy <product_id> <method> — Buy\n/pay <order_id> — Payment instructions\n/confirm <order_id> <reference> — Submit payment proof\n/orders — My orders\n/status <order_id> — Order status\n/support <message> — Contact support\n/profile — Profile''','ar':'''📚 أوامر TelesomBot\n/start — بدء\n/help — المساعدة\n/lang أو /language — تغيير اللغة\n/products — البطاقات والأرقام VIP\n/cards — البطاقات\n/vip — أرقام VIP\n/buy <product_id> <method> — شراء\n/pay <order_id> — تعليمات الدفع\n/confirm <order_id> <reference> — إرسال إثبات الدفع\n/orders — طلباتي\n/status <order_id> — حالة الطلب\n/support <message> — الدعم\n/profile — الملف الشخصي'''},
+'notfound':{'so':'Waxaan fahmi waayay command-ka. Isticmaal /help.','en':'I did not understand that command. Use /help.','ar':'لم أفهم هذا الأمر. استخدم /help.'},
+'blocked':{'so':'Account-kaaga waa la xannibay.','en':'Your account is blocked.','ar':'تم حظر حسابك.'},
+'products_empty':{'so':'Hadda wax alaab ah lama hayo.','en':'No products are available right now.','ar':'لا توجد منتجات متاحة حالياً.'},
+'order_created':{'so':'Dalabka #{id} waa la sameeyay. Isticmaal /pay {id}.','en':'Order #{id} created. Use /pay {id}.','ar':'تم إنشاء الطلب #{id}. استخدم /pay {id}.'},
+'unknown_order':{'so':'Dalabkaas lama helin.','en':'Order not found.','ar':'الطلب غير موجود.'},
+'admin_only':{'so':'Kaliya admin ayaa heli kara.','en':'Admins only.','ar':'للمشرفين فقط.'}
+}
+LANGS={'so':'Somali','en':'English','ar':'العربية'}
+def t(key,lang='so',**kw): return TEXT.get(key,{}).get(lang,TEXT.get(key,{}).get('en',key)).format(**kw)

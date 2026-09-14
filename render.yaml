@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: telesombot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BSCScan_API_KEY
+        sync: false
