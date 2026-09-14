@@ -14,7 +14,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LabeledPrice, PreCheckoutQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LabeledPrice
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiohttp import web
@@ -38,39 +38,13 @@ db=client[DB_NAME]
 bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); router=Router(); admin_router=Router(); dp.include_router(router); dp.include_router(admin_router)
 
 class UserFlow(StatesGroup):
-    order_details=State(); target_number=State(); payment_reference=State(); support=State(); admin_input=State(); broadcast=State(); search_user=State(); number_add=State(); catalog_add=State(); quote_amount=State()
+    order_details=State(); target_number=State(); payment_reference=State(); support=State(); admin_input=State(); custom_stars=State(); broadcast=State(); search_user=State(); number_add=State(); catalog_add=State(); quote_amount=State()
 
 def now(): return datetime.now(timezone.utc)
 def uid(p): return f'{p}-{uuid.uuid4().hex[:10].upper()}'
 def money(v):
     try:return round(float(v),2)
     except:return 0.0
-
-def stars_to_usd(stars): return round(int(stars) * 0.01, 2)
-def new_referral_code(): return str(__import__('secrets').randbelow(9000000000) + 1000000000)
-
-async def ensure_referral_code(tg):
-    u=await get_user(tg)
-    if u and u.get('referral_code'): return str(u['referral_code'])
-    code=new_referral_code()
-    while await db.users.find_one({'referral_code':code}): code=new_referral_code()
-    await db.users.update_one({'telegram_id':int(tg)},{'$set':{'referral_code':code}})
-    return code
-
-async def wallet_pay_order(uid_, oid):
-    order=await db.orders.find_one({'order_id':oid,'user_id':int(uid_)})
-    if not order:return False
-    amount=money(order.get('amount'))
-    if amount<=0:return False
-    u=await get_user(uid_); available=money(((u or {}).get('wallet') or {}).get('available'))
-    if available + 0.0001 < amount:return False
-    r=await db.users.update_one({'telegram_id':int(uid_),'wallet.available':{'$gte':amount}},{'$inc':{'wallet.available':-amount,'total_spent':amount}})
-    if r.modified_count != 1:return False
-    await db.wallet_ledger.insert_one({'user_id':int(uid_),'type':'purchase','amount':-amount,'order_id':oid,'created_at':now()})
-    await db.orders.update_one({'order_id':oid},{'$set':{'status':'completed','payment_status':'paid','payment_method':'balance','paid_at':now(),'updated_at':now()}})
-    if order.get('number_id'):
-        await db.numbers.update_one({'_id':__import__('bson').ObjectId(order['number_id']),'status':'available'},{'$set':{'status':'sold','sold_to':int(uid_),'sold_at':now()}})
-    return True
 def safe(v,d='-'):
     s=str(v or '').strip()
     return escape(s if s else d, quote=False)
@@ -104,12 +78,22 @@ async def notify_admin(text,markup=None):
 
 async def ensure_user(user):
     old=await get_user(user.id)
-    update={'$set':{'username':user.username,'first_name':user.first_name,'last_name':user.last_name,'updated_at':now()},'$setOnInsert':{'telegram_id':int(user.id),'language':'en','status':'active','wallet':{'available':0.0,'pending':0.0},'total_deposited':0.0,'total_spent':0.0,'referrals':0,'referral_code':new_referral_code(),'created_at':now()}}
+    # Every customer gets a permanent unique 10-digit referral code.
+    referral_code = None
+    if old is None:
+        for _ in range(10):
+            candidate = ''.join(__import__('random').choices('0123456789', k=10))
+            if not await db.users.find_one({'referral_code': candidate}):
+                referral_code = candidate
+                break
+        referral_code = referral_code or str(user.id)[-10:].zfill(10)
+    update={'$set':{'username':user.username,'first_name':user.first_name,'last_name':user.last_name,'updated_at':now()},'$setOnInsert':{'telegram_id':int(user.id),'language':'en','status':'active','wallet':{'available':0.0,'pending':0.0},'total_deposited':0.0,'total_spent':0.0,'referrals':0,'referral_earnings':0.0,'referral_code':referral_code,'created_at':now()}}
     r=await db.users.update_one({'telegram_id':int(user.id)},update,upsert=True)
     if old is None and r.upserted_id is not None:
-        await audit(user.id,'user_registered',str(user.id),{'username':user.username})
+        await audit(user.id,'user_registered',str(user.id),{'username':user.username,'referral_code':referral_code})
         kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='👤 CUSTOMER',callback_data=f'customer:{user.id}'),InlineKeyboardButton(text='🚫 BAN',callback_data=f'ban:{user.id}')]])
-        await notify_admin('🆕 <b>NEW CUSTOMER</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none'),kb)
+        await notify_admin('🆕 <b>NEW CUSTOMER</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none')+'\n🎟 Referral Code: <code>'+safe(referral_code)+'</code>',kb)
+    return old is None and r.upserted_id is not None
 
 async def lang(tg):
     u=await get_user(tg); return (u or {}).get('language','en')
@@ -129,7 +113,8 @@ def main_kb(admin=False):
         ['📶 5G','🌐 Fiber','💰 ZAAD'],
         ['🏢 Business','🏢 Corporate','🔌 IoT'],
         ['☁️ Cloud','🎁 More Services','🎁 Offers'],
-        ['💰 Wallet','🛒 My Orders','💵 Payments'],
+        ['💰 Balance','💰 Wallet','🛒 My Orders'],
+        ['💵 Payments'],
         ['👥 Referral','🆘 Customer Support','👤 My Profile'],
         ['🌐 Language']
     ]
@@ -189,23 +174,39 @@ async def payment_methods_kb(order_id, kind):
     rows=[]
     for name in names:
         x=await db.payment_methods.find_one({'name':name,'enabled':True})
-        if not x: x={'name':name,'destination':PAYMENT_DEFAULTS.get(name),'enabled':True}
-        if x.get('enabled'): rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
+        if x or name in PAYMENT_DEFAULTS:
+            rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
     rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+async def number_page(chat, category, page=0, message=None):
+    cat={'numbers':'regular','vip':'vip','virtual':'virtual'}[category]
+    page=max(0,int(page)); size=20
+    total=await db.numbers.count_documents({'category':cat,'status':'available'})
+    rows=[]
+    async for x in db.numbers.find({'category':cat,'status':'available'}).sort('number',1).skip(page*size).limit(size):
+        rows.append([InlineKeyboardButton(text=f"{x.get('number','?')} — ${money(x.get('price')):.2f}",callback_data=f"number:{x.get('_id')}")])
+    if not rows:
+        text=f'<b>{SERVICES[category]}</b>\n\n📭 No available numbers currently.'
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Home',callback_data='home')]])
+    else:
+        total_pages=max(1,(total+size-1)//size)
+        text=f'<b>{SERVICES[category]}</b>\n\n📱 Available choices: <b>{total}</b>\nPage <b>{page+1}/{total_pages}</b>'
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton(text='⬅️ Previous',callback_data=f'numberspage:{category}:{page-1}'))
+        if (page+1)*size<total: nav.append(InlineKeyboardButton(text='Next ➡️',callback_data=f'numberspage:{category}:{page+1}'))
+        rows.append(nav) if nav else None
+        rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
+        kb=InlineKeyboardMarkup(inline_keyboard=rows)
+    if message:
+        try: await message.edit_text(text,reply_markup=kb)
+        except Exception: await chat.answer(text,reply_markup=kb)
+    else:
+        await chat.answer(text,reply_markup=kb)
+
 async def send_catalog(m,category):
     if category in ('numbers','vip','virtual'):
-        cat={'numbers':'regular','vip':'vip','virtual':'virtual'}[category]
-        rows=[]
-        if category=='vip':
-            cursor=db.numbers.find({'category':cat,'status':'available'}).sort('number',1).limit(15)
-        else:
-            cursor=db.numbers.aggregate([{'$match':{'category':cat,'status':'available'}},{'$sample':{'size':15}}])
-        async for x in cursor:
-            rows.append([InlineKeyboardButton(text=f"{x.get('number','?')} — ${money(x.get('price')):.2f}",callback_data=f"number:{x.get('_id')}")])
-        if not rows:return await m.answer('📭 No available items currently. Admin can add inventory from the panel.')
-        return await m.answer(f'<b>{SERVICES[category]}</b>\n\nShowing up to 15 available choices:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return await number_page(m,category,0)
     if category=='offers':
         rows=[]
         async for x in db.offers.find({'enabled':True}).sort('created_at',-1).limit(20): rows.append(f"🎁 <b>{safe(x.get('title'))}</b>\n{safe(x.get('text'))}")
@@ -214,22 +215,37 @@ async def send_catalog(m,category):
     prices=await db.catalog.find({'service':category,'enabled':True}).sort('price',1).to_list(30)
     if prices:
         rows=[[InlineKeyboardButton(text=f"{safe(x.get('title'))} — ${money(x.get('price')):.2f}",callback_data=f"catalog:{x['_id']}")] for x in prices]
+        rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
         return await m.answer(f'<b>{SERVICES.get(category,category)}</b>\n\nChoose a package:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await m.answer(f'📋 <b>{SERVICES.get(category,category)}</b>\n\nTap <b>📝 REQUEST SERVICE</b> to send your request.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📝 REQUEST SERVICE',callback_data=f'request:{category}')]]))
+    await m.answer(f'📋 <b>{SERVICES.get(category,category)}</b>\n\nTap <b>📝 REQUEST SERVICE</b> to send your request.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📝 REQUEST SERVICE',callback_data=f'request:{category}')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]]))
 
 @router.message(CommandStart())
 async def start(m:Message,state:FSMContext):
-    await state.clear(); old=await get_user(m.from_user.id); await ensure_user(m.from_user)
-    if old is None and m.text:
-        parts=m.text.split(maxsplit=1); code=parts[1].strip() if len(parts)>1 else ''
-        if code and re.fullmatch(r'\d{10}',code):
-            ref=await db.users.find_one({'referral_code':code})
-            if ref and int(ref.get('telegram_id')) != int(m.from_user.id):
-                await db.users.update_one({'telegram_id':m.from_user.id},{'$set':{'referred_by':int(ref['telegram_id'])}})
-                await db.users.update_one({'telegram_id':int(ref['telegram_id'])},{'$inc':{'referrals':1,'referral_earnings':0.15,'wallet.available':0.15}})
-                await db.wallet_ledger.insert_one({'user_id':int(ref['telegram_id']),'type':'referral_reward','amount':0.15,'referred_user':int(m.from_user.id),'created_at':now()})
+    await state.clear()
+    is_new=await ensure_user(m.from_user)
+    # Deep-link referral: /start=1234567890 or /start 1234567890
+    payload=''
+    parts=(m.text or '').split(maxsplit=1)
+    if len(parts)>1: payload=parts[1].strip()
+    if is_new and payload and re.fullmatch(r'\d{10}',payload):
+        referrer=await db.users.find_one({'referral_code':payload})
+        if referrer and int(referrer.get('telegram_id',0)) != int(m.from_user.id):
+            try:
+                await db.referrals.insert_one({'referral_id':uid('REF'),'referrer_id':int(referrer['telegram_id']),'referred_id':int(m.from_user.id),'code':payload,'bonus':0.15,'created_at':now()})
+                await db.users.update_one({'telegram_id':int(referrer['telegram_id'])},{'$inc':{'referrals':1,'referral_earnings':0.15,'wallet.available':0.15}})
+                await db.wallet_ledger.insert_one({'ledger_id':uid('LED'),'user_id':int(referrer['telegram_id']),'type':'referral_bonus','amount':0.15,'balance_after':money(((await get_user(int(referrer['telegram_id']))) or {}).get('wallet',{}).get('available',0)),'description':'Referral bonus','created_at':now()})
+            except Exception as e: log.warning('referral award failed: %r',e)
     admin=await is_admin(m.from_user.id)
-    await m.answer(tr(await lang(m.from_user.id),'welcome'),reply_markup=main_kb(admin))
+    name=safe(m.from_user.first_name,'there')
+    welcome=(f'🌟 <b>WELCOME TO TELESOMBOT</b> 🌟\n\n'
+             f'Hello <b>{name}</b> 👋\n\n'
+             '📱 <b>SIMs & Numbers</b>\n'
+             '📶 <b>Data • Voice • 5G</b>\n'
+             '💳 <b>Secure Payments</b>\n'
+             '💰 <b>Balance & Rewards</b>\n'
+             '🎁 <b>Referral Rewards</b>\n\n'
+             'Choose a service below and get started. 🚀')
+    await m.answer(welcome,reply_markup=main_kb(admin))
 
 # Customer buttons
 @router.message(F.text=='🏠 Customer Home')
@@ -262,6 +278,13 @@ async def service_button(m:Message):
     mapping={'📱 Numbers':'numbers','💎 VIP Numbers':'vip','🌐 Virtual Numbers':'virtual','📲 eSIM':'esim','💳 Physical SIM':'sim','📡 Data':'data','📞 Voice':'voice','💬 SMS':'sms','🔋 Recharge':'recharge','🌐 Fiber':'fiber','💰 ZAAD':'zaad','🏢 Business':'business','🏢 Corporate':'corporate','🔌 IoT':'iot','☁️ Cloud':'cloud','🎁 Offers':'offers','📶 5G':'5g'}
     await send_catalog(m,mapping[m.text])
 
+@router.callback_query(F.data.startswith('numberspage:'))
+async def numbers_page_cb(c:CallbackQuery):
+    _,category,page=c.data.split(':',2)
+    if category not in ('numbers','vip','virtual'): return await c.answer('Invalid category',show_alert=True)
+    await number_page(c.message,category,int(page),message=c.message)
+    await c.answer()
+
 @router.callback_query(F.data.startswith('number:'))
 async def number_select(c:CallbackQuery):
     try: await c.message.delete()
@@ -277,8 +300,6 @@ async def order_number(c:CallbackQuery,state:FSMContext):
     if not x:return await c.answer('Number unavailable',show_alert=True)
     oid=await create_order(c.from_user.id,x.get('category','number'),f"Number: {x.get('number')}",x.get('price',0))
     await db.orders.update_one({'order_id':oid},{'$set':{'number_id':str(x['_id'])}})
-    if await wallet_pay_order(c.from_user.id,oid):
-        await c.message.answer(f'✅ <b>Number Purchased</b>\n\nNumber: <code>{safe(x.get("number"))}</code>\nPaid from Balance: <b>${money(x.get("price")):.2f}</b>\n\nYour number is now reserved for you.',reply_markup=main_kb(await is_admin(c.from_user.id))); return await c.answer()
     await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nNumber: <code>{safe(x.get("number"))}</code>\nAmount: <b>${money(x.get("price")):.2f}</b>\n\nTap <b>💵 PAY NOW</b> to continue your payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
     await c.answer()
 
@@ -308,8 +329,6 @@ async def target_number_submit(m:Message,state:FSMContext):
     oid=await create_order(m.from_user.id,service,f'{title} | Recipient: {number}',price)
     await db.orders.update_one({'order_id':oid},{'$set':{'target_number':number,'catalog_id':d.get('catalog_id')}})
     await state.clear()
-    if await wallet_pay_order(m.from_user.id,oid):
-        await m.answer(f'✅ <b>Purchase Completed</b>\n\nService: {safe(title)}\nNumber: <code>{number}</code>\nPaid from Balance: <b>${price:.2f}</b>',reply_markup=main_kb(await is_admin(m.from_user.id))); return
     await m.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(SERVICES.get(service,service))}\nPackage: {safe(title)}\nNumber: <code>{number}</code>\nAmount: <b>${price:.2f}</b>\n\n💳 Tap <b>PAY NOW</b> to continue.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
 
 @router.callback_query(F.data.startswith('request:'))
@@ -352,11 +371,16 @@ async def local_pay(c:CallbackQuery):
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
     amount=money(order.get('amount'))
-    await c.message.edit_text(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
+    text=tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>'
+    try: await c.message.delete()
+    except Exception: pass
+    await c.message.answer(text,reply_markup=await payment_methods_kb(oid,'local'))
     await c.answer()
 
 @router.callback_query(F.data.startswith('cryptopay:'))
 async def crypto_pay(c:CallbackQuery):
+    try: await c.message.delete()
+    except: pass
     oid=c.data.split(':',1)[1]
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
@@ -376,6 +400,7 @@ async def pay_method(c:CallbackQuery,state:FSMContext):
     except: pass
     parts=c.data.split(':',2); method=parts[1]; oid=parts[2] if len(parts)>2 else ''
     x=await db.payment_methods.find_one({'name':method,'enabled':True})
+    if not x and method in PAYMENT_DEFAULTS: x={'name':method,'destination':PAYMENT_DEFAULTS[method],'enabled':True}
     if not x:return await c.answer('Payment method unavailable',show_alert=True)
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id}) if oid else None
     if oid and not order:return await c.answer('Order not found',show_alert=True)
@@ -468,75 +493,106 @@ async def pick_unpaid(c:CallbackQuery):
 @router.message(F.text=='💰 Wallet')
 async def wallet(m:Message):
     u=await get_user(m.from_user.id); w=(u or {}).get('wallet',{})
-    await m.answer(f'💰 <b>Balance</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>\nTotal deposited: ${money((u or {}).get("total_deposited")):.2f}\nTotal spent: ${money((u or {}).get("total_spent")):.2f}',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')],[InlineKeyboardButton(text='👥 Referral',callback_data='referral')]]))
-
-@router.callback_query(F.data=='addbalance')
-async def addbalance(c:CallbackQuery):
-    await c.message.edit_text('⭐ <b>Add Balance with Telegram Stars</b>\n\n100 Stars = $1.00\nMinimum: 100 Stars\nMaximum: 1000 Stars\n\nChoose an amount:',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⭐ 100 = $1',callback_data='stars:100'),InlineKeyboardButton(text='⭐ 250 = $2.50',callback_data='stars:250')],[InlineKeyboardButton(text='⭐ 500 = $5',callback_data='stars:500'),InlineKeyboardButton(text='⭐ 1000 = $10',callback_data='stars:1000')],[InlineKeyboardButton(text='✏️ Custom Stars',callback_data='stars:custom')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])); await c.answer()
-
-@router.callback_query(F.data.startswith('stars:'))
-async def stars_choice(c:CallbackQuery,state:FSMContext):
-    val=c.data.split(':')[1]
-    if val=='custom':
-        await state.set_state(UserFlow.order_details); await state.update_data(stars_custom=True); await c.message.answer('✏️ Send the number of Telegram Stars you want to add (100–1000).'); return await c.answer()
-    await send_stars_invoice(c.message,c.from_user.id,int(val)); await c.answer()
-
-async def send_stars_invoice(message, uid_, stars):
-    if stars<100 or stars>1000:return await message.answer('❌ Stars must be between 100 and 1000.')
-    usd=stars_to_usd(stars); payload=f'BALANCE:{uid_}:{stars}:{uuid.uuid4().hex[:8]}'
-    await message.answer_invoice(title='Telesombot Balance',description=f'Add ${usd:.2f} to your Telesombot balance',payload=payload,currency='XTR',prices=[LabeledPrice(label=f'${usd:.2f} Balance',amount=stars)])
-
-@router.pre_checkout_query()
-async def precheckout(q:PreCheckoutQuery):
-    await q.answer(ok=True)
-
-@router.message(F.successful_payment)
-async def stars_success(m:Message):
-    sp=m.successful_payment; payload=sp.invoice_payload
-    if not payload.startswith('BALANCE:'):return
-    parts=payload.split(':')
-    if len(parts)<3:return
-    stars=int(parts[2]); usd=stars_to_usd(stars)
-    await db.users.update_one({'telegram_id':m.from_user.id},{'$inc':{'wallet.available':usd,'total_deposited':usd}})
-    await db.wallet_ledger.insert_one({'user_id':m.from_user.id,'type':'deposit_stars','amount':usd,'stars':stars,'telegram_payment_charge_id':sp.telegram_payment_charge_id,'created_at':now()})
-    await m.answer(f'✅ <b>Balance Added</b>\n\n⭐ Stars: <b>{stars}</b>\n💰 Added: <b>${usd:.2f}</b>\n\nYour balance is now available for purchases.',reply_markup=main_kb(await is_admin(m.from_user.id)))
-
-
-@router.callback_query(F.data=='wallet_cb')
-async def wallet_cb(c:CallbackQuery):
-    u=await get_user(c.from_user.id); w=(u or {}).get('wallet',{})
-    await c.message.edit_text(f'💰 <b>Balance</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')]])); await c.answer()
-
-@router.message(UserFlow.order_details)
-async def custom_stars_submit(m:Message,state:FSMContext):
-    d=await state.get_data()
-    if not d.get('stars_custom'): return
-    try: stars=int((m.text or '').strip())
-    except: return await m.answer('❌ Send a number from 100 to 1000.')
-    if not 100<=stars<=1000:return await m.answer('❌ Stars must be between 100 and 1000.')
-    await state.clear(); await send_stars_invoice(m,m.from_user.id,stars)
-
+    await m.answer(f'💰 <b>Wallet</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>\nTotal deposited: ${money((u or {}).get("total_deposited")):.2f}\nTotal spent: ${money((u or {}).get("total_spent")):.2f}')
 @router.message(F.text=='👤 My Profile')
 async def profile(m:Message):
     u=await get_user(m.from_user.id); await m.answer(f'👤 <b>My Profile</b>\n\nID: <code>{m.from_user.id}</code>\nName: {safe(m.from_user.full_name)}\nUsername: @{safe(m.from_user.username,"none")}\nLanguage: {safe((u or {}).get("language"),"en")}\nStatus: {safe((u or {}).get("status"),"active")}')
 @router.message(F.text=='👥 Referral')
 async def referral(m:Message):
-    code=await ensure_referral_code(m.from_user.id); u=await get_user(m.from_user.id)
-    me=await bot.get_me(); link=f'https://t.me/{me.username}?start={code}'
-    await m.answer(f'👥 <b>Referral Program</b>\n\nYour referral code: <code>{code}</code>\nReward per successful referral: <b>$0.15</b>\nReferrals: <b>{int((u or {}).get("referrals",0))}</b>\nEarned: <b>${money((u or {}).get("referral_earnings",0)):.2f}</b>\n\n🔗 <code>{link}</code>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💰 Balance',callback_data='wallet_cb')]]))
-@router.message(F.text=='🌐 Language')
-async def language(m:Message):
-    await m.answer(tr(await lang(m.from_user.id),'language'),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🇬🇧 English',callback_data='lang:en'),InlineKeyboardButton(text='🇸🇴 Somali',callback_data='lang:so'),InlineKeyboardButton(text='🇸🇦 العربية',callback_data='lang:ar')]]))
-@router.callback_query(F.data.startswith('lang:'))
-async def setlang(c:CallbackQuery):
-    code=c.data.split(':')[1]; await db.users.update_one({'telegram_id':c.from_user.id},{'$set':{'language':code}}); await c.message.edit_text({'en':'🇬🇧 English selected.','so':'🇸🇴 Somali ayaa la doortay.','ar':'🇸🇦 تم اختيار العربية.'}[code]); await c.message.answer(tr(code,'welcome'),reply_markup=main_kb(await is_admin(c.from_user.id))); await c.answer()
-@router.message(F.text=='🆘 Customer Support')
-async def support(m:Message,state:FSMContext):
-    if not await get_setting('support_open',True):return await m.answer('🔒 Support is currently closed.')
-    await state.set_state(UserFlow.support); await m.answer('🆘 Send your support message. It will be delivered to admin for handling.')
-@router.message(UserFlow.support)
-async def support_submit(m:Message,state:FSMContext):
-    tid=uid('TKT'); await db.support.insert_one({'ticket_id':tid,'user_id':m.from_user.id,'message':m.text,'status':'open','created_at':now()}); await state.clear(); await notify_admin(f'🆘 <b>NEW SUPPORT TICKET</b>\n\nTicket: <code>{tid}</code>\nUser: <code>{m.from_user.id}</code>\nMessage: {safe(m.text)}',approve_kb('support',tid)); await m.answer(f'✅ Ticket <code>{tid}</code> sent to support.',reply_markup=main_kb(await is_admin(m.from_user.id)))
+    u=await get_user(m.from_user.id)
+    code=(u or {}).get('referral_code')
+    if not code:
+        code=''.join(__import__('random').choices('0123456789',k=10))
+        await db.users.update_one({'telegram_id':m.from_user.id},{'$set':{'referral_code':code}})
+    me=await bot.get_me()
+    link=f'https://t.me/{me.username}?start={code}'
+    count=int((u or {}).get('referrals',0)); earnings=money((u or {}).get('referral_earnings',0))
+    share_text=f'🌟 Join Telesombot!\n\n📱 Get Telesom numbers, SIMs, data & services.\n🎁 Join with my referral code and start earning rewards!\n\n🔗 {link}'
+    share_url='https://t.me/share/url?url='+quote(link,safe='')+'&text='+quote(share_text,safe='')
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📤 Share Referral',url=share_url)],
+        [InlineKeyboardButton(text='📋 My Referral Code',callback_data='refcode')],
+        [InlineKeyboardButton(text='💰 Balance',callback_data='balance'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
+    await m.answer(f'👥 <b>REFERRAL REWARDS</b>\n\n🎟 Your code: <code>{code}</code>\n💵 You earn: <b>$0.15</b> per successful referral\n👥 Referrals: <b>{count}</b>\n💰 Referral earnings: <b>${earnings:.2f}</b>\n\nShare your link with friends. When a new user joins through your link, the reward is added to your Balance.',reply_markup=kb)
+
+@router.callback_query(F.data=='refcode')
+async def refcode(c:CallbackQuery):
+    u=await get_user(c.from_user.id); code=(u or {}).get('referral_code','')
+    await c.answer(f'Your referral code: {code}',show_alert=True)
+
+@router.callback_query(F.data=='balance')
+async def balance_cb(c:CallbackQuery):
+    await show_balance(c.message,c.from_user.id)
+    await c.answer()
+
+@router.message(F.text=='💰 Balance')
+async def balance_message(m:Message):
+    await show_balance(m,m.from_user.id)
+
+async def show_balance(chat,user_id):
+    u=await get_user(user_id); w=(u or {}).get('wallet',{})
+    available=money(w.get('available',0)); earnings=money((u or {}).get('referral_earnings',0))
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')],
+        [InlineKeyboardButton(text='👥 Referral',callback_data='referral_inline')],
+        [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
+    await chat.answer(f'💰 <b>MY BALANCE</b>\n\nAvailable: <b>${available:.2f}</b>\nReferral earnings: <b>${earnings:.2f}</b>\n\nUse your balance to purchase eligible numbers and services.',reply_markup=kb)
+
+@router.callback_query(F.data=='referral_inline')
+async def referral_inline(c:CallbackQuery):
+    await c.answer()
+    await referral(c.message)
+
+@router.callback_query(F.data=='addbalance')
+async def add_balance(c:CallbackQuery):
+    rows=[]
+    for stars in (100,250,500,750,1000):
+        rows.append([InlineKeyboardButton(text=f'⭐ {stars} Stars = ${stars/100:.2f}',callback_data=f'stars:{stars}')])
+    rows.append([InlineKeyboardButton(text='⭐ Custom Stars',callback_data='customstars')])
+    rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
+    await c.message.edit_text('➕ <b>ADD BALANCE</b>\n\nPay with Telegram Stars.\n⭐ <b>100 Stars = $1.00</b>\n\nChoose an amount:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+@router.callback_query(F.data.startswith('stars:'))
+async def stars_invoice(c:CallbackQuery):
+    stars=int(c.data.split(':',1)[1])
+    if stars<100 or stars>1000: return await c.answer('Invalid Stars amount',show_alert=True)
+    await bot.send_invoice(c.from_user.id,title=f'Add ${stars/100:.2f} Balance',description=f'Add {stars} Telegram Stars worth of balance.',payload=f'balance:{c.from_user.id}:{stars}:{uuid.uuid4().hex}',currency='XTR',prices=[LabeledPrice(label=f'Balance ${stars/100:.2f}',amount=stars)])
+    await c.answer()
+
+@router.callback_query(F.data=='customstars')
+async def custom_stars(c:CallbackQuery,state:FSMContext):
+    await state.set_state(UserFlow.custom_stars)
+    await c.message.answer('⭐ <b>Custom Stars</b>\n\nSend the number of Telegram Stars you want to add.\nMinimum: <b>100</b> Stars.')
+    await c.answer()
+
+@router.pre_checkout_query()
+async def pre_checkout(q):
+    await q.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def successful_stars_payment(m:Message,state:FSMContext):
+    sp=m.successful_payment
+    payload=sp.invoice_payload or ''
+    if not payload.startswith('balance:'): return
+    parts=payload.split(':')
+    try: stars=int(parts[2])
+    except Exception: stars=int(sp.total_amount)
+    amount=round(stars/100,2)
+    await db.users.update_one({'telegram_id':m.from_user.id},{'$inc':{'wallet.available':amount,'total_deposited':amount}})
+    u=await get_user(m.from_user.id); available=money((u or {}).get('wallet',{}).get('available',0))
+    await db.wallet_ledger.insert_one({'ledger_id':uid('LED'),'user_id':m.from_user.id,'type':'stars_deposit','amount':amount,'balance_after':available,'stars':stars,'telegram_charge_id':sp.telegram_payment_charge_id,'created_at':now()})
+    await state.clear()
+    await m.answer(f'✅ <b>Balance Added Successfully</b>\n\n⭐ Stars: <b>{stars}</b>\n💰 Added: <b>${amount:.2f}</b>\n💳 New Balance: <b>${available:.2f}</b>',reply_markup=main_kb(await is_admin(m.from_user.id)))
+
+@router.message(UserFlow.custom_stars)
+async def custom_stars_input(m:Message,state:FSMContext):
+    try: stars=int((m.text or '').strip())
+    except: return await m.answer('❌ Send a whole number of Stars, e.g. <code>150</code>.')
+    if stars<100: return await m.answer('❌ Minimum is 100 Stars.')
+    if stars>1000000: return await m.answer('❌ Stars amount is too high.')
+    await bot.send_invoice(m.from_user.id,title=f'Add ${stars/100:.2f} Balance',description=f'Add {stars} Telegram Stars worth of balance.',payload=f'balance:{m.from_user.id}:{stars}:{uuid.uuid4().hex}',currency='XTR',prices=[LabeledPrice(label=f'Balance ${stars/100:.2f}',amount=stars)])
+    await state.clear()
 
 # Admin panels
 async def panel_text(n):
@@ -973,7 +1029,7 @@ async def telesom_sync_loop():
 
 # Database initialization: legacy-safe indexes
 async def init_db():
-    specs=[('users','telegram_id',True,'telegram_id_unique'),('numbers','number',True,None),('orders','order_id',True,'order_id_unique'),('payments','payment_id',True,'payment_id_unique'),('requests','request_id',True,'request_id_unique'),('support','ticket_id',True,'ticket_id_unique'),('staff','telegram_id',True,'staff_telegram_id_unique')]
+    specs=[('users','telegram_id',True,'telegram_id_unique'),('users','referral_code',True,'referral_code_unique'),('referrals','referred_id',True,'referred_id_unique'),('numbers','number',True,None),('orders','order_id',True,'order_id_unique'),('payments','payment_id',True,'payment_id_unique'),('requests','request_id',True,'request_id_unique'),('support','ticket_id',True,'ticket_id_unique'),('staff','telegram_id',True,'staff_telegram_id_unique')]
     for col,field,unique,name in specs:
         try:
             info=await db[col].index_information(); compatible=False
