@@ -1,29 +1,22 @@
-# Telesombot Full Telegram System
+# TELESOMBOT COMPANY SYSTEM
 
-## Required ENV
-BOT_TOKEN
-MONGO_URI
-ADMIN_ID
+Telegram-only telecom company management system.
 
-## 30 Admin panels
-Dashboard, Customers, Numbers, VIP Numbers, Virtual Numbers, eSIM, Physical SIM, Data, Voice, SMS, Recharge, Wallets, Payments, Orders, Refunds, Offers, Promo Codes, Referrals, Memberships, Support, Broadcast, Notifications, Business, Corporate, Inventory, Analytics, Staff & Permissions, Security, Audit Logs, System Settings.
+## Required environment
+- BOT_TOKEN
+- MONGO_URI
+- ADMIN_ID
 
-## User commands
-/start /help /lang /services /numbers /vip /esim /sim /virtual /data /voice /sms /recharge /business /fiber /zaad /iot /cloud /order /pay /orders /payments /wallet /referral /support /profile /contact
+## Render
+Build: `pip install -r requirements.txt`
+Start: `python bot.py`
+Service: Web Service
 
-## Admin commands
-/admin /panel 1-30 /pending /confirm REQ-ID [note] /reject REQ-ID [note] /payconfirm PAY-ID /payreject PAY-ID [note] /stats
+## Customer UI
+Customers use buttons for Numbers, VIP Numbers, Virtual Numbers, eSIM, Physical SIM, Data, Voice, SMS, Recharge, Wallet, Orders, Payments, Offers, Referral, Support, Profile and Language.
 
-## Languages
-English, Somali, Arabic. /lang en, /lang so, /lang ar.
+## Admin UI
+Main admin opens the button-based `🛠️ ADMIN PANEL TELESOM` and gets 30 control panels. Sensitive orders/payments/requests use Confirm/Reject workflows and are logged.
 
-## Payment destinations
-Golis: *883*0907868526*$#
-Telesom: *880*0907868526*$#
-BNB: 0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32
-USDT-BEP20: 0x6AC864773259fa5175251829cb0E93ffb4cE6feC
-
-The bot records payment requests as pending until an admin confirms them. Automatic telecom/ZAAD/eSIM provisioning requires authorized provider APIs; this package does not fabricate confirmations.
-
-## Railway
-Create a service, add the three variables, and use start command: python bot.py.
+## Important
+This system manages catalog, inventory, orders, approvals and manual fulfillment. Real operator-side provisioning (eSIM activation, SIM activation, live balance/recharge, etc.) requires an authorized operator/API integration. The bot does not falsely claim that manual approval is automatic telecom provisioning.
