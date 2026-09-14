@@ -315,7 +315,7 @@ async def local_pay(c:CallbackQuery):
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
     amount=money(order.get('amount'))
-    await c.message.edit_text(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
+    await c.message.answer(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
     await c.answer()
 
 @router.callback_query(F.data.startswith('cryptopay:'))
@@ -326,7 +326,7 @@ async def crypto_pay(c:CallbackQuery):
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
     amount=money(order.get('amount'))
-    await c.message.edit_text(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
+    await c.message.answer(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
     await c.answer()
 
 @router.callback_query(F.data=='delete_msg')
