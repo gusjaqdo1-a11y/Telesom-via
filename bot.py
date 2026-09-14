@@ -58,7 +58,7 @@ SERVICES={
  'data':'📡 Data','voice':'📞 Voice','sms':'💬 SMS','recharge':'🔋 Recharge','fiber':'🌐 Fiber / Internet',
  'zaad':'💰 ZAAD Services','business':'🏢 Business','corporate':'🏢 Corporate','iot':'🔌 IoT','cloud':'☁️ Cloud','offers':'🎁 Offers','membership':'⭐ Memberships','5g':'📶 5G'}
 PANELS=['Dashboard','Customers','Numbers','VIP Numbers','Virtual Numbers','eSIM','Physical SIM','Data','Voice','SMS','Recharge','Wallets','Payments','Orders','Refunds','Offers','Promo Codes','Referrals','Memberships','Support','Broadcast','Notifications','Business','Corporate','Inventory','Analytics','Staff & Permissions','Security','Audit Logs','System Settings']
-PAYMENT_DEFAULTS={'Golis':'*883*0907868526*','Telesom':'*880*0907868526*','BNB':'0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32','USDT-BEP20':'0x6AC864773259fa5175251829cb0E93ffb4cE6feC'}
+PAYMENT_DEFAULTS={'ZAAD':'*880*0907868526*','Sahal':'*884*0907868526*','Golis':'*883*0907868526*','BNB':'0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32','USDT-BEP20':'0x6AC864773259fa5175251829cb0E93ffb4cE6feC'}
 PERMISSIONS={'admin','customers','numbers','payments','orders','wallets','refunds','offers','promos','broadcast','support','analytics','staff','settings','security'}
 
 async def get_user(tg): return await db.users.find_one({'telegram_id':int(tg)})
@@ -83,7 +83,7 @@ async def ensure_user(user):
     if old is None and r.upserted_id is not None:
         await audit(user.id,'user_registered',str(user.id),{'username':user.username})
         kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='👤 CUSTOMER',callback_data=f'customer:{user.id}'),InlineKeyboardButton(text='🚫 BAN',callback_data=f'ban:{user.id}')]])
-        await notify_admin('🆕 <b>NEW CUSTOMER</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none'),kb)
+        await notify_admin('🆕 <b>NEW CUSTOMER REGISTERED</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none')+'\n🌐 Language: <b>en</b>\n📌 Status: <b>active</b>\n🕒 Registered: <code>'+now().strftime('%Y-%m-%d %H:%M UTC')+'</code>\n\nℹ️ Telegram does not expose a customer phone number unless the customer shares it.',kb)
 
 async def lang(tg):
     u=await get_user(tg); return (u or {}).get('language','en')
@@ -144,10 +144,18 @@ async def create_order(uid_,service,details,amount=0):
     return oid
 
 async def payment_target_text(order_id=None):
-    methods=[]
-    async for x in db.payment_methods.find({'enabled':True}).sort('name',1):
-        methods.append([InlineKeyboardButton(text=f'💳 {safe(x.get("name"))}',callback_data=f'paymethod:{x.get("name")}'+(f':{order_id}' if order_id else ''))])
-    return InlineKeyboardMarkup(inline_keyboard=methods or [[InlineKeyboardButton(text='❌ No payment method available',callback_data='noop')]])
+    # Payment is intentionally split into Local and Crypto first.
+    suffix=(f':{order_id}' if order_id else '')
+    rows=[]
+    if await db.payment_methods.find_one({'name':{'$in':['ZAAD','Sahal','Golis']},'enabled':True}):
+        rows.append([InlineKeyboardButton(text='📱 Local Payment',callback_data=f'paygroup:local{suffix}')])
+    if await db.payment_methods.find_one({'name':{'$in':['BNB','USDT-BEP20']},'enabled':True}):
+        rows.append([InlineKeyboardButton(text='🪙 Crypto Payment',callback_data=f'paygroup:crypto{suffix}')])
+    rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def delete_button():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
 
 async def send_catalog(m,category):
     if category in ('numbers','vip','virtual'):
@@ -283,6 +291,34 @@ async def choose_pay(c:CallbackQuery):
         await c.message.answer(f'💵 <b>Payment for {escape(oid)}</b>\n\nAmount to pay: <b>${amount:.2f}</b>\n\nSelect your payment method:',reply_markup=await payment_target_text(oid))
     await c.answer()
 
+@router.callback_query(F.data.startswith('paygroup:'))
+async def pay_group(c:CallbackQuery):
+    parts=c.data.split(':',2); group=parts[1]; oid=parts[2] if len(parts)>2 else ''
+    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id,'status':{'$in':['awaiting_payment','pending']}}) if oid else None
+    if not order:return await c.answer('Order is unavailable.',show_alert=True)
+    if group=='local':
+        names=['ZAAD','Sahal','Golis']
+        rows=[]
+        for name in names:
+            x=await db.payment_methods.find_one({'name':name,'enabled':True})
+            if x: rows.append([InlineKeyboardButton(text=f'📱 {name}',callback_data=f'paymethod:{name}:{oid}')])
+        rows.append([InlineKeyboardButton(text='⬅️ Back',callback_data=f'choosepay:{oid}'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
+        await c.message.edit_text(f'📱 <b>Local Payment</b>\n\nAmount: <b>${money(order.get("amount")):.2f}</b>\n\nChoose your local payment method:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    else:
+        rows=[]
+        for name in ['BNB','USDT-BEP20']:
+            x=await db.payment_methods.find_one({'name':name,'enabled':True})
+            if x: rows.append([InlineKeyboardButton(text=f'🪙 {name}',callback_data=f'paymethod:{name}:{oid}')])
+        rows.append([InlineKeyboardButton(text='⬅️ Back',callback_data=f'choosepay:{oid}'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
+        await c.message.edit_text(f'🪙 <b>Crypto Payment</b>\n\nAmount: <b>${money(order.get("amount")):.2f}</b>\n\nChoose your cryptocurrency:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+@router.callback_query(F.data=='delete_msg')
+async def delete_msg(c:CallbackQuery):
+    try: await c.message.delete()
+    except Exception: pass
+    await c.answer('Deleted')
+
 @router.callback_query(F.data.startswith('paymethod:'))
 async def pay_method(c:CallbackQuery,state:FSMContext):
     parts=c.data.split(':',2); method=parts[1]; oid=parts[2] if len(parts)>2 else ''
@@ -296,11 +332,11 @@ async def pay_method(c:CallbackQuery,state:FSMContext):
     await state.update_data(method=method,order_id=oid,expected_amount=amount)
     await state.set_state(UserFlow.payment_reference)
 
-    if method in ('Golis','Telesom'):
+    if method in ('ZAAD','Sahal','Golis'):
         base=str(x.get('destination') or PAYMENT_DEFAULTS[method]).strip()
         ussd=base + f'{amount:g}#'
         dial_url='tel:' + quote(ussd, safe='*')
-        wallet_name='Golis' if method=='Golis' else 'Telesom / ZAAD'
+        wallet_name={'ZAAD':'ZAAD','Sahal':'Sahal','Golis':'Golis'}[method]
         text=(f'💵 <b>{wallet_name} PAYMENT</b>\n\n'
               f'💰 Amount: <b>${amount:.2f}</b>\n\n'
               f'👇 Tap <b>PAY NOW</b>. Your phone dialer/payment screen will open with the payment code and amount already filled in.\n\n'
@@ -316,7 +352,7 @@ async def pay_method(c:CallbackQuery,state:FSMContext):
               f'💰 Amount: <b>${amount:.2f}</b>\n\n'
               f'📍 Send the exact amount to the address below, then tap <b>✅ I HAVE PAID</b>.\n\n'
               f'<code>{escape(str(x.get("destination","")))}</code>')
-        await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],[InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay')]]))
+        await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],[InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]]))
     await c.answer()
 
 @router.callback_query(F.data=='paid_confirm')
@@ -325,7 +361,7 @@ async def paid_confirm(c:CallbackQuery,state:FSMContext):
         return await c.answer('Choose a payment method first.',show_alert=True)
     d=await state.get_data()
     method=d.get('method','')
-    if method in ('Golis','Telesom'):
+    if method in ('ZAAD','Sahal','Golis'):
         prompt='🔎 <b>Payment Confirmation</b>\n\nSend the payment reference/transaction ID. If your wallet does not show a reference, send the phone number you paid from.\n\nExample: <code>TXN123456</code>'
     else:
         prompt='🔎 <b>Payment Confirmation</b>\n\nSend the transaction hash/reference.\n\nExample: <code>TXN123456</code>'
@@ -771,8 +807,8 @@ async def sync_telesom_catalog():
         log.warning('Telesom website sync unavailable: %r',e)
 
 async def sync_telesom_numbers():
-    """Import publicly visible Telesom SIM numbers when the public order page exposes them.
-    The public site may expose only a subset/dynamically generated number, so this never invents numbers.
+    """Refresh publicly visible Telesom number inventory.
+    Only numbers actually exposed by telesom.com are imported; no numbers are invented.
     """
     try:
         import aiohttp
@@ -789,22 +825,30 @@ async def sync_telesom_numbers():
                 href=a.get('href','')
                 if 'sim_device' in href and href not in links:
                     links.append(href if href.startswith('http') else 'https://telesom.com'+href)
-            for url in links[:10]:
+            seen=set(); successful_pages=0
+            for url in links[:25]:
                 try:
                     async with session.get(url,allow_redirects=True) as rr:
                         if rr.status != 200: continue
                         page=await rr.text(errors='ignore')
+                    successful_pages += 1
                     text='\n'.join(BeautifulSoup(page,'html.parser').stripped_strings)
                     nums=set(re.findall(r'\b63\d{7}\b',text))
                     for number in nums:
+                        seen.add(number)
                         pos=text.find(number)
-                        nearby=text[max(0,pos-500):pos+500] if pos>=0 else text[:1000]
+                        nearby=text[max(0,pos-700):pos+700] if pos>=0 else text[:1200]
                         pm=re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)',nearby)
                         price=money(pm.group(1)) if pm else 10.0
                         category='vip' if re.search(r'vip',nearby,re.I) else 'regular'
-                        await db.numbers.update_one({'number':number},{'$set':{'number':number,'price':price,'category':category,'status':'available','source':'telesom.com','source_url':url,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
+                        await db.numbers.update_one({'number':number},{'$set':{'number':number,'price':price,'category':category,'status':'available','source':'telesom.com','source_url':url,'last_seen_at':now(),'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
                 except Exception as e:
                     log.warning('Telesom number sync failed %s: %r',url,e)
+            if successful_pages and links:
+                # Hide Telesom-sourced numbers that disappeared from the latest public inventory.
+                if seen:
+                    await db.numbers.update_many({'source':'telesom.com','status':'available','last_seen_at':{'$lt':now()}}, {'$set':{'status':'unavailable','updated_at':now()}})
+                    await db.numbers.update_many({'source':'telesom.com','number':{'$in':list(seen)}}, {'$set':{'status':'available','last_seen_at':now()}})
     except Exception as e:
         log.warning('Telesom number sync unavailable: %r',e)
 
@@ -814,7 +858,7 @@ async def telesom_sync_loop():
             await sync_telesom_catalog()
             await sync_telesom_numbers()
         except Exception as e: log.warning('catalog sync loop: %r',e)
-        await asyncio.sleep(6*60*60)
+        await asyncio.sleep(120)
 
 # Database initialization: legacy-safe indexes
 async def init_db():
