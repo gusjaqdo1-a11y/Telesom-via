@@ -14,7 +14,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LabeledPrice, PreCheckoutQuery
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiohttp import web
@@ -45,6 +45,32 @@ def uid(p): return f'{p}-{uuid.uuid4().hex[:10].upper()}'
 def money(v):
     try:return round(float(v),2)
     except:return 0.0
+
+def stars_to_usd(stars): return round(int(stars) * 0.01, 2)
+def new_referral_code(): return str(__import__('secrets').randbelow(9000000000) + 1000000000)
+
+async def ensure_referral_code(tg):
+    u=await get_user(tg)
+    if u and u.get('referral_code'): return str(u['referral_code'])
+    code=new_referral_code()
+    while await db.users.find_one({'referral_code':code}): code=new_referral_code()
+    await db.users.update_one({'telegram_id':int(tg)},{'$set':{'referral_code':code}})
+    return code
+
+async def wallet_pay_order(uid_, oid):
+    order=await db.orders.find_one({'order_id':oid,'user_id':int(uid_)})
+    if not order:return False
+    amount=money(order.get('amount'))
+    if amount<=0:return False
+    u=await get_user(uid_); available=money(((u or {}).get('wallet') or {}).get('available'))
+    if available + 0.0001 < amount:return False
+    r=await db.users.update_one({'telegram_id':int(uid_),'wallet.available':{'$gte':amount}},{'$inc':{'wallet.available':-amount,'total_spent':amount}})
+    if r.modified_count != 1:return False
+    await db.wallet_ledger.insert_one({'user_id':int(uid_),'type':'purchase','amount':-amount,'order_id':oid,'created_at':now()})
+    await db.orders.update_one({'order_id':oid},{'$set':{'status':'completed','payment_status':'paid','payment_method':'balance','paid_at':now(),'updated_at':now()}})
+    if order.get('number_id'):
+        await db.numbers.update_one({'_id':__import__('bson').ObjectId(order['number_id']),'status':'available'},{'$set':{'status':'sold','sold_to':int(uid_),'sold_at':now()}})
+    return True
 def safe(v,d='-'):
     s=str(v or '').strip()
     return escape(s if s else d, quote=False)
@@ -78,7 +104,7 @@ async def notify_admin(text,markup=None):
 
 async def ensure_user(user):
     old=await get_user(user.id)
-    update={'$set':{'username':user.username,'first_name':user.first_name,'last_name':user.last_name,'updated_at':now()},'$setOnInsert':{'telegram_id':int(user.id),'language':'en','status':'active','wallet':{'available':0.0,'pending':0.0},'total_deposited':0.0,'total_spent':0.0,'referrals':0,'created_at':now()}}
+    update={'$set':{'username':user.username,'first_name':user.first_name,'last_name':user.last_name,'updated_at':now()},'$setOnInsert':{'telegram_id':int(user.id),'language':'en','status':'active','wallet':{'available':0.0,'pending':0.0},'total_deposited':0.0,'total_spent':0.0,'referrals':0,'referral_code':new_referral_code(),'created_at':now()}}
     r=await db.users.update_one({'telegram_id':int(user.id)},update,upsert=True)
     if old is None and r.upserted_id is not None:
         await audit(user.id,'user_registered',str(user.id),{'username':user.username})
@@ -163,7 +189,8 @@ async def payment_methods_kb(order_id, kind):
     rows=[]
     for name in names:
         x=await db.payment_methods.find_one({'name':name,'enabled':True})
-        if x: rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
+        if not x: x={'name':name,'destination':PAYMENT_DEFAULTS.get(name),'enabled':True}
+        if x.get('enabled'): rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
     rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -192,7 +219,15 @@ async def send_catalog(m,category):
 
 @router.message(CommandStart())
 async def start(m:Message,state:FSMContext):
-    await state.clear(); await ensure_user(m.from_user)
+    await state.clear(); old=await get_user(m.from_user.id); await ensure_user(m.from_user)
+    if old is None and m.text:
+        parts=m.text.split(maxsplit=1); code=parts[1].strip() if len(parts)>1 else ''
+        if code and re.fullmatch(r'\d{10}',code):
+            ref=await db.users.find_one({'referral_code':code})
+            if ref and int(ref.get('telegram_id')) != int(m.from_user.id):
+                await db.users.update_one({'telegram_id':m.from_user.id},{'$set':{'referred_by':int(ref['telegram_id'])}})
+                await db.users.update_one({'telegram_id':int(ref['telegram_id'])},{'$inc':{'referrals':1,'referral_earnings':0.15,'wallet.available':0.15}})
+                await db.wallet_ledger.insert_one({'user_id':int(ref['telegram_id']),'type':'referral_reward','amount':0.15,'referred_user':int(m.from_user.id),'created_at':now()})
     admin=await is_admin(m.from_user.id)
     await m.answer(tr(await lang(m.from_user.id),'welcome'),reply_markup=main_kb(admin))
 
@@ -242,6 +277,8 @@ async def order_number(c:CallbackQuery,state:FSMContext):
     if not x:return await c.answer('Number unavailable',show_alert=True)
     oid=await create_order(c.from_user.id,x.get('category','number'),f"Number: {x.get('number')}",x.get('price',0))
     await db.orders.update_one({'order_id':oid},{'$set':{'number_id':str(x['_id'])}})
+    if await wallet_pay_order(c.from_user.id,oid):
+        await c.message.answer(f'✅ <b>Number Purchased</b>\n\nNumber: <code>{safe(x.get("number"))}</code>\nPaid from Balance: <b>${money(x.get("price")):.2f}</b>\n\nYour number is now reserved for you.',reply_markup=main_kb(await is_admin(c.from_user.id))); return await c.answer()
     await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nNumber: <code>{safe(x.get("number"))}</code>\nAmount: <b>${money(x.get("price")):.2f}</b>\n\nTap <b>💵 PAY NOW</b> to continue your payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
     await c.answer()
 
@@ -271,6 +308,8 @@ async def target_number_submit(m:Message,state:FSMContext):
     oid=await create_order(m.from_user.id,service,f'{title} | Recipient: {number}',price)
     await db.orders.update_one({'order_id':oid},{'$set':{'target_number':number,'catalog_id':d.get('catalog_id')}})
     await state.clear()
+    if await wallet_pay_order(m.from_user.id,oid):
+        await m.answer(f'✅ <b>Purchase Completed</b>\n\nService: {safe(title)}\nNumber: <code>{number}</code>\nPaid from Balance: <b>${price:.2f}</b>',reply_markup=main_kb(await is_admin(m.from_user.id))); return
     await m.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(SERVICES.get(service,service))}\nPackage: {safe(title)}\nNumber: <code>{number}</code>\nAmount: <b>${price:.2f}</b>\n\n💳 Tap <b>PAY NOW</b> to continue.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
 
 @router.callback_query(F.data.startswith('request:'))
@@ -309,24 +348,20 @@ async def choose_pay(c:CallbackQuery):
 
 @router.callback_query(F.data.startswith('localpay:'))
 async def local_pay(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
     oid=c.data.split(':',1)[1]
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
     amount=money(order.get('amount'))
-    await c.message.answer(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
+    await c.message.edit_text(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
     await c.answer()
 
 @router.callback_query(F.data.startswith('cryptopay:'))
 async def crypto_pay(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
     oid=c.data.split(':',1)[1]
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
     if not order:return await c.answer('Order not found',show_alert=True)
     amount=money(order.get('amount'))
-    await c.message.answer(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
+    await c.message.edit_text(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
     await c.answer()
 
 @router.callback_query(F.data=='delete_msg')
@@ -433,13 +468,62 @@ async def pick_unpaid(c:CallbackQuery):
 @router.message(F.text=='💰 Wallet')
 async def wallet(m:Message):
     u=await get_user(m.from_user.id); w=(u or {}).get('wallet',{})
-    await m.answer(f'💰 <b>Wallet</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>\nTotal deposited: ${money((u or {}).get("total_deposited")):.2f}\nTotal spent: ${money((u or {}).get("total_spent")):.2f}')
+    await m.answer(f'💰 <b>Balance</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>\nTotal deposited: ${money((u or {}).get("total_deposited")):.2f}\nTotal spent: ${money((u or {}).get("total_spent")):.2f}',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')],[InlineKeyboardButton(text='👥 Referral',callback_data='referral')]]))
+
+@router.callback_query(F.data=='addbalance')
+async def addbalance(c:CallbackQuery):
+    await c.message.edit_text('⭐ <b>Add Balance with Telegram Stars</b>\n\n100 Stars = $1.00\nMinimum: 100 Stars\nMaximum: 1000 Stars\n\nChoose an amount:',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⭐ 100 = $1',callback_data='stars:100'),InlineKeyboardButton(text='⭐ 250 = $2.50',callback_data='stars:250')],[InlineKeyboardButton(text='⭐ 500 = $5',callback_data='stars:500'),InlineKeyboardButton(text='⭐ 1000 = $10',callback_data='stars:1000')],[InlineKeyboardButton(text='✏️ Custom Stars',callback_data='stars:custom')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])); await c.answer()
+
+@router.callback_query(F.data.startswith('stars:'))
+async def stars_choice(c:CallbackQuery,state:FSMContext):
+    val=c.data.split(':')[1]
+    if val=='custom':
+        await state.set_state(UserFlow.order_details); await state.update_data(stars_custom=True); await c.message.answer('✏️ Send the number of Telegram Stars you want to add (100–1000).'); return await c.answer()
+    await send_stars_invoice(c.message,c.from_user.id,int(val)); await c.answer()
+
+async def send_stars_invoice(message, uid_, stars):
+    if stars<100 or stars>1000:return await message.answer('❌ Stars must be between 100 and 1000.')
+    usd=stars_to_usd(stars); payload=f'BALANCE:{uid_}:{stars}:{uuid.uuid4().hex[:8]}'
+    await message.answer_invoice(title='Telesombot Balance',description=f'Add ${usd:.2f} to your Telesombot balance',payload=payload,currency='XTR',prices=[LabeledPrice(label=f'${usd:.2f} Balance',amount=stars)])
+
+@router.pre_checkout_query()
+async def precheckout(q:PreCheckoutQuery):
+    await q.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def stars_success(m:Message):
+    sp=m.successful_payment; payload=sp.invoice_payload
+    if not payload.startswith('BALANCE:'):return
+    parts=payload.split(':')
+    if len(parts)<3:return
+    stars=int(parts[2]); usd=stars_to_usd(stars)
+    await db.users.update_one({'telegram_id':m.from_user.id},{'$inc':{'wallet.available':usd,'total_deposited':usd}})
+    await db.wallet_ledger.insert_one({'user_id':m.from_user.id,'type':'deposit_stars','amount':usd,'stars':stars,'telegram_payment_charge_id':sp.telegram_payment_charge_id,'created_at':now()})
+    await m.answer(f'✅ <b>Balance Added</b>\n\n⭐ Stars: <b>{stars}</b>\n💰 Added: <b>${usd:.2f}</b>\n\nYour balance is now available for purchases.',reply_markup=main_kb(await is_admin(m.from_user.id)))
+
+
+@router.callback_query(F.data=='wallet_cb')
+async def wallet_cb(c:CallbackQuery):
+    u=await get_user(c.from_user.id); w=(u or {}).get('wallet',{})
+    await c.message.edit_text(f'💰 <b>Balance</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')]])); await c.answer()
+
+@router.message(UserFlow.order_details)
+async def custom_stars_submit(m:Message,state:FSMContext):
+    d=await state.get_data()
+    if not d.get('stars_custom'): return
+    try: stars=int((m.text or '').strip())
+    except: return await m.answer('❌ Send a number from 100 to 1000.')
+    if not 100<=stars<=1000:return await m.answer('❌ Stars must be between 100 and 1000.')
+    await state.clear(); await send_stars_invoice(m,m.from_user.id,stars)
+
 @router.message(F.text=='👤 My Profile')
 async def profile(m:Message):
     u=await get_user(m.from_user.id); await m.answer(f'👤 <b>My Profile</b>\n\nID: <code>{m.from_user.id}</code>\nName: {safe(m.from_user.full_name)}\nUsername: @{safe(m.from_user.username,"none")}\nLanguage: {safe((u or {}).get("language"),"en")}\nStatus: {safe((u or {}).get("status"),"active")}')
 @router.message(F.text=='👥 Referral')
 async def referral(m:Message):
-    u=await get_user(m.from_user.id); await m.answer(f'👥 <b>Referral</b>\n\nYour referral code: <code>{m.from_user.id}</code>\nReferrals: <b>{int((u or {}).get("referrals",0))}</b>')
+    code=await ensure_referral_code(m.from_user.id); u=await get_user(m.from_user.id)
+    me=await bot.get_me(); link=f'https://t.me/{me.username}?start={code}'
+    await m.answer(f'👥 <b>Referral Program</b>\n\nYour referral code: <code>{code}</code>\nReward per successful referral: <b>$0.15</b>\nReferrals: <b>{int((u or {}).get("referrals",0))}</b>\nEarned: <b>${money((u or {}).get("referral_earnings",0)):.2f}</b>\n\n🔗 <code>{link}</code>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💰 Balance',callback_data='wallet_cb')]]))
 @router.message(F.text=='🌐 Language')
 async def language(m:Message):
     await m.answer(tr(await lang(m.from_user.id),'language'),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🇬🇧 English',callback_data='lang:en'),InlineKeyboardButton(text='🇸🇴 Somali',callback_data='lang:so'),InlineKeyboardButton(text='🇸🇦 العربية',callback_data='lang:ar')]]))
