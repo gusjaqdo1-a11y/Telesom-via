@@ -1,31 +1,29 @@
-# Telesombot
+# Telesombot Full Telegram System
 
-Telegram-only Telesom-style service management foundation.
+## Required ENV
+BOT_TOKEN
+MONGO_URI
+ADMIN_ID
 
-## ENV
-BOT_TOKEN=Telegram bot token
-MONGO_URI=MongoDB connection string
-ADMIN_ID=main admin Telegram ID
+## 30 Admin panels
+Dashboard, Customers, Numbers, VIP Numbers, Virtual Numbers, eSIM, Physical SIM, Data, Voice, SMS, Recharge, Wallets, Payments, Orders, Refunds, Offers, Promo Codes, Referrals, Memberships, Support, Broadcast, Notifications, Business, Corporate, Inventory, Analytics, Staff & Permissions, Security, Audit Logs, System Settings.
 
-## Run
-pip install -r requirements.txt
-python bot.py
+## User commands
+/start /help /lang /services /numbers /vip /esim /sim /virtual /data /voice /sms /recharge /business /fiber /zaad /iot /cloud /order /pay /orders /payments /wallet /referral /support /profile /contact
 
-## Deploy
-Railway/Render: create a worker/background service and add the three ENV variables.
-
-## Important
-This package contains the Telegram UX, multilingual command framework, MongoDB persistence, request/approval engine, 30 admin-control categories, audit logging, and starter service routing.
-
-Actual Telesom/ZAAD/eSIM/SMS/number provisioning requires authorized official APIs or an approved operator integration. The bot does not pretend that an order is provisioned merely because an admin confirms it.
+## Admin commands
+/admin /panel 1-30 /pending /confirm REQ-ID [note] /reject REQ-ID [note] /payconfirm PAY-ID /payreject PAY-ID [note] /stats
 
 ## Languages
-English: /lang en
-Somali: /lang so
-Arabic: /lang ar
+English, Somali, Arabic. /lang en, /lang so, /lang ar.
 
-## Admin
-/admin
-/pending
-/confirm REQ-000001
-/reject REQ-000001
+## Payment destinations
+Golis: *883*0907868526*$#
+Telesom: *880*0907868526*$#
+BNB: 0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32
+USDT-BEP20: 0x6AC864773259fa5175251829cb0E93ffb4cE6feC
+
+The bot records payment requests as pending until an admin confirms them. Automatic telecom/ZAAD/eSIM provisioning requires authorized provider APIs; this package does not fabricate confirmations.
+
+## Railway
+Create a service, add the three variables, and use start command: python bot.py.
