@@ -1,16 +1,23 @@
-# Telesombot — Button Telecom System
+# Telesombot — Full Telegram Service System
 
 ## ENV
 - BOT_TOKEN
 - MONGO_URI
 - ADMIN_ID
-- DB_NAME (optional, default telesombot)
-- PORT (optional, Render sets this automatically)
+- DB_NAME (optional)
+- PORT (optional)
 
 ## Run
-python bot.py
+`python bot.py`
 
-## Important
-The bot refreshes public Telesom catalogue/number pages every 120 seconds. It only imports publicly visible data and never invents live inventory.
+## Payment
+Local: ZAAD and SAHAL. The bot creates a `tel:` link with the amount filled in, e.g. SAHAL `*883*0907868526*2#` and ZAAD `*880*0907868526*2#`.
+Crypto: BNB and USDT-BEP20.
 
-Local payment opens the phone dialer with the amount pre-filled. Automatic payment verification/provisioning still requires an authorized operator/payment API; Telegram cannot bypass a user's PIN or confirm a wallet transaction by itself.
+The bot cannot enter wallet PINs or cryptographically verify local payments without an official payment API. Admin verification remains required after the customer confirms payment.
+
+## Telesom sync
+The bot refreshes the public Telesom catalogue and publicly discoverable SIM order pages every 120 seconds. It only imports numbers actually exposed by telesom.com and never invents inventory.
+
+## Render
+Run as a Web Service with `python bot.py`; the bot exposes `/health` on Render's PORT.

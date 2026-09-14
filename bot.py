@@ -58,7 +58,7 @@ SERVICES={
  'data':'📡 Data','voice':'📞 Voice','sms':'💬 SMS','recharge':'🔋 Recharge','fiber':'🌐 Fiber / Internet',
  'zaad':'💰 ZAAD Services','business':'🏢 Business','corporate':'🏢 Corporate','iot':'🔌 IoT','cloud':'☁️ Cloud','offers':'🎁 Offers','membership':'⭐ Memberships','5g':'📶 5G'}
 PANELS=['Dashboard','Customers','Numbers','VIP Numbers','Virtual Numbers','eSIM','Physical SIM','Data','Voice','SMS','Recharge','Wallets','Payments','Orders','Refunds','Offers','Promo Codes','Referrals','Memberships','Support','Broadcast','Notifications','Business','Corporate','Inventory','Analytics','Staff & Permissions','Security','Audit Logs','System Settings']
-PAYMENT_DEFAULTS={'ZAAD':'*880*0907868526*','Sahal':'*884*0907868526*','Golis':'*883*0907868526*','BNB':'0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32','USDT-BEP20':'0x6AC864773259fa5175251829cb0E93ffb4cE6feC'}
+PAYMENT_DEFAULTS={'ZAAD':'*880*0907868526*','SAHAL':'*883*0907868526*','BNB':'0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32','USDT-BEP20':'0x6AC864773259fa5175251829cb0E93ffb4cE6feC'}
 PERMISSIONS={'admin','customers','numbers','payments','orders','wallets','refunds','offers','promos','broadcast','support','analytics','staff','settings','security'}
 
 async def get_user(tg): return await db.users.find_one({'telegram_id':int(tg)})
@@ -83,10 +83,17 @@ async def ensure_user(user):
     if old is None and r.upserted_id is not None:
         await audit(user.id,'user_registered',str(user.id),{'username':user.username})
         kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='👤 CUSTOMER',callback_data=f'customer:{user.id}'),InlineKeyboardButton(text='🚫 BAN',callback_data=f'ban:{user.id}')]])
-        await notify_admin('🆕 <b>NEW CUSTOMER REGISTERED</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none')+'\n🌐 Language: <b>en</b>\n📌 Status: <b>active</b>\n🕒 Registered: <code>'+now().strftime('%Y-%m-%d %H:%M UTC')+'</code>\n\nℹ️ Telegram does not expose a customer phone number unless the customer shares it.',kb)
+        await notify_admin('🆕 <b>NEW CUSTOMER</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none'),kb)
 
 async def lang(tg):
     u=await get_user(tg); return (u or {}).get('language','en')
+
+TEXTS={
+'en': {'welcome':'👋 <b>Welcome to Telesombot</b>\n\nChoose a service from the menu below.', 'choose_payment':'💵 <b>Choose Payment</b>\n\nSelect how you want to pay:', 'local':'📱 <b>Local Payment</b>\n\nChoose your mobile wallet:', 'crypto':'🪙 <b>Crypto Payment</b>\n\nChoose your cryptocurrency:', 'send_now':'📲 Send Now', 'confirm':'✅ Confirm', 'payment_done':'✅ <b>Payment confirmation received.</b>\n\nYour order is now being processed.', 'language':'🌐 <b>Select Language</b>'},
+'so': {'welcome':'👋 <b>Kusoo dhawoow Telesombot</b>\n\nDooro adeegga aad rabto.', 'choose_payment':'💵 <b>Dooro Habka Lacag-bixinta</b>\n\nDooro sida aad lacagta u bixinayso:', 'local':'📱 <b>Lacag-bixinta Local</b>\n\nDooro wallet-ka lacagta:', 'crypto':'🪙 <b>Lacag-bixinta Crypto</b>\n\nDooro lacagta crypto:', 'send_now':'📲 Hadda Dir', 'confirm':'✅ Xaqiiji', 'payment_done':'✅ <b>Xaqiijinta lacagta waa la helay.</b>\n\nDalabkaaga hadda waa la farsamaynayaa.', 'language':'🌐 <b>Dooro Luuqadda</b>'},
+'ar': {'welcome':'👋 <b>مرحباً بك في Telesombot</b>\n\nاختر الخدمة من القائمة أدناه.', 'choose_payment':'💵 <b>اختر طريقة الدفع</b>\n\nاختر طريقة الدفع التي تريدها:', 'local':'📱 <b>الدفع المحلي</b>\n\nاختر المحفظة:', 'crypto':'🪙 <b>الدفع بالعملات الرقمية</b>\n\nاختر العملة:', 'send_now':'📲 إرسال الآن', 'confirm':'✅ تأكيد', 'payment_done':'✅ <b>تم استلام تأكيد الدفع.</b>\n\nطلبك قيد المعالجة الآن.', 'language':'🌐 <b>اختر اللغة</b>'}
+}
+def tr(code,key): return TEXTS.get(code,TEXTS['en']).get(key,TEXTS['en'].get(key,key))
 
 def main_kb(admin=False):
     rows=[
@@ -144,18 +151,21 @@ async def create_order(uid_,service,details,amount=0):
     return oid
 
 async def payment_target_text(order_id=None):
-    # Payment is intentionally split into Local and Crypto first.
-    suffix=(f':{order_id}' if order_id else '')
+    suffix=f':{order_id}' if order_id else ''
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📱 Local Payment',callback_data=f'localpay{suffix}')],
+        [InlineKeyboardButton(text='🪙 Crypto Payment',callback_data=f'cryptopay{suffix}')],
+        [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]
+    ])
+
+async def payment_methods_kb(order_id, kind):
+    names=['ZAAD','SAHAL'] if kind=='local' else ['BNB','USDT-BEP20']
     rows=[]
-    if await db.payment_methods.find_one({'name':{'$in':['ZAAD','Sahal','Golis']},'enabled':True}):
-        rows.append([InlineKeyboardButton(text='📱 Local Payment',callback_data=f'paygroup:local{suffix}')])
-    if await db.payment_methods.find_one({'name':{'$in':['BNB','USDT-BEP20']},'enabled':True}):
-        rows.append([InlineKeyboardButton(text='🪙 Crypto Payment',callback_data=f'paygroup:crypto{suffix}')])
+    for name in names:
+        x=await db.payment_methods.find_one({'name':name,'enabled':True})
+        if x: rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
     rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def delete_button():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
 
 async def send_catalog(m,category):
     if category in ('numbers','vip','virtual'):
@@ -184,7 +194,7 @@ async def send_catalog(m,category):
 async def start(m:Message,state:FSMContext):
     await state.clear(); await ensure_user(m.from_user)
     admin=await is_admin(m.from_user.id)
-    await m.answer('👋 <b>Welcome to Telesombot</b>\n\nAll services, orders and payments are available through the buttons below.\n\n⏳ <b>Pending 5-10 Min. Please wait</b>',reply_markup=main_kb(admin))
+    await m.answer(tr(await lang(m.from_user.id),'welcome'),reply_markup=main_kb(admin))
 
 # Customer buttons
 @router.message(F.text=='🏠 Customer Home')
@@ -219,10 +229,12 @@ async def service_button(m:Message):
 
 @router.callback_query(F.data.startswith('number:'))
 async def number_select(c:CallbackQuery):
+    try: await c.message.delete()
+    except: pass
     try: x=await db.numbers.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1])})
     except: x=None
     if not x: return await c.answer('Item unavailable',show_alert=True)
-    await c.message.answer(f"📱 <b>{safe(x.get('number'))}</b>\n\nCategory: {safe(x.get('category'))}\nPrice: <b>${money(x.get('price')):.2f}</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🛒 ORDER NOW',callback_data=f'order_number:{x["_id"]}')],[InlineKeyboardButton(text='⬅️ Back',callback_data='home')]])); await c.answer()
+    await c.message.answer(f"📱 <b>{safe(x.get('number'))}</b>\n\nCategory: {safe(x.get('category'))}\nPrice: <b>${money(x.get('price')):.2f}</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🛒 ORDER NOW',callback_data=f'order_number:{x["_id"]}')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])); await c.answer()
 @router.callback_query(F.data.startswith('order_number:'))
 async def order_number(c:CallbackQuery,state:FSMContext):
     try: x=await db.numbers.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1]),'status':'available'})
@@ -230,11 +242,13 @@ async def order_number(c:CallbackQuery,state:FSMContext):
     if not x:return await c.answer('Number unavailable',show_alert=True)
     oid=await create_order(c.from_user.id,x.get('category','number'),f"Number: {x.get('number')}",x.get('price',0))
     await db.orders.update_one({'order_id':oid},{'$set':{'number_id':str(x['_id'])}})
-    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nNumber: <code>{safe(x.get("number"))}</code>\nAmount: <b>${money(x.get("price")):.2f}</b>\n\n⏳ <b>Pending 5-10 Min. Please wait</b>\n\nTap <b>💵 PAY NOW</b> to continue your payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
+    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nNumber: <code>{safe(x.get("number"))}</code>\nAmount: <b>${money(x.get("price")):.2f}</b>\n\nTap <b>💵 PAY NOW</b> to continue your payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
     await c.answer()
 
 @router.callback_query(F.data.startswith('catalog:'))
 async def catalog_select(c:CallbackQuery,state:FSMContext):
+    try: await c.message.delete()
+    except: pass
     try: x=await db.catalog.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1]),'enabled':True})
     except: x=None
     if not x:return await c.answer('Package unavailable',show_alert=True)
@@ -245,7 +259,7 @@ async def catalog_select(c:CallbackQuery,state:FSMContext):
         await c.message.answer(f'📱 <b>{safe(SERVICES.get(service,service))}</b>\n\nPackage: <b>{safe(x.get("title"))}</b>\nPrice: <b>${money(x.get("price")):.2f}</b>\n\n📞 Send the Telesom number that should receive this service.\nExample: <code>0634XXXXXX</code>')
         return await c.answer()
     oid=await create_order(c.from_user.id,service,x.get('title','Package'),x.get('price',0))
-    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(service)}\nPackage: {safe(x.get("title"))}\nAmount: <b>${money(x.get("price")):.2f}</b>\n\n⏳ <b>Pending 5-10 Min. Please wait</b>\n\n💳 Choose <b>PAY NOW</b> to complete payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
+    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(service)}\nPackage: {safe(x.get("title"))}\nAmount: <b>${money(x.get("price")):.2f}</b>\n\n💳 Choose <b>PAY NOW</b> to complete payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
     await c.answer()
 
 @router.message(UserFlow.target_number)
@@ -257,7 +271,7 @@ async def target_number_submit(m:Message,state:FSMContext):
     oid=await create_order(m.from_user.id,service,f'{title} | Recipient: {number}',price)
     await db.orders.update_one({'order_id':oid},{'$set':{'target_number':number,'catalog_id':d.get('catalog_id')}})
     await state.clear()
-    await m.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(SERVICES.get(service,service))}\nPackage: {safe(title)}\nNumber: <code>{number}</code>\nAmount: <b>${price:.2f}</b>\n\n⏳ <b>Pending 5-10 Min. Please wait</b>\n\n💳 Tap <b>PAY NOW</b> to continue.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
+    await m.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(SERVICES.get(service,service))}\nPackage: {safe(title)}\nNumber: <code>{number}</code>\nAmount: <b>${price:.2f}</b>\n\n💳 Tap <b>PAY NOW</b> to continue.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
 
 @router.callback_query(F.data.startswith('request:'))
 async def request_service(c:CallbackQuery,state:FSMContext):
@@ -273,7 +287,7 @@ async def order_details(m:Message,state:FSMContext):
     await db.requests.insert_one({'request_id':rid,'user_id':m.from_user.id,'kind':service,'order_id':oid,'data':{'details':details,'service':service},'status':'pending','created_at':now(),'updated_at':now()})
     await state.clear()
     await notify_admin(f'📝 <b>NEW SERVICE REQUEST</b>\n\nRequest: <code>{rid}</code>\nOrder: <code>{oid}</code>\nUser: <code>{m.from_user.id}</code>\nService: <b>{safe(SERVICES.get(service,service))}</b>\nDetails: {safe(details)}\n\nSet/confirm the price before requesting payment.',approve_kb('request',rid))
-    await m.answer(f'✅ <b>Request Received</b>\n\nReference: <code>{rid}</code>\n⏳ <b>Pending 5-10 Min. Please wait</b>\n\nYou do not need to pay yet. Once the price is confirmed, the bot will show <b>PAY NOW</b>.',reply_markup=main_kb(await is_admin(m.from_user.id)))
+    await m.answer(f'✅ <b>Request Received</b>\n\nReference: <code>{rid}</code>\nYou do not need to pay yet. Once the price is confirmed, the bot will show <b>PAY NOW</b>.',reply_markup=main_kb(await is_admin(m.from_user.id)))
 
 @router.message(F.text=='💵 Payments')
 async def payments(m:Message):
@@ -281,46 +295,50 @@ async def payments(m:Message):
 
 @router.callback_query(F.data.startswith('choosepay:'))
 async def choose_pay(c:CallbackQuery):
+    try: await c.message.delete()
+    except: pass
     oid=c.data.split(':',1)[1]
     order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id,'status':{'$in':['awaiting_payment','pending']}})
     if not order:return await c.answer('Order is unavailable or already paid.',show_alert=True)
     amount=money(order.get('amount'))
     if amount<=0:
-        await c.message.answer(f'💵 <b>Payment for {escape(oid)}</b>\n\nThis service requires a custom amount. Select a payment method and then enter the amount you actually paid.')
+        await c.message.answer(tr(await lang(c.from_user.id),'choose_payment'),reply_markup=await payment_target_text(oid))
     else:
-        await c.message.answer(f'💵 <b>Payment for {escape(oid)}</b>\n\nAmount to pay: <b>${amount:.2f}</b>\n\nSelect your payment method:',reply_markup=await payment_target_text(oid))
+        await c.message.answer(tr(await lang(c.from_user.id),'choose_payment')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_target_text(oid))
     await c.answer()
 
-@router.callback_query(F.data.startswith('paygroup:'))
-async def pay_group(c:CallbackQuery):
-    parts=c.data.split(':',2); group=parts[1]; oid=parts[2] if len(parts)>2 else ''
-    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id,'status':{'$in':['awaiting_payment','pending']}}) if oid else None
-    if not order:return await c.answer('Order is unavailable.',show_alert=True)
-    if group=='local':
-        names=['ZAAD','Sahal','Golis']
-        rows=[]
-        for name in names:
-            x=await db.payment_methods.find_one({'name':name,'enabled':True})
-            if x: rows.append([InlineKeyboardButton(text=f'📱 {name}',callback_data=f'paymethod:{name}:{oid}')])
-        rows.append([InlineKeyboardButton(text='⬅️ Back',callback_data=f'choosepay:{oid}'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-        await c.message.edit_text(f'📱 <b>Local Payment</b>\n\nAmount: <b>${money(order.get("amount")):.2f}</b>\n\nChoose your local payment method:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    else:
-        rows=[]
-        for name in ['BNB','USDT-BEP20']:
-            x=await db.payment_methods.find_one({'name':name,'enabled':True})
-            if x: rows.append([InlineKeyboardButton(text=f'🪙 {name}',callback_data=f'paymethod:{name}:{oid}')])
-        rows.append([InlineKeyboardButton(text='⬅️ Back',callback_data=f'choosepay:{oid}'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-        await c.message.edit_text(f'🪙 <b>Crypto Payment</b>\n\nAmount: <b>${money(order.get("amount")):.2f}</b>\n\nChoose your cryptocurrency:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+@router.callback_query(F.data.startswith('localpay:'))
+async def local_pay(c:CallbackQuery):
+    try: await c.message.delete()
+    except: pass
+    oid=c.data.split(':',1)[1]
+    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
+    if not order:return await c.answer('Order not found',show_alert=True)
+    amount=money(order.get('amount'))
+    await c.message.edit_text(tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'local'))
+    await c.answer()
+
+@router.callback_query(F.data.startswith('cryptopay:'))
+async def crypto_pay(c:CallbackQuery):
+    try: await c.message.delete()
+    except: pass
+    oid=c.data.split(':',1)[1]
+    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
+    if not order:return await c.answer('Order not found',show_alert=True)
+    amount=money(order.get('amount'))
+    await c.message.edit_text(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
     await c.answer()
 
 @router.callback_query(F.data=='delete_msg')
 async def delete_msg(c:CallbackQuery):
     try: await c.message.delete()
-    except Exception: pass
-    await c.answer('Deleted')
+    except: pass
+    await c.answer()
 
 @router.callback_query(F.data.startswith('paymethod:'))
 async def pay_method(c:CallbackQuery,state:FSMContext):
+    try: await c.message.delete()
+    except: pass
     parts=c.data.split(':',2); method=parts[1]; oid=parts[2] if len(parts)>2 else ''
     x=await db.payment_methods.find_one({'name':method,'enabled':True})
     if not x:return await c.answer('Payment method unavailable',show_alert=True)
@@ -332,19 +350,19 @@ async def pay_method(c:CallbackQuery,state:FSMContext):
     await state.update_data(method=method,order_id=oid,expected_amount=amount)
     await state.set_state(UserFlow.payment_reference)
 
-    if method in ('ZAAD','Sahal','Golis'):
+    if method in ('ZAAD','SAHAL'):
         base=str(x.get('destination') or PAYMENT_DEFAULTS[method]).strip()
         ussd=base + f'{amount:g}#'
         dial_url='tel:' + quote(ussd, safe='*')
-        wallet_name={'ZAAD':'ZAAD','Sahal':'Sahal','Golis':'Golis'}[method]
+        wallet_name=method
         text=(f'💵 <b>{wallet_name} PAYMENT</b>\n\n'
               f'💰 Amount: <b>${amount:.2f}</b>\n\n'
-              f'👇 Tap <b>PAY NOW</b>. Your phone dialer/payment screen will open with the payment code and amount already filled in.\n\n'
-              f'After the payment is completed, return here and tap <b>✅ I HAVE PAID</b>.')
+              f'👇 Tap <b>Send Now</b>. Your phone dialer will open with the payment code and amount already filled in.\n\n'
+              f'After sending the payment, return here and tap <b>Confirm</b>.')
         kb=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='💳 PAY NOW',url=dial_url)],
-            [InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],
-            [InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay')]
+            [InlineKeyboardButton(text='📲 Send Now',url=dial_url)],
+            [InlineKeyboardButton(text='✅ Confirm',callback_data='paid_confirm')],
+            [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]
         ])
         await c.message.answer(text,reply_markup=kb)
     else:
@@ -352,7 +370,7 @@ async def pay_method(c:CallbackQuery,state:FSMContext):
               f'💰 Amount: <b>${amount:.2f}</b>\n\n'
               f'📍 Send the exact amount to the address below, then tap <b>✅ I HAVE PAID</b>.\n\n'
               f'<code>{escape(str(x.get("destination","")))}</code>')
-        await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],[InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]]))
+        await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],[InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay')]]))
     await c.answer()
 
 @router.callback_query(F.data=='paid_confirm')
@@ -361,7 +379,7 @@ async def paid_confirm(c:CallbackQuery,state:FSMContext):
         return await c.answer('Choose a payment method first.',show_alert=True)
     d=await state.get_data()
     method=d.get('method','')
-    if method in ('ZAAD','Sahal','Golis'):
+    if method in ('ZAAD','SAHAL'):
         prompt='🔎 <b>Payment Confirmation</b>\n\nSend the payment reference/transaction ID. If your wallet does not show a reference, send the phone number you paid from.\n\nExample: <code>TXN123456</code>'
     else:
         prompt='🔎 <b>Payment Confirmation</b>\n\nSend the transaction hash/reference.\n\nExample: <code>TXN123456</code>'
@@ -424,10 +442,10 @@ async def referral(m:Message):
     u=await get_user(m.from_user.id); await m.answer(f'👥 <b>Referral</b>\n\nYour referral code: <code>{m.from_user.id}</code>\nReferrals: <b>{int((u or {}).get("referrals",0))}</b>')
 @router.message(F.text=='🌐 Language')
 async def language(m:Message):
-    await m.answer('🌐 <b>Select Language</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🇬🇧 English',callback_data='lang:en'),InlineKeyboardButton(text='🇸🇴 Somali',callback_data='lang:so'),InlineKeyboardButton(text='🇸🇦 العربية',callback_data='lang:ar')]]))
+    await m.answer(tr(await lang(m.from_user.id),'language'),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🇬🇧 English',callback_data='lang:en'),InlineKeyboardButton(text='🇸🇴 Somali',callback_data='lang:so'),InlineKeyboardButton(text='🇸🇦 العربية',callback_data='lang:ar')]]))
 @router.callback_query(F.data.startswith('lang:'))
 async def setlang(c:CallbackQuery):
-    code=c.data.split(':')[1]; await db.users.update_one({'telegram_id':c.from_user.id},{'$set':{'language':code}}); await c.message.answer({'en':'✅ English selected.','so':'✅ Somali ayaa la doortay.','ar':'✅ تم اختيار العربية.'}[code],reply_markup=main_kb(await is_admin(c.from_user.id))); await c.answer()
+    code=c.data.split(':')[1]; await db.users.update_one({'telegram_id':c.from_user.id},{'$set':{'language':code}}); await c.message.edit_text({'en':'🇬🇧 English selected.','so':'🇸🇴 Somali ayaa la doortay.','ar':'🇸🇦 تم اختيار العربية.'}[code]); await c.message.answer(tr(code,'welcome'),reply_markup=main_kb(await is_admin(c.from_user.id))); await c.answer()
 @router.message(F.text=='🆘 Customer Support')
 async def support(m:Message,state:FSMContext):
     if not await get_setting('support_open',True):return await m.answer('🔒 Support is currently closed.')
@@ -807,13 +825,13 @@ async def sync_telesom_catalog():
         log.warning('Telesom website sync unavailable: %r',e)
 
 async def sync_telesom_numbers():
-    """Refresh publicly visible Telesom number inventory.
+    """Sync every publicly discoverable Telesom SIM order page.
     Only numbers actually exposed by telesom.com are imported; no numbers are invented.
     """
     try:
         import aiohttp
         from bs4 import BeautifulSoup
-        timeout=aiohttp.ClientTimeout(total=30)
+        timeout=aiohttp.ClientTimeout(total=20)
         headers={'User-Agent':'Mozilla/5.0 (compatible; Telesombot/1.0)'}
         async with aiohttp.ClientSession(timeout=timeout,headers=headers) as session:
             async with session.get('https://telesom.com/personal/products',allow_redirects=True) as r:
@@ -823,32 +841,41 @@ async def sync_telesom_numbers():
             links=[]
             for a in soup.find_all('a',href=True):
                 href=a.get('href','')
-                if 'sim_device' in href and href not in links:
-                    links.append(href if href.startswith('http') else 'https://telesom.com'+href)
-            seen=set(); successful_pages=0
-            for url in links[:25]:
-                try:
-                    async with session.get(url,allow_redirects=True) as rr:
-                        if rr.status != 200: continue
-                        page=await rr.text(errors='ignore')
-                    successful_pages += 1
-                    text='\n'.join(BeautifulSoup(page,'html.parser').stripped_strings)
-                    nums=set(re.findall(r'\b63\d{7}\b',text))
-                    for number in nums:
-                        seen.add(number)
-                        pos=text.find(number)
-                        nearby=text[max(0,pos-700):pos+700] if pos>=0 else text[:1200]
-                        pm=re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)',nearby)
-                        price=money(pm.group(1)) if pm else 10.0
-                        category='vip' if re.search(r'vip',nearby,re.I) else 'regular'
-                        await db.numbers.update_one({'number':number},{'$set':{'number':number,'price':price,'category':category,'status':'available','source':'telesom.com','source_url':url,'last_seen_at':now(),'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
-                except Exception as e:
-                    log.warning('Telesom number sync failed %s: %r',url,e)
-            if successful_pages and links:
-                # Hide Telesom-sourced numbers that disappeared from the latest public inventory.
-                if seen:
-                    await db.numbers.update_many({'source':'telesom.com','status':'available','last_seen_at':{'$lt':now()}}, {'$set':{'status':'unavailable','updated_at':now()}})
-                    await db.numbers.update_many({'source':'telesom.com','number':{'$in':list(seen)}}, {'$set':{'status':'available','last_seen_at':now()}})
+                if 'sim_device' in href:
+                    url=href if href.startswith('http') else 'https://telesom.com'+href
+                    if url not in links: links.append(url)
+            if not links: return
+            sem=asyncio.Semaphore(20)
+            seen=set(); successful=False
+            async def fetch(url):
+                nonlocal successful
+                async with sem:
+                    try:
+                        async with session.get(url,allow_redirects=True) as rr:
+                            if rr.status != 200: return []
+                            page=await rr.text(errors='ignore')
+                        successful=True
+                        text='\n'.join(BeautifulSoup(page,'html.parser').stripped_strings)
+                        found=[]
+                        for number in set(re.findall(r'\b63\d{7}\b',text)):
+                            pos=text.find(number)
+                            nearby=text[max(0,pos-800):pos+800] if pos>=0 else text[:1500]
+                            pm=re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)',nearby)
+                            price=money(pm.group(1)) if pm else 10.0
+                            category='vip' if re.search(r'vip',nearby,re.I) else 'regular'
+                            found.append((number,price,category,url))
+                        return found
+                    except Exception as e:
+                        log.warning('Telesom number page failed: %r',e); return []
+            results=await asyncio.gather(*(fetch(u) for u in links))
+            for batch in results:
+                for number,price,category,url in batch:
+                    seen.add(number)
+                    await db.numbers.update_one({'number':number},{'$set':{'number':number,'price':price,'category':category,'status':'available','source':'telesom.com','source_url':url,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
+            # Only mark old website inventory unavailable when the website crawl itself succeeded.
+            if successful and seen:
+                await db.numbers.update_many({'source':'telesom.com','number':{'$nin':list(seen)},'status':'available'},{'$set':{'status':'unavailable','updated_at':now()}})
+            log.info('Telesom number sync: %s public pages, %s numbers',len(links),len(seen))
     except Exception as e:
         log.warning('Telesom number sync unavailable: %r',e)
 
@@ -879,6 +906,7 @@ async def init_db():
     for k,v in defaults.items():
         if await db.settings.find_one({'_id':k}) is None:await set_setting(k,v)
     for name,dest in PAYMENT_DEFAULTS.items(): await db.payment_methods.update_one({'name':name},{'$set':{'destination':dest,'enabled':True},'$setOnInsert':{'name':name}},upsert=True)
+    await db.payment_methods.delete_many({'name':{'$in':['Golis','Telesom']}})
     website_catalog=[
         ('data','24 Hours Unlimited Data',0.50),
         ('data','24 Hours Unlimited Calls + Data',1.00),
