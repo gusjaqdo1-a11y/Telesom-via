@@ -1,1083 +1,13358 @@
-import os
-import asyncio
-import logging
-import uuid
+import telebot
+from pymongo import MongoClient
+import requests
+from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, LabeledPrice, KeyboardButton, KeyboardButtonRequestChat, ChatAdministratorRights, ReplyKeyboardRemove, BotCommand
+import os, json, random, secrets, string
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+import yt_dlp
+import subprocess
 import re
-from urllib.parse import quote
-from html import escape
-from datetime import datetime, timezone
-from typing import Optional
-
-from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LabeledPrice
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiohttp import web
-
-load_dotenv()
-BOT_TOKEN=os.getenv('BOT_TOKEN','').strip()
-MONGO_URI=os.getenv('MONGO_URI','').strip()
-ADMIN_ID_RAW=os.getenv('ADMIN_ID','0').strip()
-PORT=int(os.getenv('PORT','10000') or '10000')
-DB_NAME=os.getenv('DB_NAME','telesombot')
-if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN is missing')
-if not MONGO_URI: raise RuntimeError('MONGO_URI is missing')
-try: MAIN_ADMIN=int(ADMIN_ID_RAW)
-except ValueError: raise RuntimeError('ADMIN_ID must be numeric')
-if MAIN_ADMIN<=0: raise RuntimeError('ADMIN_ID is missing or invalid')
-
-logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
-log=logging.getLogger('telesombot')
-client=AsyncIOMotorClient(MONGO_URI,serverSelectionTimeoutMS=10000)
-db=client[DB_NAME]
-bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); router=Router(); admin_router=Router(); dp.include_router(router); dp.include_router(admin_router)
-
-class UserFlow(StatesGroup):
-    order_details=State(); target_number=State(); payment_reference=State(); support=State(); admin_input=State(); custom_stars=State(); broadcast=State(); search_user=State(); number_add=State(); catalog_add=State(); quote_amount=State()
-
-def now(): return datetime.now(timezone.utc)
-def uid(p): return f'{p}-{uuid.uuid4().hex[:10].upper()}'
-def money(v):
-    try:return round(float(v),2)
-    except:return 0.0
-def safe(v,d='-'):
-    s=str(v or '').strip()
-    return escape(s if s else d, quote=False)
-
-def raw_safe(v,d='-'):
-    s=str(v or '').strip()
-    return s if s else d
-
-SERVICES={
- 'numbers':'📱 Numbers','vip':'💎 VIP Numbers','virtual':'🌐 Virtual Numbers','esim':'📲 eSIM','sim':'💳 Physical SIM',
- 'data':'📡 Data','voice':'📞 Voice','sms':'💬 SMS','recharge':'🔋 Recharge','fiber':'🌐 Fiber / Internet',
- 'zaad':'💰 ZAAD Services','business':'🏢 Business','corporate':'🏢 Corporate','iot':'🔌 IoT','cloud':'☁️ Cloud','offers':'🎁 Offers','membership':'⭐ Memberships','5g':'📶 5G'}
-PANELS=['Dashboard','Customers','Numbers','VIP Numbers','Virtual Numbers','eSIM','Physical SIM','Data','Voice','SMS','Recharge','Wallets','Payments','Orders','Refunds','Offers','Promo Codes','Referrals','Memberships','Support','Broadcast','Notifications','Business','Corporate','Inventory','Analytics','Staff & Permissions','Security','Audit Logs','System Settings']
-PAYMENT_DEFAULTS={'ZAAD':'*880*0907868526*','SAHAL':'*883*0907868526*','BNB':'0x1f12ffDc93E49eff0c78672Ab6abA62410c05a32','USDT-BEP20':'0x6AC864773259fa5175251829cb0E93ffb4cE6feC'}
-PERMISSIONS={'admin','customers','numbers','payments','orders','wallets','refunds','offers','promos','broadcast','support','analytics','staff','settings','security'}
-
-async def get_user(tg): return await db.users.find_one({'telegram_id':int(tg)})
-async def get_setting(k,d=None):
-    x=await db.settings.find_one({'_id':k}); return x.get('value',d) if x else d
-async def set_setting(k,v): await db.settings.update_one({'_id':k},{'$set':{'value':v}},upsert=True)
-async def audit(actor,action,target=None,data=None): await db.audit_logs.insert_one({'actor':int(actor),'action':action,'target':target,'data':data or {},'created_at':now()})
-async def is_admin(tg):
-    if int(tg)==MAIN_ADMIN:return True
-    x=await db.staff.find_one({'telegram_id':int(tg),'active':True}); return bool(x and 'admin' in x.get('permissions',[]))
-async def has_permission(tg,p):
-    if int(tg)==MAIN_ADMIN:return True
-    x=await db.staff.find_one({'telegram_id':int(tg),'active':True}); return bool(x and (p in x.get('permissions',[]) or 'admin' in x.get('permissions',[])))
-async def notify_admin(text,markup=None):
-    try: await bot.send_message(MAIN_ADMIN,text,reply_markup=markup)
-    except Exception as e: log.warning('admin notification: %r',e)
-
-async def ensure_user(user):
-    old=await get_user(user.id)
-    # Every customer gets a permanent unique 10-digit referral code.
-    referral_code = None
-    if old is None:
-        for _ in range(10):
-            candidate = ''.join(__import__('random').choices('0123456789', k=10))
-            if not await db.users.find_one({'referral_code': candidate}):
-                referral_code = candidate
-                break
-        referral_code = referral_code or str(user.id)[-10:].zfill(10)
-    update={'$set':{'username':user.username,'first_name':user.first_name,'last_name':user.last_name,'updated_at':now()},'$setOnInsert':{'telegram_id':int(user.id),'language':'en','status':'active','wallet':{'available':0.0,'pending':0.0},'total_deposited':0.0,'total_spent':0.0,'referrals':0,'referral_earnings':0.0,'referral_code':referral_code,'created_at':now()}}
-    r=await db.users.update_one({'telegram_id':int(user.id)},update,upsert=True)
-    if old is None and r.upserted_id is not None:
-        await audit(user.id,'user_registered',str(user.id),{'username':user.username,'referral_code':referral_code})
-        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='👤 CUSTOMER',callback_data=f'customer:{user.id}'),InlineKeyboardButton(text='🚫 BAN',callback_data=f'ban:{user.id}')]])
-        await notify_admin('🆕 <b>NEW CUSTOMER</b>\n\n👤 Name: '+safe(user.full_name)+'\n🆔 Telegram ID: <code>'+str(user.id)+'</code>\n🔗 Username: @'+safe(user.username,'none')+'\n🎟 Referral Code: <code>'+safe(referral_code)+'</code>',kb)
-    return old is None and r.upserted_id is not None
-
-async def lang(tg):
-    u=await get_user(tg); return (u or {}).get('language','en')
-
-TEXTS={
-'en': {'welcome':'👋 <b>Welcome to Telesombot</b>\n\nChoose a service from the menu below.', 'choose_payment':'💵 <b>Choose Payment</b>\n\nSelect how you want to pay:', 'local':'📱 <b>Local Payment</b>\n\nChoose your mobile wallet:', 'crypto':'🪙 <b>Crypto Payment</b>\n\nChoose your cryptocurrency:', 'send_now':'📲 Send Now', 'confirm':'✅ Confirm', 'payment_done':'✅ <b>Payment confirmation received.</b>\n\nYour order is now being processed.', 'language':'🌐 <b>Select Language</b>'},
-'so': {'welcome':'👋 <b>Kusoo dhawoow Telesombot</b>\n\nDooro adeegga aad rabto.', 'choose_payment':'💵 <b>Dooro Habka Lacag-bixinta</b>\n\nDooro sida aad lacagta u bixinayso:', 'local':'📱 <b>Lacag-bixinta Local</b>\n\nDooro wallet-ka lacagta:', 'crypto':'🪙 <b>Lacag-bixinta Crypto</b>\n\nDooro lacagta crypto:', 'send_now':'📲 Hadda Dir', 'confirm':'✅ Xaqiiji', 'payment_done':'✅ <b>Xaqiijinta lacagta waa la helay.</b>\n\nDalabkaaga hadda waa la farsamaynayaa.', 'language':'🌐 <b>Dooro Luuqadda</b>'},
-'ar': {'welcome':'👋 <b>مرحباً بك في Telesombot</b>\n\nاختر الخدمة من القائمة أدناه.', 'choose_payment':'💵 <b>اختر طريقة الدفع</b>\n\nاختر طريقة الدفع التي تريدها:', 'local':'📱 <b>الدفع المحلي</b>\n\nاختر المحفظة:', 'crypto':'🪙 <b>الدفع بالعملات الرقمية</b>\n\nاختر العملة:', 'send_now':'📲 إرسال الآن', 'confirm':'✅ تأكيد', 'payment_done':'✅ <b>تم استلام تأكيد الدفع.</b>\n\nطلبك قيد المعالجة الآن.', 'language':'🌐 <b>اختر اللغة</b>'}
-}
-def tr(code,key): return TEXTS.get(code,TEXTS['en']).get(key,TEXTS['en'].get(key,key))
-
-def main_kb(admin=False):
-    rows=[
-        ['📱 Numbers','💎 VIP Numbers','🌐 Virtual Numbers'],
-        ['📲 eSIM','💳 Physical SIM','📡 Data'],
-        ['📞 Voice','💬 SMS','🔋 Recharge'],
-        ['📶 5G','🌐 Fiber','💰 ZAAD'],
-        ['🏢 Business','🏢 Corporate','🔌 IoT'],
-        ['☁️ Cloud','🎁 More Services','🎁 Offers'],
-        ['💰 Balance','💰 Wallet','🛒 My Orders'],
-        ['💵 Payments'],
-        ['👥 Referral','🆘 Customer Support','👤 My Profile'],
-        ['🌐 Language']
-    ]
-    if admin: rows.append(['🛠️ ADMIN PANEL TELESOM'])
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=x) for x in r] for r in rows],resize_keyboard=True,is_persistent=True)
-
-ADMIN_PANELS = (PANELS + [
-    'Payment Approvals','Order Approvals','Request Approvals','Customer Wallets','Wallet Adjustments',
-    'Number Pricing','Number Import','Data Pricing','Voice Pricing','SMS Pricing','Recharge Pricing',
-    'eSIM Pricing','SIM Pricing','Business Pricing','Corporate Pricing','5G Pricing','Fiber Pricing',
-    'Service Availability','Catalog Sync','Telesom Sync','Payment Destinations','Payment Settings',
-    'Order Settings','Registration Settings','Support Settings','Broadcast History','Message Templates',
-    'Customer Search','Customer Export','Orders Search','Payments Search','Refund Queue','Offer Manager',
-    'Promo Manager','Referral Manager','Membership Manager','Notification Manager','Business Requests',
-    'Corporate Requests','SIM Requests','eSIM Requests','Data Requests','Voice Requests','SMS Requests',
-    'Recharge Requests','5G Requests','Fiber Requests','ZAAD Requests','IoT Requests','Cloud Requests',
-    'Inventory Search','Inventory Import','Inventory Export','Low Stock','Unavailable Numbers',
-    'Reserved Numbers','Sold Numbers','Failed Orders','Completed Orders','Cancelled Orders',
-    'Revenue','Sales by Service','Sales by Day','Top Customers','Conversion Stats','Staff Manager',
-    'Permissions','Security Events','Login Activity','Audit Logs','Database Stats','System Settings',
-    'Service ON/OFF','Payment ON/OFF','Maintenance','Backup Info','Health Check','Refresh Website Data',
-    'Refresh Number Inventory','Admin Broadcast','Customer Announcements','Danger Zone'
-])[:100]
-
-def admin_kb():
-    rows=[]
-    for i in range(0,len(ADMIN_PANELS),2):
-        pair=[]
-        for j in (i,i+1):
-            if j<len(ADMIN_PANELS): pair.append(KeyboardButton(text=f'🛠 {j+1:02d}. {ADMIN_PANELS[j]}'))
-        rows.append(pair)
-    rows += [[KeyboardButton(text='⏳ Pending Approvals'),KeyboardButton(text='📢 BROADCAST')],[KeyboardButton(text='🏠 Customer Home')]]
-    return ReplyKeyboardMarkup(keyboard=rows,resize_keyboard=True,is_persistent=True)
-
-def approve_kb(kind,ident):
-    rows=[[InlineKeyboardButton(text='✅ CONFIRM',callback_data=f'approve:{kind}:{ident}'),InlineKeyboardButton(text='❌ REJECT',callback_data=f'reject:{kind}:{ident}')],[InlineKeyboardButton(text='📄 DETAILS',callback_data=f'details:{kind}:{ident}'),InlineKeyboardButton(text='💬 CONTACT USER',callback_data=f'contact:{kind}:{ident}')]]
-    if kind=='request': rows.append([InlineKeyboardButton(text='💰 SET PRICE & CONFIRM',callback_data=f'setprice:{ident}')])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def back_kb(): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Back',callback_data='home')]])
-
-async def create_order(uid_,service,details,amount=0):
-    oid=uid('ORD')
-    await db.orders.insert_one({'order_id':oid,'user_id':int(uid_),'service':service,'details':details,'amount':money(amount),'status':'awaiting_payment','payment_status':'unpaid','created_at':now(),'updated_at':now()})
-    return oid
-
-async def payment_target_text(order_id=None):
-    suffix=f':{order_id}' if order_id else ''
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📱 Local Payment',callback_data=f'localpay{suffix}')],
-        [InlineKeyboardButton(text='🪙 Crypto Payment',callback_data=f'cryptopay{suffix}')],
-        [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]
-    ])
-
-async def payment_methods_kb(order_id, kind):
-    names=['ZAAD','SAHAL'] if kind=='local' else ['BNB','USDT-BEP20']
-    rows=[]
-    for name in names:
-        x=await db.payment_methods.find_one({'name':name,'enabled':True})
-        if x or name in PAYMENT_DEFAULTS:
-            rows.append([InlineKeyboardButton(text=('💰 '+name if kind=='local' else '🪙 '+name),callback_data=f'paymethod:{name}:{order_id}')])
-    rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-async def number_page(chat, category, page=0, message=None):
-    cat={'numbers':'regular','vip':'vip','virtual':'virtual'}[category]
-    page=max(0,int(page)); size=20
-    total=await db.numbers.count_documents({'category':cat,'status':'available'})
-    rows=[]
-    async for x in db.numbers.find({'category':cat,'status':'available'}).sort('number',1).skip(page*size).limit(size):
-        rows.append([InlineKeyboardButton(text=f"{x.get('number','?')} — ${money(x.get('price')):.2f}",callback_data=f"number:{x.get('_id')}")])
-    if not rows:
-        text=f'<b>{SERVICES[category]}</b>\n\n📭 No available numbers currently.'
-        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Home',callback_data='home')]])
-    else:
-        total_pages=max(1,(total+size-1)//size)
-        text=f'<b>{SERVICES[category]}</b>\n\n📱 Available choices: <b>{total}</b>\nPage <b>{page+1}/{total_pages}</b>'
-        nav=[]
-        if page>0: nav.append(InlineKeyboardButton(text='⬅️ Previous',callback_data=f'numberspage:{category}:{page-1}'))
-        if (page+1)*size<total: nav.append(InlineKeyboardButton(text='Next ➡️',callback_data=f'numberspage:{category}:{page+1}'))
-        rows.append(nav) if nav else None
-        rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-        kb=InlineKeyboardMarkup(inline_keyboard=rows)
-    if message:
-        try: await message.edit_text(text,reply_markup=kb)
-        except Exception: await chat.answer(text,reply_markup=kb)
-    else:
-        await chat.answer(text,reply_markup=kb)
-
-async def send_catalog(m,category):
-    if category in ('numbers','vip','virtual'):
-        return await number_page(m,category,0)
-    if category=='offers':
-        rows=[]
-        async for x in db.offers.find({'enabled':True}).sort('created_at',-1).limit(20): rows.append(f"🎁 <b>{safe(x.get('title'))}</b>\n{safe(x.get('text'))}")
-        return await m.answer('\n\n'.join(rows) or 'No offers available.')
-    if not await get_setting('orders_open',True): return await m.answer('🔒 Ordering is currently closed.')
-    prices=await db.catalog.find({'service':category,'enabled':True}).sort('price',1).to_list(30)
-    if prices:
-        rows=[[InlineKeyboardButton(text=f"{safe(x.get('title'))} — ${money(x.get('price')):.2f}",callback_data=f"catalog:{x['_id']}")] for x in prices]
-        rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-        return await m.answer(f'<b>{SERVICES.get(category,category)}</b>\n\nChoose a package:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await m.answer(f'📋 <b>{SERVICES.get(category,category)}</b>\n\nTap <b>📝 REQUEST SERVICE</b> to send your request.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📝 REQUEST SERVICE',callback_data=f'request:{category}')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]]))
-
-@router.message(CommandStart())
-async def start(m:Message,state:FSMContext):
-    await state.clear()
-    is_new=await ensure_user(m.from_user)
-    # Deep-link referral: /start=1234567890 or /start 1234567890
-    payload=''
-    parts=(m.text or '').split(maxsplit=1)
-    if len(parts)>1: payload=parts[1].strip()
-    if is_new and payload and re.fullmatch(r'\d{10}',payload):
-        referrer=await db.users.find_one({'referral_code':payload})
-        if referrer and int(referrer.get('telegram_id',0)) != int(m.from_user.id):
-            try:
-                await db.referrals.insert_one({'referral_id':uid('REF'),'referrer_id':int(referrer['telegram_id']),'referred_id':int(m.from_user.id),'code':payload,'bonus':0.15,'created_at':now()})
-                await db.users.update_one({'telegram_id':int(referrer['telegram_id'])},{'$inc':{'referrals':1,'referral_earnings':0.15,'wallet.available':0.15}})
-                await db.wallet_ledger.insert_one({'ledger_id':uid('LED'),'user_id':int(referrer['telegram_id']),'type':'referral_bonus','amount':0.15,'balance_after':money(((await get_user(int(referrer['telegram_id']))) or {}).get('wallet',{}).get('available',0)),'description':'Referral bonus','created_at':now()})
-            except Exception as e: log.warning('referral award failed: %r',e)
-    admin=await is_admin(m.from_user.id)
-    name=safe(m.from_user.first_name,'there')
-    welcome=(f'🌟 <b>WELCOME TO TELESOMBOT</b> 🌟\n\n'
-             f'Hello <b>{name}</b> 👋\n\n'
-             '📱 <b>SIMs & Numbers</b>\n'
-             '📶 <b>Data • Voice • 5G</b>\n'
-             '💳 <b>Secure Payments</b>\n'
-             '💰 <b>Balance & Rewards</b>\n'
-             '🎁 <b>Referral Rewards</b>\n\n'
-             'Choose a service below and get started. 🚀')
-    await m.answer(welcome,reply_markup=main_kb(admin))
-
-# Customer buttons
-@router.message(F.text=='🏠 Customer Home')
-async def customer_home(m:Message,state:FSMContext): await state.clear(); await m.answer('🏠 <b>Customer Home</b>',reply_markup=main_kb(await is_admin(m.from_user.id)))
-@router.message(F.text=='🛠️ ADMIN PANEL TELESOM')
-async def admin_home(m:Message):
-    if not await is_admin(m.from_user.id): return await m.answer('❌ Not authorized.')
-    await m.answer('🛡️ <b>TELESOM ADMIN PANEL</b>\n\nChoose a management panel:',reply_markup=admin_kb())
-@router.message(F.text=='🎁 More Services')
-async def more_services(m:Message):
-    rows=[
-        [InlineKeyboardButton(text='📞 Call Conference',callback_data='serviceinfo:call_conference'),InlineKeyboardButton(text='🎵 Ila Maqal',callback_data='serviceinfo:ila_maqal')],
-        [InlineKeyboardButton(text='📚 Aqoonmaal',callback_data='serviceinfo:aqoonmaal'),InlineKeyboardButton(text='🩺 Shaafi',callback_data='serviceinfo:shaafi')],
-        [InlineKeyboardButton(text='🚗 ILA SOCO',callback_data='serviceinfo:ila_soco'),InlineKeyboardButton(text='🛡️ Antitheft',callback_data='serviceinfo:antitheft')],
-        [InlineKeyboardButton(text='🛍️ Mobile Market',callback_data='serviceinfo:mobile_market'),InlineKeyboardButton(text='📡 5G',callback_data='serviceinfo:5g')],
-        [InlineKeyboardButton(text='📞 Roaming',callback_data='serviceinfo:roaming'),InlineKeyboardButton(text='🌍 International Calling',callback_data='serviceinfo:international_calling')],
-        [InlineKeyboardButton(text='📋 Postpaid',callback_data='serviceinfo:postpaid'),InlineKeyboardButton(text='📞 Fixed Line',callback_data='serviceinfo:fixed_line')],
-    ]
-    await m.answer('🎁 <b>More Telesom Services</b>\n\nThese services are based on the current Telesom service catalogue. Purchasable packages appear when admin has configured a price/package for them.',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-@router.callback_query(F.data.startswith('serviceinfo:'))
-async def service_info(c:CallbackQuery):
-    key=c.data.split(':',1)[1]
-    names={'call_conference':'Call Conference','ila_maqal':'Ila Maqal','aqoonmaal':'Aqoonmaal','shaafi':'Shaafi','ila_soco':'ILA SOCO','antitheft':'Antitheft','mobile_market':'Mobile Market','5g':'5G','roaming':'Roaming','international_calling':'International Calling','postpaid':'Postpaid Plans','fixed_line':'Fixed Line Service'}
-    await c.message.answer(f'📋 <b>{safe(names.get(key,key))}</b>\n\nThis service is available in the Telesom catalogue. If an orderable package is configured by admin, it will appear under the relevant service menu.')
-    await c.answer()
-
-@router.message(F.text.in_({'📱 Numbers','💎 VIP Numbers','🌐 Virtual Numbers','📲 eSIM','💳 Physical SIM','📡 Data','📞 Voice','💬 SMS','🔋 Recharge','🌐 Fiber','💰 ZAAD','🏢 Business','🏢 Corporate','🔌 IoT','☁️ Cloud','🎁 Offers','📶 5G'}))
-async def service_button(m:Message):
-    mapping={'📱 Numbers':'numbers','💎 VIP Numbers':'vip','🌐 Virtual Numbers':'virtual','📲 eSIM':'esim','💳 Physical SIM':'sim','📡 Data':'data','📞 Voice':'voice','💬 SMS':'sms','🔋 Recharge':'recharge','🌐 Fiber':'fiber','💰 ZAAD':'zaad','🏢 Business':'business','🏢 Corporate':'corporate','🔌 IoT':'iot','☁️ Cloud':'cloud','🎁 Offers':'offers','📶 5G':'5g'}
-    await send_catalog(m,mapping[m.text])
-
-@router.callback_query(F.data.startswith('numberspage:'))
-async def numbers_page_cb(c:CallbackQuery):
-    _,category,page=c.data.split(':',2)
-    if category not in ('numbers','vip','virtual'): return await c.answer('Invalid category',show_alert=True)
-    await number_page(c.message,category,int(page),message=c.message)
-    await c.answer()
-
-@router.callback_query(F.data.startswith('number:'))
-async def number_select(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
-    try: x=await db.numbers.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1])})
-    except: x=None
-    if not x: return await c.answer('Item unavailable',show_alert=True)
-    await c.message.answer(f"📱 <b>{safe(x.get('number'))}</b>\n\nCategory: {safe(x.get('category'))}\nPrice: <b>${money(x.get('price')):.2f}</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🛒 ORDER NOW',callback_data=f'order_number:{x["_id"]}')],[InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])); await c.answer()
-@router.callback_query(F.data.startswith('order_number:'))
-async def order_number(c:CallbackQuery,state:FSMContext):
-    try: x=await db.numbers.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1]),'status':'available'})
-    except: x=None
-    if not x:return await c.answer('Number unavailable',show_alert=True)
-    oid=await create_order(c.from_user.id,x.get('category','number'),f"Number: {x.get('number')}",x.get('price',0))
-    await db.orders.update_one({'order_id':oid},{'$set':{'number_id':str(x['_id'])}})
-    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nNumber: <code>{safe(x.get("number"))}</code>\nAmount: <b>${money(x.get("price")):.2f}</b>\n\nTap <b>💵 PAY NOW</b> to continue your payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
-    await c.answer()
-
-@router.callback_query(F.data.startswith('catalog:'))
-async def catalog_select(c:CallbackQuery,state:FSMContext):
-    try: await c.message.delete()
-    except: pass
-    try: x=await db.catalog.find_one({'_id':__import__('bson').ObjectId(c.data.split(':',1)[1]),'enabled':True})
-    except: x=None
-    if not x:return await c.answer('Package unavailable',show_alert=True)
-    service=x.get('service','service')
-    if service in {'data','voice','sms','recharge','5g'}:
-        await state.update_data(catalog_id=str(x['_id']),catalog_service=service,catalog_title=x.get('title'),catalog_price=money(x.get('price')))
-        await state.set_state(UserFlow.target_number)
-        await c.message.answer(f'📱 <b>{safe(SERVICES.get(service,service))}</b>\n\nPackage: <b>{safe(x.get("title"))}</b>\nPrice: <b>${money(x.get("price")):.2f}</b>\n\n📞 Send the Telesom number that should receive this service.\nExample: <code>0634XXXXXX</code>')
-        return await c.answer()
-    oid=await create_order(c.from_user.id,service,x.get('title','Package'),x.get('price',0))
-    await c.message.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(service)}\nPackage: {safe(x.get("title"))}\nAmount: <b>${money(x.get("price")):.2f}</b>\n\n💳 Choose <b>PAY NOW</b> to complete payment.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
-    await c.answer()
-
-@router.message(UserFlow.target_number)
-async def target_number_submit(m:Message,state:FSMContext):
-    d=await state.get_data(); number=re.sub(r'\D','',m.text or '')
-    if number.startswith('252') and len(number)>=12: number='0'+number[-9:]
-    if not re.fullmatch(r'06\d{8}',number): return await m.answer('❌ Invalid Telesom number. Please send a valid 10-digit number, for example <code>0634XXXXXX</code>.')
-    service=d.get('catalog_service','data'); title=d.get('catalog_title','Package'); price=money(d.get('catalog_price'))
-    oid=await create_order(m.from_user.id,service,f'{title} | Recipient: {number}',price)
-    await db.orders.update_one({'order_id':oid},{'$set':{'target_number':number,'catalog_id':d.get('catalog_id')}})
-    await state.clear()
-    await m.answer(f'🛒 <b>Order Created</b>\n\nOrder: <code>{escape(oid)}</code>\nService: {safe(SERVICES.get(service,service))}\nPackage: {safe(title)}\nNumber: <code>{number}</code>\nAmount: <b>${price:.2f}</b>\n\n💳 Tap <b>PAY NOW</b> to continue.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders'),InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
-
-@router.callback_query(F.data.startswith('request:'))
-async def request_service(c:CallbackQuery,state:FSMContext):
-    service=c.data.split(':',1)[1]; await state.update_data(service=service); await state.set_state(UserFlow.order_details)
-    await c.message.answer(f'📝 <b>{safe(SERVICES.get(service,service))}</b>\n\nSend the required details. Your request will be sent to our service queue.\n💡 <b>No payment is requested yet.</b> The service price will be shown before payment.')
-    await c.answer()
-
-@router.message(UserFlow.order_details)
-async def order_details(m:Message,state:FSMContext):
-    d=await state.get_data(); service=d.get('service'); details=(m.text or '').strip()
-    if not details:return await m.answer('❌ Please send the required details.')
-    oid=await create_order(m.from_user.id,service,details,0); rid=uid('REQ')
-    await db.requests.insert_one({'request_id':rid,'user_id':m.from_user.id,'kind':service,'order_id':oid,'data':{'details':details,'service':service},'status':'pending','created_at':now(),'updated_at':now()})
-    await state.clear()
-    await notify_admin(f'📝 <b>NEW SERVICE REQUEST</b>\n\nRequest: <code>{rid}</code>\nOrder: <code>{oid}</code>\nUser: <code>{m.from_user.id}</code>\nService: <b>{safe(SERVICES.get(service,service))}</b>\nDetails: {safe(details)}\n\nSet/confirm the price before requesting payment.',approve_kb('request',rid))
-    await m.answer(f'✅ <b>Request Received</b>\n\nReference: <code>{rid}</code>\nYou do not need to pay yet. Once the price is confirmed, the bot will show <b>PAY NOW</b>.',reply_markup=main_kb(await is_admin(m.from_user.id)))
-
-@router.message(F.text=='💵 Payments')
-async def payments(m:Message):
-    await m.answer('💵 <b>Payments</b>\n\nFirst choose an unpaid order from <b>🛒 My Orders</b>, or use the payment button shown after creating an order.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders')],[InlineKeyboardButton(text='🏠 Home',callback_data='home')]]))
-
-@router.callback_query(F.data.startswith('choosepay:'))
-async def choose_pay(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
-    oid=c.data.split(':',1)[1]
-    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id,'status':{'$in':['awaiting_payment','pending']}})
-    if not order:return await c.answer('Order is unavailable or already paid.',show_alert=True)
-    amount=money(order.get('amount'))
-    if amount<=0:
-        await c.message.answer(tr(await lang(c.from_user.id),'choose_payment'),reply_markup=await payment_target_text(oid))
-    else:
-        await c.message.answer(tr(await lang(c.from_user.id),'choose_payment')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_target_text(oid))
-    await c.answer()
-
-@router.callback_query(F.data.startswith('localpay:'))
-async def local_pay(c:CallbackQuery):
-    oid=c.data.split(':',1)[1]
-    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
-    if not order:return await c.answer('Order not found',show_alert=True)
-    amount=money(order.get('amount'))
-    text=tr(await lang(c.from_user.id),'local')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>'
-    try: await c.message.delete()
-    except Exception: pass
-    await c.message.answer(text,reply_markup=await payment_methods_kb(oid,'local'))
-    await c.answer()
-
-@router.callback_query(F.data.startswith('cryptopay:'))
-async def crypto_pay(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
-    oid=c.data.split(':',1)[1]
-    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id})
-    if not order:return await c.answer('Order not found',show_alert=True)
-    amount=money(order.get('amount'))
-    await c.message.edit_text(tr(await lang(c.from_user.id),'crypto')+f'\n\n💰 <b>Amount: ${amount:.2f}</b>',reply_markup=await payment_methods_kb(oid,'crypto'))
-    await c.answer()
-
-@router.callback_query(F.data=='delete_msg')
-async def delete_msg(c:CallbackQuery):
-    try: await c.message.delete()
-    except: pass
-    await c.answer()
-
-@router.callback_query(F.data.startswith('paymethod:'))
-async def pay_method(c:CallbackQuery,state:FSMContext):
-    try: await c.message.delete()
-    except: pass
-    parts=c.data.split(':',2); method=parts[1]; oid=parts[2] if len(parts)>2 else ''
-    x=await db.payment_methods.find_one({'name':method,'enabled':True})
-    if not x and method in PAYMENT_DEFAULTS: x={'name':method,'destination':PAYMENT_DEFAULTS[method],'enabled':True}
-    if not x:return await c.answer('Payment method unavailable',show_alert=True)
-    order=await db.orders.find_one({'order_id':oid,'user_id':c.from_user.id}) if oid else None
-    if oid and not order:return await c.answer('Order not found',show_alert=True)
-    amount=money(order.get('amount')) if order else 0
-    if amount<=0:
-        return await c.answer('This order has no price yet.',show_alert=True)
-    await state.update_data(method=method,order_id=oid,expected_amount=amount)
-    await state.set_state(UserFlow.payment_reference)
-
-    if method in ('ZAAD','SAHAL'):
-        base=str(x.get('destination') or PAYMENT_DEFAULTS[method]).strip()
-        ussd=base + f'{amount:g}#'
-        dial_url='tel:' + quote(ussd, safe='*')
-        wallet_name=method
-        text=(f'💵 <b>{wallet_name} PAYMENT</b>\n\n'
-              f'💰 Amount: <b>${amount:.2f}</b>\n\n'
-              f'👇 Tap <b>Send Now</b>. Your phone dialer will open with the payment code and amount already filled in.\n\n'
-              f'After sending the payment, return here and tap <b>Confirm</b>.')
-        kb=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='📲 Send Now',url=dial_url)],
-            [InlineKeyboardButton(text='✅ Confirm',callback_data='paid_confirm')],
-            [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]
-        ])
-        await c.message.answer(text,reply_markup=kb)
-    else:
-        text=(f'🪙 <b>{safe(method)}</b>\n\n'
-              f'💰 Amount: <b>${amount:.2f}</b>\n\n'
-              f'📍 Send the exact amount to the address below, then tap <b>✅ I HAVE PAID</b>.\n\n'
-              f'<code>{escape(str(x.get("destination","")))}</code>')
-        await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ I HAVE PAID',callback_data='paid_confirm')],[InlineKeyboardButton(text='❌ CANCEL',callback_data='cancelpay')]]))
-    await c.answer()
-
-@router.callback_query(F.data=='paid_confirm')
-async def paid_confirm(c:CallbackQuery,state:FSMContext):
-    if await state.get_state()!=UserFlow.payment_reference.state:
-        return await c.answer('Choose a payment method first.',show_alert=True)
-    d=await state.get_data()
-    method=d.get('method','')
-    if method in ('ZAAD','SAHAL'):
-        prompt='🔎 <b>Payment Confirmation</b>\n\nSend the payment reference/transaction ID. If your wallet does not show a reference, send the phone number you paid from.\n\nExample: <code>TXN123456</code>'
-    else:
-        prompt='🔎 <b>Payment Confirmation</b>\n\nSend the transaction hash/reference.\n\nExample: <code>TXN123456</code>'
-    await c.message.answer(prompt)
-    await c.answer()
-
-@router.callback_query(F.data=='cancelpay')
-async def cancelpay(c:CallbackQuery,state:FSMContext):
-    await state.clear(); await c.message.answer('❌ Payment cancelled.',reply_markup=main_kb(await is_admin(c.from_user.id))); await c.answer()
-
-@router.message(UserFlow.payment_reference)
-async def payment_submit(m:Message,state:FSMContext):
-    d=await state.get_data(); ref=m.text.strip(); oid=d.get('order_id'); method=d.get('method'); expected=money(d.get('expected_amount'))
-    order=await db.orders.find_one({'order_id':oid,'user_id':m.from_user.id}) if oid else None
-    if oid and not order:return await m.answer('❌ Order not found.')
-    amount=expected
-    if amount<=0:
-        amount=money(ref.split()[1]) if len(ref.split())>1 and ref.split()[1].replace('.','',1).isdigit() else 0
-    if amount<=0:return await m.answer('❌ Amount could not be determined. Send: <code>REFERENCE AMOUNT</code>, for example <code>TXN123456 10</code>.')
-    if expected>0 and abs(amount-expected)>0.009:return await m.answer(f'❌ The payment must be exactly <b>${expected:.2f}</b>.')
-    if not await get_setting('payments_open',True):return await m.answer('🔒 Payments are currently closed.')
-    pid=uid('PAY')
-    await db.payments.insert_one({'payment_id':pid,'user_id':m.from_user.id,'order_id':oid,'method':method,'amount':amount,'reference':ref,'status':'pending','user_confirmed_at':now(),'created_at':now(),'updated_at':now()})
-    if oid:
-        await db.orders.update_one({'order_id':oid,'user_id':m.from_user.id},{'$set':{'payment_status':'pending_verification','status':'payment_submitted','payment_id':pid,'updated_at':now()}})
-    await state.clear()
-    await notify_admin(f'💳 <b>PAYMENT VERIFICATION REQUIRED</b>\n\nPayment: <code>{escape(pid)}</code>\nOrder: <code>{escape(oid or "WALLET")}</code>\nUser: <code>{m.from_user.id}</code>\nAmount: <b>${amount:.2f}</b>\nMethod: <b>{safe(method)}</b>\nReference: <code>{safe(ref)}</code>\n\n👤 The customer confirmed they already sent the payment.',approve_kb('payment',pid))
-    await m.answer(f'✅ <b>Payment Confirmation Sent</b>\n\nPayment: <code>{escape(pid)}</code>\nAmount: <b>${amount:.2f}</b>\nStatus: <b>WAITING FOR ADMIN VERIFICATION</b>\n\nYour payment has now been sent to admin for verification.',reply_markup=main_kb(await is_admin(m.from_user.id)))
-
-async def show_orders(chat, user_id):
-    rows=[]
-    async for x in db.orders.find({'user_id':user_id}).sort('created_at',-1).limit(20):
-        oid=escape(str(x.get('order_id',''))); status=safe(x.get('status')); service=safe(x.get('service')); amount=money(x.get('amount'))
-        rows.append(f'📦 <code>{oid}</code>\n{service} — <b>{status}</b>\nAmount: <b>${amount:.2f}</b>')
-    text='🛒 <b>My Orders</b>\n\n'+('\n\n'.join(rows) or 'No orders yet.')
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY UNPAID ORDER',callback_data='pick_unpaid')],[InlineKeyboardButton(text='🏠 Home',callback_data='home')]])
-    await chat.answer(text,reply_markup=kb)
-
-@router.message(F.text=='🛒 My Orders')
-async def orders(m:Message): await show_orders(m,m.from_user.id)
-@router.callback_query(F.data=='myorders')
-async def myorders(c:CallbackQuery): await show_orders(c.message,c.from_user.id); await c.answer()
-@router.callback_query(F.data=='pick_unpaid')
-async def pick_unpaid(c:CallbackQuery):
-    rows=[]
-    async for x in db.orders.find({'user_id':c.from_user.id,'status':{'$in':['awaiting_payment','payment_submitted']},'payment_status':{'$ne':'paid'}}).sort('created_at',-1).limit(20):
-        rows.append([InlineKeyboardButton(text=f'{x.get("order_id")} — ${money(x.get("amount")):.2f}',callback_data=f'choosepay:{x.get("order_id")}')])
-    if not rows:return await c.answer('No unpaid orders.',show_alert=True)
-    await c.message.answer('💵 <b>Select an unpaid order</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
-
-@router.message(F.text=='💰 Wallet')
-async def wallet(m:Message):
-    u=await get_user(m.from_user.id); w=(u or {}).get('wallet',{})
-    await m.answer(f'💰 <b>Wallet</b>\n\nAvailable: <b>${money(w.get("available")):.2f}</b>\nPending: <b>${money(w.get("pending")):.2f}</b>\nTotal deposited: ${money((u or {}).get("total_deposited")):.2f}\nTotal spent: ${money((u or {}).get("total_spent")):.2f}')
-@router.message(F.text=='👤 My Profile')
-async def profile(m:Message):
-    u=await get_user(m.from_user.id); await m.answer(f'👤 <b>My Profile</b>\n\nID: <code>{m.from_user.id}</code>\nName: {safe(m.from_user.full_name)}\nUsername: @{safe(m.from_user.username,"none")}\nLanguage: {safe((u or {}).get("language"),"en")}\nStatus: {safe((u or {}).get("status"),"active")}')
-@router.message(F.text=='👥 Referral')
-async def referral(m:Message):
-    u=await get_user(m.from_user.id)
-    code=(u or {}).get('referral_code')
-    if not code:
-        code=''.join(__import__('random').choices('0123456789',k=10))
-        await db.users.update_one({'telegram_id':m.from_user.id},{'$set':{'referral_code':code}})
-    me=await bot.get_me()
-    link=f'https://t.me/{me.username}?start={code}'
-    count=int((u or {}).get('referrals',0)); earnings=money((u or {}).get('referral_earnings',0))
-    share_text=f'🌟 Join Telesombot!\n\n📱 Get Telesom numbers, SIMs, data & services.\n🎁 Join with my referral code and start earning rewards!\n\n🔗 {link}'
-    share_url='https://t.me/share/url?url='+quote(link,safe='')+'&text='+quote(share_text,safe='')
-    kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='📤 Share Referral',url=share_url)],
-        [InlineKeyboardButton(text='📋 My Referral Code',callback_data='refcode')],
-        [InlineKeyboardButton(text='💰 Balance',callback_data='balance'),InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
-    await m.answer(f'👥 <b>REFERRAL REWARDS</b>\n\n🎟 Your code: <code>{code}</code>\n💵 You earn: <b>$0.15</b> per successful referral\n👥 Referrals: <b>{count}</b>\n💰 Referral earnings: <b>${earnings:.2f}</b>\n\nShare your link with friends. When a new user joins through your link, the reward is added to your Balance.',reply_markup=kb)
-
-@router.callback_query(F.data=='refcode')
-async def refcode(c:CallbackQuery):
-    u=await get_user(c.from_user.id); code=(u or {}).get('referral_code','')
-    await c.answer(f'Your referral code: {code}',show_alert=True)
-
-@router.callback_query(F.data=='balance')
-async def balance_cb(c:CallbackQuery):
-    await show_balance(c.message,c.from_user.id)
-    await c.answer()
-
-@router.message(F.text=='💰 Balance')
-async def balance_message(m:Message):
-    await show_balance(m,m.from_user.id)
-
-async def show_balance(chat,user_id):
-    u=await get_user(user_id); w=(u or {}).get('wallet',{})
-    available=money(w.get('available',0)); earnings=money((u or {}).get('referral_earnings',0))
-    kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='➕ Add Balance',callback_data='addbalance')],
-        [InlineKeyboardButton(text='👥 Referral',callback_data='referral_inline')],
-        [InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')]])
-    await chat.answer(f'💰 <b>MY BALANCE</b>\n\nAvailable: <b>${available:.2f}</b>\nReferral earnings: <b>${earnings:.2f}</b>\n\nUse your balance to purchase eligible numbers and services.',reply_markup=kb)
-
-@router.callback_query(F.data=='referral_inline')
-async def referral_inline(c:CallbackQuery):
-    await c.answer()
-    await referral(c.message)
-
-@router.callback_query(F.data=='addbalance')
-async def add_balance(c:CallbackQuery):
-    rows=[]
-    for stars in (100,250,500,750,1000):
-        rows.append([InlineKeyboardButton(text=f'⭐ {stars} Stars = ${stars/100:.2f}',callback_data=f'stars:{stars}')])
-    rows.append([InlineKeyboardButton(text='⭐ Custom Stars',callback_data='customstars')])
-    rows.append([InlineKeyboardButton(text='🗑️ Delete',callback_data='delete_msg')])
-    await c.message.edit_text('➕ <b>ADD BALANCE</b>\n\nPay with Telegram Stars.\n⭐ <b>100 Stars = $1.00</b>\n\nChoose an amount:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await c.answer()
-
-@router.callback_query(F.data.startswith('stars:'))
-async def stars_invoice(c:CallbackQuery):
-    stars=int(c.data.split(':',1)[1])
-    if stars<100 or stars>1000: return await c.answer('Invalid Stars amount',show_alert=True)
-    await bot.send_invoice(c.from_user.id,title=f'Add ${stars/100:.2f} Balance',description=f'Add {stars} Telegram Stars worth of balance.',payload=f'balance:{c.from_user.id}:{stars}:{uuid.uuid4().hex}',currency='XTR',prices=[LabeledPrice(label=f'Balance ${stars/100:.2f}',amount=stars)])
-    await c.answer()
-
-@router.callback_query(F.data=='customstars')
-async def custom_stars(c:CallbackQuery,state:FSMContext):
-    await state.set_state(UserFlow.custom_stars)
-    await c.message.answer('⭐ <b>Custom Stars</b>\n\nSend the number of Telegram Stars you want to add.\nMinimum: <b>100</b> Stars.')
-    await c.answer()
-
-@router.pre_checkout_query()
-async def pre_checkout(q):
-    await q.answer(ok=True)
-
-@router.message(F.successful_payment)
-async def successful_stars_payment(m:Message,state:FSMContext):
-    sp=m.successful_payment
-    payload=sp.invoice_payload or ''
-    if not payload.startswith('balance:'): return
-    parts=payload.split(':')
-    try: stars=int(parts[2])
-    except Exception: stars=int(sp.total_amount)
-    amount=round(stars/100,2)
-    await db.users.update_one({'telegram_id':m.from_user.id},{'$inc':{'wallet.available':amount,'total_deposited':amount}})
-    u=await get_user(m.from_user.id); available=money((u or {}).get('wallet',{}).get('available',0))
-    await db.wallet_ledger.insert_one({'ledger_id':uid('LED'),'user_id':m.from_user.id,'type':'stars_deposit','amount':amount,'balance_after':available,'stars':stars,'telegram_charge_id':sp.telegram_payment_charge_id,'created_at':now()})
-    await state.clear()
-    await m.answer(f'✅ <b>Balance Added Successfully</b>\n\n⭐ Stars: <b>{stars}</b>\n💰 Added: <b>${amount:.2f}</b>\n💳 New Balance: <b>${available:.2f}</b>',reply_markup=main_kb(await is_admin(m.from_user.id)))
-
-@router.message(UserFlow.custom_stars)
-async def custom_stars_input(m:Message,state:FSMContext):
-    try: stars=int((m.text or '').strip())
-    except: return await m.answer('❌ Send a whole number of Stars, e.g. <code>150</code>.')
-    if stars<100: return await m.answer('❌ Minimum is 100 Stars.')
-    if stars>1000000: return await m.answer('❌ Stars amount is too high.')
-    await bot.send_invoice(m.from_user.id,title=f'Add ${stars/100:.2f} Balance',description=f'Add {stars} Telegram Stars worth of balance.',payload=f'balance:{m.from_user.id}:{stars}:{uuid.uuid4().hex}',currency='XTR',prices=[LabeledPrice(label=f'Balance ${stars/100:.2f}',amount=stars)])
-    await state.clear()
-
-# Admin panels
-async def panel_text(n):
-    counts={1:await db.users.count_documents({}),2:await db.users.count_documents({}),3:await db.numbers.count_documents({'category':'regular'}),4:await db.numbers.count_documents({'category':'vip'}),5:await db.numbers.count_documents({'category':'virtual'}),6:await db.catalog.count_documents({'service':'esim'}),7:await db.catalog.count_documents({'service':'sim'}),8:await db.catalog.count_documents({'service':'data'}),9:await db.catalog.count_documents({'service':'voice'}),10:await db.catalog.count_documents({'service':'sms'}),11:await db.catalog.count_documents({'service':'recharge'}),12:await db.wallet_ledger.count_documents({}),13:await db.payments.count_documents({}),14:await db.orders.count_documents({}),15:await db.requests.count_documents({'kind':'refund'}),16:await db.offers.count_documents({}),17:await db.promos.count_documents({}),18:await db.referrals.count_documents({}),19:await db.memberships.count_documents({}),20:await db.support.count_documents({}),21:await db.notifications.count_documents({'type':'broadcast'}),22:await db.notifications.count_documents({}),23:await db.requests.count_documents({'kind':'business'}),24:await db.requests.count_documents({'kind':'corporate'}),25:await db.numbers.count_documents({}),26:await db.audit_logs.count_documents({}),27:await db.staff.count_documents({}),28:await db.security_events.count_documents({}),29:await db.audit_logs.count_documents({}),30:await db.settings.count_documents({})}
-    extra_col={31:('payments',{'status':'pending'}),32:('orders',{'status':{'$in':['awaiting_payment','payment_submitted','pending']}}),33:('requests',{'status':'pending'}),34:('users',{}),35:('wallet_ledger',{}),36:('numbers',{}),37:('numbers',{}),38:('catalog',{'service':'data'}),39:('catalog',{'service':'voice'}),40:('catalog',{'service':'sms'}),41:('catalog',{'service':'recharge'}),42:('catalog',{'service':'esim'}),43:('catalog',{'service':'sim'}),44:('catalog',{'service':'business'}),45:('requests',{'kind':'corporate'}),46:('catalog',{'service':'5g'}),47:('catalog',{'service':'fiber'}),48:('settings',{}),49:('catalog',{}),50:('audit_logs',{}),51:('payment_methods',{}),52:('payment_methods',{}),53:('orders',{}),54:('users',{}),55:('support',{}),56:('notifications',{'type':'broadcast'}),57:('notifications',{}),58:('users',{}),59:('users',{}),60:('orders',{}),61:('payments',{}),62:('requests',{'kind':'refund'}),63:('offers',{}),64:('promos',{}),65:('referrals',{}),66:('memberships',{}),67:('notifications',{}),68:('requests',{'kind':'business'}),69:('requests',{'kind':'corporate'}),70:('requests',{'kind':'sim'}),71:('requests',{'kind':'esim'}),72:('requests',{'kind':'data'}),73:('requests',{'kind':'voice'}),74:('requests',{'kind':'sms'}),75:('requests',{'kind':'recharge'}),76:('requests',{'kind':'5g'}),77:('requests',{'kind':'fiber'}),78:('requests',{'kind':'zaad'}),79:('requests',{'kind':'iot'}),80:('requests',{'kind':'cloud'}),81:('numbers',{}),82:('numbers',{}),83:('numbers',{}),84:('numbers',{'status':'low'}),85:('numbers',{'status':'unavailable'}),86:('numbers',{'status':'reserved'}),87:('numbers',{'status':'sold'}),88:('orders',{'status':'failed'}),89:('orders',{'status':'completed'}),90:('orders',{'status':'cancelled'}),91:('payments',{'status':'confirmed'}),92:('orders',{}),93:('orders',{}),94:('orders',{}),95:('users',{}),96:('staff',{}),97:('security_events',{}),98:('audit_logs',{}),99:('settings',{}),100:('settings',{})}
-    if n>30 and n in extra_col:
-        col,q=extra_col[n]
-        try: counts[n]=await db[col].count_documents(q)
-        except: counts[n]=0
-    name=PANELS[n-1] if n<=len(PANELS) else ADMIN_PANELS[n-1]
-    return f'🛠️ <b>{n}. {safe(name)}</b>\n\nRecords: <b>{counts.get(n,0)}</b>\n\nChoose an action below.'
-
-def panel_actions(n):
-    acts={1:[('📊 Refresh Dashboard','p:1'),('⏳ Pending Approvals','pending')],2:[('👥 List Customers','users'),('🔎 Find Customer','finduser')],3:[('➕ Add Number','addnum:regular'),('📋 Inventory','inventory:regular')],4:[('➕ Add VIP Number','addnum:vip'),('📋 VIP Inventory','inventory:vip')],5:[('➕ Add Virtual Number','addnum:virtual'),('📋 Inventory','inventory:virtual')],6:[('➕ Add eSIM Package','addcatalog:esim'),('📋 eSIM Packages','cataloglist:esim')],7:[('➕ Add SIM Package','addcatalog:sim'),('📋 SIM Packages','cataloglist:sim')],8:[('➕ Add Data Package','addcatalog:data'),('📋 Data Packages','cataloglist:data')],9:[('➕ Add Voice Package','addcatalog:voice'),('📋 Voice Packages','cataloglist:voice')],10:[('➕ Add SMS Package','addcatalog:sms'),('📋 SMS Packages','cataloglist:sms')],11:[('➕ Add Recharge Package','addcatalog:recharge'),('📋 Recharge Packages','cataloglist:recharge')],16:[('➕ Add Offer','addoffer'),('🎁 Active Offers','offers')],17:[('➕ Add Promo','addpromo'),('🎟 Promo List','promos')],20:[('🎧 Open Tickets','tickets')],21:[('📢 Broadcast','broadcast')],23:[('➕ Business Package','addcatalog:business'),('📋 Business Catalogue','cataloglist:business')],24:[('➕ Corporate Package','addcatalog:corporate'),('📋 Corporate Catalogue','cataloglist:corporate')],25:[('📦 Inventory','inventory:all')],26:[('📈 Analytics','analytics')],27:[('➕ Add Staff','addstaff'),('👨‍💼 Staff List','staff')],28:[('🔐 Security','security')],29:[('📋 Audit Logs','audit')],30:[('⚙️ Services ON/OFF','settings_services'),('💳 Payment Methods','settings_payments')]}
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=a,callback_data=cb) for a,cb in acts.get(n,[('📋 View Records',f'records:{n}')])]])
-
-@router.message(F.text.regexp(r'^🛠\s+\d{2,3}\. '))
-async def admin_panel_button(m:Message,state:FSMContext):
-    if not await is_admin(m.from_user.id): return
-    n=int(re.search(r'🛠\s+(\d+)\.',m.text).group(1)); await m.answer(await panel_text(n),reply_markup=panel_actions(n))
-
-@router.message(F.text=='📢 BROADCAST')
-async def broadcast_button(m:Message,state:FSMContext):
-    if not await has_permission(m.from_user.id,'broadcast'): return await m.answer('❌ Not authorized.')
-    await state.set_state(UserFlow.broadcast); await m.answer('📢 <b>Broadcast</b>\n\nSend the message to broadcast to all active customers.')
-
-@router.message(F.text=='⏳ Pending Approvals')
-async def pending(m:Message):
-    if not await has_permission(m.from_user.id,'admin'):return
-    found=0
-    async for r in db.requests.find({'status':'pending'}).sort('created_at',-1).limit(15):
-        found+=1; await m.answer(f'⏳ <b>REQUEST</b> <code>{r["request_id"]}</code>\nUser: <code>{r["user_id"]}</code>\nKind: {safe(r.get("kind"))}\nDetails: <code>{safe(r.get("data"))}</code>',reply_markup=approve_kb('request',r['request_id']))
-    async for p in db.payments.find({'status':'pending'}).sort('created_at',-1).limit(15):
-        found+=1; await m.answer(f'💳 <b>PAYMENT</b> <code>{p["payment_id"]}</code>\nUser: <code>{p["user_id"]}</code>\nOrder: <code>{p.get("order_id")}</code>\nAmount: <b>${money(p.get("amount")):.2f}</b>\nMethod: {safe(p.get("method"))}\nReference: <code>{safe(p.get("reference"))}</code>',reply_markup=approve_kb('payment',p['payment_id']))
-    if not found: await m.answer('✅ No pending approvals.')
-
-@router.callback_query(F.data.startswith('p:'))
-async def panel_callback(c:CallbackQuery):
-    if not await is_admin(c.from_user.id): return await c.answer('Not authorized',show_alert=True)
-    n=int(c.data.split(':')[1]); await c.message.answer(await panel_text(n),reply_markup=panel_actions(n)); await c.answer()
-
-# Admin action callbacks/input
-@router.callback_query(F.data.startswith('setprice:'))
-async def set_request_price(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'orders'): return await c.answer('Not authorized',show_alert=True)
-    rid=c.data.split(':',1)[1]; row=await db.requests.find_one({'request_id':rid,'status':'pending'})
-    if not row:return await c.answer('Request already processed.',show_alert=True)
-    await state.update_data(quote_request_id=rid); await state.set_state(UserFlow.quote_amount)
-    await c.message.answer(f'💰 <b>Set service price</b>\n\nRequest: <code>{rid}</code>\nSend the final customer price, for example: <code>25</code>'); await c.answer()
-
-@router.message(UserFlow.quote_amount)
-async def quote_amount_submit(m:Message,state:FSMContext):
-    if not await has_permission(m.from_user.id,'orders'): return
-    d=await state.get_data(); rid=d.get('quote_request_id'); amount=money((m.text or '').strip())
-    if amount<=0:return await m.answer('❌ Send a valid price, e.g. <code>25</code>.')
-    req=await db.requests.find_one({'request_id':rid,'status':'pending'})
-    if not req: await state.clear(); return await m.answer('❌ Request not found.')
-    oid=req.get('order_id')
-    await db.requests.update_one({'request_id':rid},{'$set':{'status':'confirmed','price':amount,'confirmed_by':m.from_user.id,'updated_at':now()}})
-    if oid: await db.orders.update_one({'order_id':oid},{'$set':{'amount':amount,'status':'awaiting_payment','payment_status':'unpaid','quoted_by':m.from_user.id,'quoted_at':now(),'updated_at':now()}})
-    await audit(m.from_user.id,'request_price_confirmed',rid,{'amount':amount}); await state.clear()
-    await bot.send_message(req['user_id'],f'💰 <b>Price Confirmed</b>\n\nReference: <code>{rid}</code>\nAmount: <b>${amount:.2f}</b>\n\n⏳ <b>Pending 5-10 Min. Please wait</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders')]]))
-    await m.answer(f'✅ Price ${amount:.2f} confirmed and payment opened for the customer.',reply_markup=admin_kb())
-
-@router.callback_query(F.data.startswith('approve:'))
-async def approve(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'admin'):return await c.answer('Not authorized',show_alert=True)
-    _,kind,ident=c.data.split(':',2)
-    if kind=='payment':
-        row=await db.payments.find_one_and_update({'payment_id':ident,'status':'pending'},{'$set':{'status':'confirmed','confirmed_by':c.from_user.id,'confirmed_at':now(),'updated_at':now()}},return_document=__import__('pymongo').ReturnDocument.AFTER)
-        if row:
-            oid=row.get('order_id')
-            if oid:
-                await db.orders.update_one({'order_id':oid,'user_id':row['user_id']},{'$set':{'payment_status':'paid','status':'processing','payment_confirmed_by':c.from_user.id,'updated_at':now()}})
-                await bot.send_message(row['user_id'],f'✅ <b>Payment Confirmed</b>\n\nPayment: <code>{escape(ident)}</code>\nAmount: <b>${money(row["amount"]):.2f}</b>\n\nYour order is now <b>PROCESSING</b>.')
-            else:
-                await bot.send_message(row['user_id'],f'✅ <b>Payment Confirmed</b>\n\nPayment: <code>{escape(ident)}</code>\nAmount: <b>${money(row["amount"]):.2f}</b>.')
-    elif kind=='request':
-        row=await db.requests.find_one({'request_id':ident,'status':'pending'})
-        if row:
-            amount=money(row.get('price'))
-            if amount<=0:
-                await c.answer('Set the customer price first.',show_alert=True); return
-            row=await db.requests.find_one_and_update({'request_id':ident,'status':'pending'},{'$set':{'status':'confirmed','confirmed_by':c.from_user.id,'updated_at':now()}},return_document=__import__('pymongo').ReturnDocument.AFTER)
-            oid=row.get('order_id') or row.get('data',{}).get('order_id')
-            if oid: await db.orders.update_one({'order_id':oid},{'$set':{'amount':amount,'status':'awaiting_payment','payment_status':'unpaid','updated_at':now()}})
-            await bot.send_message(row['user_id'],f'💰 <b>Price Confirmed</b>\n\nReference: <code>{escape(ident)}</code>\nAmount: <b>${amount:.2f}</b>\n\n⏳ <b>Pending 5-10 Min. Please wait</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💵 PAY NOW',callback_data=f'choosepay:{oid}')],[InlineKeyboardButton(text='🛒 My Orders',callback_data='myorders')]]))
-    else: row=None
-    if row: await audit(c.from_user.id,'approved',ident,{'kind':kind}); await c.message.edit_reply_markup(reply_markup=None); await c.answer('Confirmed')
-    else: await c.answer('Already processed / not found',show_alert=True)
-@router.callback_query(F.data.startswith('reject:'))
-async def reject(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'admin'):return await c.answer('Not authorized',show_alert=True)
-    _,kind,ident=c.data.split(':',2); col=db.payments if kind=='payment' else db.requests; key='payment_id' if kind=='payment' else 'request_id'
-    row=await col.find_one_and_update({key:ident,'status':'pending'},{'$set':{'status':'rejected','rejected_by':c.from_user.id,'updated_at':now()}},return_document=__import__('pymongo').ReturnDocument.AFTER)
-    if row:
-        if kind=='payment' and row.get('order_id'):
-            await db.orders.update_one({'order_id':row['order_id']},{'$set':{'payment_status':'rejected','status':'awaiting_payment','updated_at':now()}})
-        await bot.send_message(row['user_id'],f'❌ <b>{kind.title()} Rejected</b>\n\nReference: <code>{escape(ident)}</code>\nPlease check the payment details and try again.')
-        await audit(c.from_user.id,'rejected',ident,{'kind':kind}); await c.message.edit_reply_markup(reply_markup=None); await c.answer('Rejected')
-    else: await c.answer('Already processed / not found',show_alert=True)
-@router.callback_query(F.data.startswith('details:'))
-async def details(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'admin'):return await c.answer('Not authorized',show_alert=True)
-    _,kind,ident=c.data.split(':',2); row=await (db.payments.find_one({'payment_id':ident}) if kind=='payment' else db.support.find_one({'ticket_id':ident}) if kind=='support' else db.requests.find_one({'request_id':ident}));
-    if row: await c.message.answer('📄 <b>DETAILS</b>\n\n'+safe(row)); await c.answer()
-    else: await c.answer('Not found',show_alert=True)
-@router.callback_query(F.data.startswith('contact:'))
-async def contact(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'support'):return await c.answer('Not authorized',show_alert=True)
-    _,kind,ident=c.data.split(':',2); row=await (db.payments.find_one({'payment_id':ident}) if kind=='payment' else db.support.find_one({'ticket_id':ident}) if kind=='support' else db.requests.find_one({'request_id':ident}));
-    if row: await c.message.answer(f'💬 User Telegram ID: <code>{row.get("user_id")}</code>\nOpen the user profile in Telegram to contact them.'); await c.answer()
-    else: await c.answer('Not found',show_alert=True)
-
-@router.callback_query(F.data=='home')
-async def home(c:CallbackQuery): await c.message.answer('🏠 Customer Home',reply_markup=main_kb(await is_admin(c.from_user.id))); await c.answer()
-@router.callback_query(F.data.startswith('customer:'))
-async def customer(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'customers'):return await c.answer('Not authorized',show_alert=True)
-    tid=int(c.data.split(':')[1]); u=await get_user(tid); w=(u or {}).get('wallet',{}); await c.message.answer(f'👤 <b>Customer</b>\nID: <code>{tid}</code>\nUsername: @{safe((u or {}).get("username"),"none")}\nStatus: {safe((u or {}).get("status"))}\nAvailable: ${money(w.get("available")):.2f}\nPending: ${money(w.get("pending")):.2f}\nReferrals: {int((u or {}).get("referrals",0))}'); await c.answer()
-@router.callback_query(F.data.startswith('ban:'))
-async def ban(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'security'):return await c.answer('Not authorized',show_alert=True)
-    tid=int(c.data.split(':')[1]);
-    if tid==MAIN_ADMIN:return await c.answer('Main admin protected',show_alert=True)
-    await db.users.update_one({'telegram_id':tid},{'$set':{'status':'banned'}}); await audit(c.from_user.id,'user_banned',str(tid)); await c.answer('Banned')
-
-@router.callback_query(F.data=='addnum:regular')
-@router.callback_query(F.data=='addnum:vip')
-@router.callback_query(F.data=='addnum:virtual')
-async def addnum(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'numbers'):return await c.answer('Not authorized',show_alert=True)
-    cat=c.data.split(':')[1]; await state.update_data(input_kind='number',category=cat); await state.set_state(UserFlow.number_add); await c.message.answer(f'➕ Add {cat} number\n\nSend: <code>NUMBER PRICE</code>\nExample: <code>25263xxxxxx 25</code>'); await c.answer()
-@router.message(UserFlow.number_add)
-async def number_add(m:Message,state:FSMContext):
-    if not await has_permission(m.from_user.id,'numbers'):return
-    p=m.text.split(); d=await state.get_data()
-    if len(p)<2:return await m.answer('Format: NUMBER PRICE')
-    await db.numbers.update_one({'number':p[0]},{'$set':{'number':p[0],'price':money(p[1]),'category':d.get('category'),'status':'available','updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True); await audit(m.from_user.id,'number_upsert',p[0],{'category':d.get('category'),'price':money(p[1])}); await state.clear(); await m.answer('✅ Number added to inventory.',reply_markup=admin_kb())
-
-@router.callback_query(F.data=='addoffer')
-async def addoffer(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'offers'):return await c.answer('Not authorized',show_alert=True)
-    await state.set_state(UserFlow.catalog_add); await state.update_data(input_kind='offer'); await c.message.answer('➕ Send offer as: <code>TITLE | DESCRIPTION</code>'); await c.answer()
-@router.message(UserFlow.catalog_add)
-async def catalog_input(m:Message,state:FSMContext):
-    d=await state.get_data(); kind=d.get('input_kind')
-    if kind=='promo':
-        p=[x.strip() for x in (m.text or '').split('|',1)]
-        if len(p)!=2 or money(p[1])<=0:return await m.answer('Format: <code>CODE | DISCOUNT</code>')
-        await db.promos.update_one({'code':p[0].upper()},{'$set':{'code':p[0].upper(),'discount':money(p[1]),'enabled':True,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
-        await audit(m.from_user.id,'promo_upsert',p[0].upper(),{'discount':money(p[1])}); await state.clear(); return await m.answer('✅ Promo saved.',reply_markup=admin_kb())
-    if kind!='offer':return
-    p=[x.strip() for x in (m.text or '').split('|',1)]
-    if len(p)<2:return await m.answer('Format: TITLE | DESCRIPTION')
-    oid=uid('OFF'); await db.offers.insert_one({'offer_id':oid,'title':p[0],'text':p[1],'enabled':True,'created_at':now()}); await audit(m.from_user.id,'offer_created',oid); await state.clear(); await m.answer('✅ Offer created.',reply_markup=admin_kb())
-
-@router.callback_query(F.data=='addstaff')
-async def addstaff(c:CallbackQuery,state:FSMContext):
-    if c.from_user.id!=MAIN_ADMIN:return await c.answer('Main admin only',show_alert=True)
-    await state.set_state(UserFlow.admin_input); await state.update_data(input_kind='staff'); await c.message.answer('👨‍💼 Send: <code>TELEGRAM_ID permission1,permission2</code>'); await c.answer()
-@router.message(UserFlow.admin_input)
-async def admin_input(m:Message,state:FSMContext):
-    d=await state.get_data(); kind=d.get('input_kind')
-    if kind!='staff':return
-    p=m.text.split(maxsplit=1)
-    if len(p)<2:return await m.answer('Format: TELEGRAM_ID permission1,permission2')
-    try:tid=int(p[0])
-    except:return await m.answer('Invalid Telegram ID')
-    perms=sorted(set(p[1].split(','))&PERMISSIONS); await db.staff.update_one({'telegram_id':tid},{'$set':{'telegram_id':tid,'permissions':perms,'active':True,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True); await audit(m.from_user.id,'staff_upsert',str(tid),{'permissions':perms}); await state.clear(); await m.answer('✅ Staff saved.',reply_markup=admin_kb())
-
-@router.callback_query(F.data=='finduser')
-async def finduser(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'customers'):return await c.answer('Not authorized',show_alert=True)
-    await state.set_state(UserFlow.search_user); await c.message.answer('🔎 Send customer Telegram ID.'); await c.answer()
-@router.message(UserFlow.search_user)
-async def search_user(m:Message,state:FSMContext):
-    try:tid=int(m.text.strip())
-    except:return await m.answer('Invalid Telegram ID')
-    u=await get_user(tid); await state.clear()
-    if not u:return await m.answer('Customer not found.',reply_markup=admin_kb())
-    w=u.get('wallet',{}); await m.answer(f'👤 ID: <code>{tid}</code>\nUsername: @{safe(u.get("username"),"none")}\nStatus: {safe(u.get("status"))}\nAvailable: ${money(w.get("available")):.2f}\nPending: ${money(w.get("pending")):.2f}',reply_markup=admin_kb())
-
-@router.callback_query(F.data.startswith('addcatalog:'))
-async def add_catalog(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'settings'): return await c.answer('Not authorized',show_alert=True)
-    service=c.data.split(':',1)[1]
-    await state.update_data(input_kind='catalog',catalog_service=service)
-    await state.set_state(UserFlow.catalog_add)
-    await c.message.answer(f'➕ <b>Add {safe(service)} package</b>\n\nSend: <code>TITLE | PRICE</code>\nExample: <code>10 GB - 30 Days | 5</code>')
-    await c.answer()
-
-@router.message(UserFlow.catalog_add)
-async def catalog_add_submit(m:Message,state:FSMContext):
-    if not await has_permission(m.from_user.id,'settings'): return
-    d=await state.get_data(); parts=[x.strip() for x in (m.text or '').split('|',1)]
-    if len(parts)!=2 or money(parts[1])<=0:
-        return await m.answer('❌ Format: <code>TITLE | PRICE</code>')
-    title,price=parts[0],money(parts[1]); service=d.get('catalog_service','data')
-    await db.catalog.update_one({'service':service,'title':title},{'$set':{'service':service,'title':title,'price':price,'enabled':True,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
-    await audit(m.from_user.id,'catalog_upsert',title,{'service':service,'price':price}); await state.clear()
-    await m.answer(f'✅ Package saved.\n\n{safe(title)} — <b>${price:.2f}</b>',reply_markup=admin_kb())
-
-@router.callback_query(F.data.startswith('cataloglist:'))
-async def catalog_list(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'settings'): return await c.answer('Not authorized',show_alert=True)
-    service=c.data.split(':',1)[1]; rows=[]
-    async for x in db.catalog.find({'service':service}).sort('price',1).limit(50): rows.append(f'📦 <b>{safe(x.get("title"))}</b> — ${money(x.get("price")):.2f} — {"ON" if x.get("enabled") else "OFF"}')
-    await c.message.answer(f'📋 <b>{safe(service)} Catalogue</b>\n\n'+('\n'.join(rows) or 'No packages configured.')); await c.answer()
-
-@router.callback_query(F.data=='broadcast')
-async def broadcast(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'broadcast'):return await c.answer('Not authorized',show_alert=True)
-    await state.set_state(UserFlow.broadcast); await c.message.answer('📢 Send any message (text, photo, video, document, etc.). It will be copied to all active customers.'); await c.answer()
-@router.message(UserFlow.broadcast)
-async def broadcast_send(m:Message,state:FSMContext):
-    if not await has_permission(m.from_user.id,'broadcast'): return
-    count=0
-    async for u in db.users.find({'status':{'$ne':'banned'}},{'telegram_id':1}):
-        try:
-            await bot.copy_message(chat_id=int(u['telegram_id']),from_chat_id=m.chat.id,message_id=m.message_id)
-            count+=1
-        except: pass
-    await db.notifications.insert_one({'type':'broadcast','text':m.text or m.caption or '[media]','count':count,'created_at':now()})
-    await audit(m.from_user.id,'broadcast',None,{'count':count}); await state.clear()
-    await m.answer(f'📢 Broadcast sent to <b>{count}</b> customers.',reply_markup=admin_kb())
-
-@router.callback_query(F.data=='users')
-async def users(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'customers'):return await c.answer('Not authorized',show_alert=True)
-    total=await db.users.count_documents({}); active=await db.users.count_documents({'status':'active'}); banned=await db.users.count_documents({'status':'banned'}); await c.message.answer(f'👥 <b>Customers</b>\n\nTotal: {total}\nActive: {active}\nBanned: {banned}'); await c.answer()
-@router.callback_query(F.data.startswith('inventory:'))
-async def inventory(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'numbers'):return await c.answer('Not authorized',show_alert=True)
-    cat=c.data.split(':')[1]; q={} if cat=='all' else {'category':cat}; rows=[]
-    async for x in db.numbers.find(q).sort('created_at',-1).limit(30): rows.append(f"<code>{safe(x.get('number'))}</code> — ${money(x.get('price')):.2f} — {safe(x.get('category'))} — {safe(x.get('status'))}")
-    await c.message.answer('📦 <b>Inventory</b>\n\n'+('\n'.join(rows) or 'No inventory.')); await c.answer()
-@router.callback_query(F.data=='offers')
-async def offers(c:CallbackQuery):
-    rows=[]
-    async for x in db.offers.find({'enabled':True}).limit(30):rows.append(f"🎁 {safe(x.get('title'))} — {safe(x.get('text'))}")
-    await c.message.answer('🎁 <b>Offers</b>\n\n'+('\n'.join(rows) or 'No offers.'));await c.answer()
-@router.callback_query(F.data=='promos')
-async def promos(c:CallbackQuery):
-    rows=[]
-    async for x in db.promos.find({}).limit(30):rows.append(f"🎟 <code>{safe(x.get('code'))}</code> — {money(x.get('discount')):.2f} — {'ON' if x.get('enabled') else 'OFF'}")
-    await c.message.answer('🎟 <b>Promo Codes</b>\n\n'+('\n'.join(rows) or 'No promos.'));await c.answer()
-@router.callback_query(F.data=='tickets')
-async def tickets(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'support'):return await c.answer('Not authorized',show_alert=True)
-    async for x in db.support.find({'status':'open'}).sort('created_at',-1).limit(15): await c.message.answer(f'🎧 <b>{x["ticket_id"]}</b>\nUser: <code>{x["user_id"]}</code>\n{x.get("message","")}',reply_markup=approve_kb('support',x['ticket_id']))
-    await c.answer()
-@router.callback_query(F.data=='analytics')
-async def analytics(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'analytics'):return await c.answer('Not authorized',show_alert=True)
-    await c.message.answer(f'📈 <b>Analytics</b>\n\nCustomers: {await db.users.count_documents({})}\nOrders: {await db.orders.count_documents({})}\nPayments: {await db.payments.count_documents({})}\nNumbers: {await db.numbers.count_documents({})}\nPending requests: {await db.requests.count_documents({"status":"pending"})}\nPending payments: {await db.payments.count_documents({"status":"pending"})}');await c.answer()
-@router.callback_query(F.data=='staff')
-async def staff(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'staff'):return await c.answer('Not authorized',show_alert=True)
-    rows=[]
-    async for x in db.staff.find({}).limit(30):rows.append(f"<code>{x['telegram_id']}</code> — {', '.join(x.get('permissions',[]))} — {'ON' if x.get('active') else 'OFF'}")
-    await c.message.answer('👨‍💼 <b>Staff</b>\n\n'+('\n'.join(rows) or 'No staff.'));await c.answer()
-@router.callback_query(F.data=='audit')
-async def audit_logs(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'settings'):return await c.answer('Not authorized',show_alert=True)
-    rows=[]
-    async for x in db.audit_logs.find({}).sort('created_at',-1).limit(20):rows.append(f"{safe(x.get('action'))} | actor {x.get('actor')} | {safe(x.get('target'))}")
-    await c.message.answer('📋 <b>Audit Logs</b>\n\n'+('\n'.join(rows) or 'No logs.'));await c.answer()
-@router.callback_query(F.data=='security')
-async def security(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'security'):return await c.answer('Not authorized',show_alert=True)
-    await c.message.answer('🔐 <b>Security</b>\n\nMain admin is protected. All important admin actions are logged.\nUse the customer BAN button and staff permissions from the corresponding panels.');await c.answer()
-@router.callback_query(F.data=='pending')
-async def pending_callback(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'admin'): return await c.answer('Not authorized',show_alert=True)
-    await pending(c.message); await c.answer()
-
-@router.callback_query(F.data=='settings_payments')
-async def settings_payments(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'payments'): return await c.answer('Not authorized',show_alert=True)
-    rows=[]
-    async for x in db.payment_methods.find({}).sort('name',1):
-        state='🟢 ON' if x.get('enabled') else '🔴 OFF'
-        rows.append([InlineKeyboardButton(text=f'{x.get("name")} — {state}',callback_data=f'togglepay:{x.get("name")}')])
-    await c.message.answer('💳 <b>Payment Methods</b>\n\nTap a method to turn it ON/OFF.',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text='No methods',callback_data='noop')]])); await c.answer()
-
-@router.callback_query(F.data.startswith('togglepay:'))
-async def toggle_payment_method(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'payments'): return await c.answer('Not authorized',show_alert=True)
-    name=c.data.split(':',1)[1]
-    row=await db.payment_methods.find_one({'name':name})
-    if not row:return await c.answer('Not found',show_alert=True)
-    enabled=not bool(row.get('enabled'))
-    await db.payment_methods.update_one({'name':name},{'$set':{'enabled':enabled,'updated_at':now()}})
-    await audit(c.from_user.id,'payment_method_toggle',name,{'enabled':enabled})
-    await c.answer('ON' if enabled else 'OFF',show_alert=True)
-
-@router.callback_query(F.data=='addpromo')
-async def addpromo(c:CallbackQuery,state:FSMContext):
-    if not await has_permission(c.from_user.id,'promos'): return await c.answer('Not authorized',show_alert=True)
-    await state.update_data(input_kind='promo'); await state.set_state(UserFlow.catalog_add)
-    await c.message.answer('🎟 <b>Add Promo</b>\n\nSend: <code>CODE | DISCOUNT</code>\nExample: <code>WELCOME10 | 10</code>'); await c.answer()
-
-@router.callback_query(F.data=='settings_services')
-async def settings_services(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'settings'):return await c.answer('Not authorized',show_alert=True)
-    await c.message.answer('⚙️ <b>Service Controls</b>',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🟢 Orders ON/OFF',callback_data='toggle:orders_open')],[InlineKeyboardButton(text='💳 Payments ON/OFF',callback_data='toggle:payments_open')],[InlineKeyboardButton(text='🎧 Support ON/OFF',callback_data='toggle:support_open')]]));await c.answer()
-@router.callback_query(F.data.startswith('toggle:'))
-async def toggle(c:CallbackQuery):
-    if not await has_permission(c.from_user.id,'settings'):return await c.answer('Not authorized',show_alert=True)
-    k=c.data.split(':')[1]; v=not await get_setting(k,True); await set_setting(k,v); await audit(c.from_user.id,'setting_toggled',k,{'value':v}); await c.answer(('ON' if v else 'OFF'),show_alert=True)
-
-# Generic records for all remaining panels
-@router.callback_query(F.data.startswith('records:'))
-async def records(c:CallbackQuery):
-    if not await is_admin(c.from_user.id):return await c.answer('Not authorized',show_alert=True)
-    n=int(c.data.split(':')[1]); colmap={6:'catalog',7:'catalog',8:'catalog',9:'catalog',10:'catalog',11:'catalog',12:'wallet_ledger',13:'payments',14:'orders',15:'requests',18:'referrals',19:'memberships',22:'notifications',23:'requests',24:'requests'}; col=colmap.get(n)
-    if not col:return await c.answer('This panel is ready for configuration through its dedicated controls.',show_alert=True)
-    rows=[]
-    async for x in db[col].find({}).sort('created_at',-1).limit(15):rows.append(str(x.get('request_id') or x.get('order_id') or x.get('payment_id') or x.get('_id'))+' | '+safe(x.get('status'),safe(x.get('service'))))
-    await c.message.answer(f'📋 <b>{PANELS[n-1]}</b>\n\n'+('\n'.join(rows) or 'No records.'));await c.answer()
-
-# Banned guard / free text guard
-@router.message()
-async def fallback(m:Message,state:FSMContext):
-    u=await get_user(m.from_user.id)
-    if u and u.get('status')=='banned':return await m.answer('🚫 Your account is blocked.')
-    if await state.get_state(): return
-    await m.answer('👇 Please use the buttons on the menu.',reply_markup=main_kb(await is_admin(m.from_user.id)))
-
-# Public Telesom website catalogue sync. This reads publicly visible products/prices; it does not invent inventory.
-TELESOM_PUBLIC_PAGES=[
-    'https://telesom.com/personal/products',
-    'https://telesom.com/personal/data_bundles/0',
-    'https://telesom.com/personal/network/4g',
-    'https://telesom.com/personal/network/5g',
-    'https://telesom.com/personal/esim',
-    'https://telesom.com/personal/kaafiye',
-]
-
-async def sync_telesom_catalog():
-    try:
-        import aiohttp
-        from bs4 import BeautifulSoup
-        timeout=aiohttp.ClientTimeout(total=25)
-        headers={'User-Agent':'Mozilla/5.0 (compatible; Telesombot/1.0)'}
-        async with aiohttp.ClientSession(timeout=timeout,headers=headers) as session:
-            for url in TELESOM_PUBLIC_PAGES:
-                try:
-                    async with session.get(url,allow_redirects=True) as r:
-                        if r.status != 200: continue
-                        html=await r.text(errors='ignore')
-                    soup=BeautifulSoup(html,'html.parser')
-                    text='\n'.join(x.strip() for x in soup.stripped_strings if x.strip())
-                    service=('data' if 'data_bundles' in url else ('voice' if '/network/4g' in url or '/kaafiye' in url else ('5g' if '/network/5g' in url else ('esim' if '/esim' in url else 'sim'))))
-                    # Capture nearby product/price lines from the public page.
-                    lines=text.splitlines()
-                    for i,line in enumerate(lines):
-                        m=re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)',line)
-                        if not m: continue
-                        price=money(m.group(1))
-                        if price<=0 or price>1000: continue
-                        title=re.sub(r'\s+',' ',re.sub(r'\$\s*[0-9]+(?:\.[0-9]+)?','',line)).strip(' -:')
-                        if not title or len(title)<3 or len(title)>120: continue
-                        if title.lower() in {'buy now','top-up','price','pricing'}: continue
-                        await db.catalog.update_one({'service':service,'title':title},{'$set':{'service':service,'title':title,'price':price,'enabled':True,'source':'telesom.com','source_url':url,'synced_at':now()}},upsert=True)
-                except Exception as e:
-                    log.warning('Telesom sync page failed %s: %r',url,e)
-    except Exception as e:
-        log.warning('Telesom website sync unavailable: %r',e)
-
-async def sync_telesom_numbers():
-    """Sync every publicly discoverable Telesom SIM order page.
-    Only numbers actually exposed by telesom.com are imported; no numbers are invented.
+import shutil
+import threading
+import asyncio
+import uuid
+import time
+import hashlib
+import hmac
+import html
+import urllib.parse
+import contextvars
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from cryptography.fernet import Fernet
+except Exception:
+    Fernet = None
+
+from telethon import TelegramClient
+
+# ================= CONFIG =================
+
+TOKEN = os.getenv("BOT_TOKEN")
+BOT2_TOKEN = os.getenv("BOT2_TOKEN")  # Existing verification bot
+CUSTOMER_AI_BOT_TOKEN = os.getenv("CUSTOMER_AI_BOT_TOKEN", "").strip()
+
+# Dedicated Telegram managed-bot Creator. Bot Management Mode must be enabled.
+CREATOR_BOT_TOKEN = os.getenv("CREATOR_BOT_TOKEN", "").strip()
+CREATOR_BOT_USERNAME = os.getenv("CREATOR_BOT_USERNAME", "").strip().lstrip("@")
+MANAGED_TOKEN_ENCRYPTION_KEY = os.getenv("MANAGED_TOKEN_ENCRYPTION_KEY", "").strip()
+
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH")
+
+PHONE = os.getenv("PHONE")
+
+# Resend API Config for support@vexdou.space (HTTP Port 443 - Railway-friendly)
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "support@vexdou.space")
+
+# D7 SMS API Config (SMS ONLY)
+D7_TOKEN = os.getenv("D7_TOKEN")
+D7_VERIFY_BASE_URL = "https://api.d7networks.com/verify/v1"
+D7_VERIFY_SEND_URL = f"{D7_VERIFY_BASE_URL}/otp/send-otp"
+D7_VERIFY_RESEND_URL = f"{D7_VERIFY_BASE_URL}/otp/resend-otp"
+D7_VERIFY_CHECK_URL = f"{D7_VERIFY_BASE_URL}/otp/verify-otp"
+D7_VERIFY_STATUS_URL = f"{D7_VERIFY_BASE_URL}/report"
+
+# WaForge WhatsApp OTP (WhatsApp is intentionally separate from D7 SMS)
+WAFORGE_API_KEY = os.getenv("WAFORGE_API_KEY", "").strip()
+# Optional overrides are useful if WaForge changes the endpoint/auth scheme.
+WAFORGE_BASE_URL = os.getenv("WAFORGE_BASE_URL", "https://www.waforge.online/api").rstrip("/")
+WAFORGE_API_KEY_HEADER = os.getenv("WAFORGE_API_KEY_HEADER", "Authorization").strip() or "Authorization"
+if WAFORGE_BASE_URL.endswith("/api/v1"):
+    # Older deployments may still have the legacy base in Railway Variables.
+    # Prefer the current WaForge /api contract automatically.
+    WAFORGE_BASE_URL = WAFORGE_BASE_URL[:-3]
+# WaForge's current public API uses /api/otp/send and /api/otp/verify.
+# Keep the legacy /api/v1 paths as a compatibility fallback for older accounts.
+WAFORGE_OTP_SEND_URL = f"{WAFORGE_BASE_URL}/otp/send"
+WAFORGE_OTP_VERIFY_URL = f"{WAFORGE_BASE_URL}/otp/verify"
+WAFORGE_LEGACY_BASE_URL = os.getenv("WAFORGE_LEGACY_BASE_URL", "https://www.waforge.online/api/v1").rstrip("/")
+WAFORGE_OTP_SEND_LEGACY_URL = f"{WAFORGE_LEGACY_BASE_URL}/otp/send"
+WAFORGE_OTP_VERIFY_LEGACY_URL = f"{WAFORGE_LEGACY_BASE_URL}/otp/verify"
+WAFORGE_OTP_TTL = 300
+WHATSAPP_OTP_TTL = WAFORGE_OTP_TTL
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+# Railway can store the complete Netscape/Mozilla cookies.txt as the value of
+# YOUTUBE_COOKIES. YTDLP_COOKIES_FILE is also supported for a mounted file path.
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
+_YTDLP_ENV_COOKIE_PATH = os.path.join("/tmp", "downloadvedioytibot_youtube_cookies.txt")
+
+def _ytdlp_cookiefile():
+    """Return a yt-dlp-compatible cookies.txt path.
+
+    Priority: explicit file path, then the full cookie text stored in
+    YOUTUBE_COOKIES. The Railway env value is materialized only in /tmp and is
+    never printed to logs.
     """
     try:
-        import aiohttp
-        from bs4 import BeautifulSoup
-        timeout=aiohttp.ClientTimeout(total=20)
-        headers={'User-Agent':'Mozilla/5.0 (compatible; Telesombot/1.0)'}
-        async with aiohttp.ClientSession(timeout=timeout,headers=headers) as session:
-            async with session.get('https://telesom.com/personal/products',allow_redirects=True) as r:
-                if r.status != 200: return
-                html=await r.text(errors='ignore')
-            soup=BeautifulSoup(html,'html.parser')
-            links=[]
-            for a in soup.find_all('a',href=True):
-                href=a.get('href','')
-                if 'sim_device' in href:
-                    url=href if href.startswith('http') else 'https://telesom.com'+href
-                    if url not in links: links.append(url)
-            if not links: return
-            sem=asyncio.Semaphore(20)
-            seen=set(); successful=False
-            async def fetch(url):
-                nonlocal successful
-                async with sem:
-                    try:
-                        async with session.get(url,allow_redirects=True) as rr:
-                            if rr.status != 200: return []
-                            page=await rr.text(errors='ignore')
-                        successful=True
-                        text='\n'.join(BeautifulSoup(page,'html.parser').stripped_strings)
-                        found=[]
-                        for number in set(re.findall(r'\b63\d{7}\b',text)):
-                            pos=text.find(number)
-                            nearby=text[max(0,pos-800):pos+800] if pos>=0 else text[:1500]
-                            pm=re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)',nearby)
-                            price=money(pm.group(1)) if pm else 10.0
-                            category='vip' if re.search(r'vip',nearby,re.I) else 'regular'
-                            found.append((number,price,category,url))
-                        return found
-                    except Exception as e:
-                        log.warning('Telesom number page failed: %r',e); return []
-            results=await asyncio.gather(*(fetch(u) for u in links))
-            for batch in results:
-                for number,price,category,url in batch:
-                    seen.add(number)
-                    await db.numbers.update_one({'number':number},{'$set':{'number':number,'price':price,'category':category,'status':'available','source':'telesom.com','source_url':url,'updated_at':now()},'$setOnInsert':{'created_at':now()}},upsert=True)
-            # Only mark old website inventory unavailable when the website crawl itself succeeded.
-            if successful and seen:
-                await db.numbers.update_many({'source':'telesom.com','number':{'$nin':list(seen)},'status':'available'},{'$set':{'status':'unavailable','updated_at':now()}})
-            log.info('Telesom number sync: %s public pages, %s numbers',len(links),len(seen))
+        if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+            return YTDLP_COOKIES_FILE
+        raw = str(YOUTUBE_COOKIES or "")
+        if not raw.strip():
+            return ""
+        # Railway may preserve literal \n sequences depending on how the
+        # variable was pasted. Convert them only when the value otherwise looks
+        # like a Netscape cookies file.
+        if "\\n" in raw and "\n" not in raw:
+            raw = raw.replace("\\n", "\n")
+        raw = raw.strip() + "\n"
+        if not raw.startswith("# HTTP Cookie File") and not raw.startswith("# Netscape HTTP Cookie File"):
+            print("YouTube cookies env ignored: not a Netscape/Mozilla cookies.txt file")
+            return ""
+        try:
+            if os.path.isfile(_YTDLP_ENV_COOKIE_PATH):
+                with open(_YTDLP_ENV_COOKIE_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                    if f.read() == raw:
+                        return _YTDLP_ENV_COOKIE_PATH
+        except Exception:
+            pass
+        with open(_YTDLP_ENV_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+            f.write(raw)
+        try:
+            os.chmod(_YTDLP_ENV_COOKIE_PATH, 0o600)
+        except Exception:
+            pass
+        return _YTDLP_ENV_COOKIE_PATH
     except Exception as e:
-        log.warning('Telesom number sync unavailable: %r',e)
+        print("YouTube cookies setup failed:", repr(e))
+        return ""
 
-async def telesom_sync_loop():
+def _ytdlp_cookie_args():
+    path = _ytdlp_cookiefile()
+    return {"cookiefile": path} if path else {}
+# Optional song-recognition service. If configured, it can identify Original Sounds and return
+# the real artist/album artwork. It is never required for normal MP3 conversion.
+AUDD_API_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()  # Optional legacy fallback; AcoustID is primary
+# AcoustID + Chromaprint audio fingerprinting. Register an application at AcoustID
+# and put its application/client key in ACOUSTID_API_KEY.
+ACOUSTID_API_KEY = os.getenv("ACOUSTID_API_KEY", "").strip()
+ACOUSTID_TIMEOUT = int(os.getenv("ACOUSTID_TIMEOUT", "30"))
+# Jamendo: full-length tracks are used only when Jamendo marks them downloadable.
+JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "709fa152").strip()  # Jamendo documented read-API testing client; replace with your own client ID for production
+JAMENDO_TIMEOUT = int(os.getenv("JAMENDO_TIMEOUT", "20"))
+YOUTUBE_PO_TOKEN = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
+YOUTUBE_PLAYER_CLIENT = os.getenv("YOUTUBE_PLAYER_CLIENT", "").strip()
+
+# Download limits (admin-configurable at runtime).
+FREE_MAX_MINUTES_DEFAULT = int(os.getenv("FREE_MAX_MINUTES", "10"))
+PREMIUM_MAX_MINUTES_DEFAULT = int(os.getenv("PREMIUM_MAX_MINUTES", "180"))
+MAX_YOUTUBE_DURATION = FREE_MAX_MINUTES_DEFAULT * 60
+
+# Cobalt: no API key is required when your own Cobalt instance is configured
+# without authentication. The bot uses POST / on the configured instance.
+# For a monetized/premium bot, use a self-hosted Cobalt instance rather than
+# relying on the public api.cobalt.tools service.
+COBALT_API_URL = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+COBALT_API_KEY = os.getenv("COBALT_API_KEY", "").strip()
+COBALT_TIMEOUT = int(os.getenv("COBALT_TIMEOUT", "180"))
+
+# ================= RAPIDAPI YOUTUBE DOWNLOADER =================
+RAPIDAPI_YT_HOST = os.getenv("RAPIDAPI_YT_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
+RAPIDAPI_YT_DETAILS_URL = os.getenv("RAPIDAPI_YT_DETAILS_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/video/details").strip()
+RAPIDAPI_YT_SEARCH_URL = os.getenv("RAPIDAPI_YT_SEARCH_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/search/videos").strip()
+# Keep the key in your hosting provider's secret/environment settings.
+RAPIDAPI_YT_KEY = os.getenv("RAPIDAPI_YT_KEY", "").strip()
+RAPIDAPI_TIMEOUT = int(os.getenv("RAPIDAPI_TIMEOUT", "60"))
+# Instagram RapidAPI configuration. Values can also be managed from Admin Panel
+# and are persisted in MongoDB settings (no environment variable required for limits).
+RAPIDAPI_IG_HOST = os.getenv("RAPIDAPI_IG_HOST", "").strip()
+RAPIDAPI_IG_URL = os.getenv("RAPIDAPI_IG_URL", "").strip()
+RAPIDAPI_IG_KEY = os.getenv("RAPIDAPI_IG_KEY", "").strip()
+
+# Optional SaveAPI universal resolver. It is intentionally disabled until the
+# owner supplies a key. When enabled it becomes the fast primary resolver for
+# platforms covered by the provider, with yt-dlp/Cobalt kept as fallbacks.
+SAVEAPI_KEY = (os.getenv("SAVEAPI_KEY") or os.getenv("SAVE_API_KEY") or "").strip()
+SAVEAPI_URL = (os.getenv("SAVEAPI_URL") or os.getenv("SAVE_API_URL") or "https://api.saveapi.org/v1/download").strip()
+SAVEAPI_TIMEOUT = int(os.getenv("SAVEAPI_TIMEOUT", "45"))
+
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "64"))
+
+# Fast Telegram broadcast controls. Telegram's free Bot API broadcast limit is
+# about 30 messages/sec; keep a small safety margin by default. If you explicitly
+# enable paid broadcasts in BotFather and want to pay Telegram Stars for higher
+# throughput, set PAID_BROADCAST_ENABLED=true.
+PAID_BROADCAST_ENABLED = str(os.getenv("PAID_BROADCAST_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+BROADCAST_WORKERS = max(4, int(os.getenv("BROADCAST_WORKERS", "24")))
+BROADCAST_RATE = max(1.0, float(os.getenv("BROADCAST_RATE", "28")))
+_broadcast_rate_lock = threading.Lock()
+_broadcast_last_send = 0.0
+
+# Railway/production FFmpeg resolver. Set FFMPEG_PATH only if the binary is not
+# already on PATH. FFmpeg is required for MP3 extraction and for merging separate
+# YouTube video/audio streams.
+def _ffmpeg_bin():
+    candidates = [os.getenv("FFMPEG_PATH", "").strip(), shutil.which("ffmpeg") or ""]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.isdir(candidate):
+            candidate=os.path.join(candidate,"ffmpeg")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        found=shutil.which(candidate)
+        if found:
+            return found
+    # Optional Python-bundled fallback. If imageio-ffmpeg is present in Railway,
+    # use its bundled binary automatically so MP3 conversion does not depend on
+    # PATH. It is still fine to use a system FFmpeg when available.
+    try:
+        import imageio_ffmpeg
+        bundled=imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            return bundled
+    except Exception:
+        pass
+    return None
+
+def _ffmpeg_convert_to_mp3(source, output, bitrate="192k", timeout=300):
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is not installed on Railway. Add FFmpeg to the deployment image or set FFMPEG_PATH.")
+    cmd=[ffmpeg,"-y","-hide_banner","-loglevel","error","-i",source,"-vn","-map_metadata","0","-codec:a","libmp3lame","-b:a",str(bitrate),"-threads","0",output]
+    proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    if proc.returncode != 0 or not os.path.isfile(output) or os.path.getsize(output) < 1000:
+        err=(proc.stderr or b"").decode("utf-8","ignore")[-1200:]
+        raise RuntimeError(f"FFmpeg MP3 conversion failed: {err}")
+    return output
+
+# Premium configuration
+PREMIUM_DEFAULT_PRICES = {
+    "1": 5.0,
+    "3": 12.0,
+    "9": 30.0,
+    "12": 40.0,
+}
+PREMIUM_QUALITY_FORMATS = {
+    "720": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "1440": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+    "2160": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+}
+FREE_QUALITY_FORMAT = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+
+# Platform access / YouTube policy
+# Free users: TikTok, Instagram, Facebook, Pinterest, Snapchat, X/Twitter and
+# YouTube Shorts. Full YouTube videos are Premium-only unless Admin opens them.
+FREE_PLATFORMS = {"tiktok", "instagram", "facebook", "pinterest", "snapchat", "twitter"}
+YOUTUBE_FULL_FREE_DEFAULT = False
+FREE_YOUTUBE_MAX_MB_DEFAULT = int(os.getenv("FREE_YOUTUBE_MAX_MB", "49"))
+TRIAL_YOUTUBE_MAX_MB_DEFAULT = int(os.getenv("TRIAL_YOUTUBE_MAX_MB", "0"))
+PREMIUM_YOUTUBE_MAX_MB_DEFAULT = int(os.getenv("PREMIUM_YOUTUBE_MAX_MB", "0"))  # 0 = Unlimited
+
+# Dual executors for Priority (Quick Access) & Normal
+
+PREMIUM_CONCURRENT_DOWNLOADS = int(os.getenv("PREMIUM_CONCURRENT_DOWNLOADS", "96"))
+FREE_CONCURRENT_DOWNLOADS = int(os.getenv("FREE_CONCURRENT_DOWNLOADS", str(min(32, MAX_CONCURRENT_DOWNLOADS))))
+QUICK_ACCESS_CONCURRENT_DOWNLOADS = int(os.getenv("QUICK_ACCESS_CONCURRENT_DOWNLOADS", "160"))
+vip_executor = ThreadPoolExecutor(max_workers=max(1, PREMIUM_CONCURRENT_DOWNLOADS))
+quick_executor = ThreadPoolExecutor(max_workers=max(1, QUICK_ACCESS_CONCURRENT_DOWNLOADS))
+normal_executor = ThreadPoolExecutor(max_workers=max(1, FREE_CONCURRENT_DOWNLOADS))
+
+http_session = requests.Session()
+
+tg_client = TelegramClient(
+    "session",
+    API_ID,
+    API_HASH
+)
+
+_main_bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+_ACTIVE_BOT = contextvars.ContextVar("active_bot", default=None)
+_ACTIVE_MANAGED_META = contextvars.ContextVar("active_managed_meta", default=None)
+
+class _BotRouter:
+    def _target(self):
+        return _ACTIVE_BOT.get() or _main_bot
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+    def infinity_polling(self, *args, **kwargs):
+        return _main_bot.infinity_polling(*args, **kwargs)
+    def polling(self, *args, **kwargs):
+        return _main_bot.polling(*args, **kwargs)
+
+bot = _BotRouter()
+bot2 = telebot.TeleBot(BOT2_TOKEN, parse_mode="HTML")
+customer_ai_bot = telebot.TeleBot(CUSTOMER_AI_BOT_TOKEN, parse_mode="HTML") if CUSTOMER_AI_BOT_TOKEN else None
+
+ADMIN_IDS = [7983838654, 8668532036]
+PRIMARY_ADMIN_ID = 7983838654
+
+CHANNEL_ID = "@tiktokvediodownload"
+
+POST_CHANNELS = []
+pending_links = {}
+CHANNEL_WINDOW_OPEN = False
+MANAGED_CHANNELS = []
+MAX_CHANNELS = 10
+# User-owned Telegram destinations where this bot has been added/admined.
+# Stored in Mongo settings so redeploys do not erase the list.
+DESTINATION_KEY = "bot_destinations"
+# Pending Telegram chat-picker requests: request_id -> {user_id, type}
+DESTINATION_REQUESTS = {}
+DESTINATION_ADMIN_REQUESTS = {}
+SUPPORT_TICKET_REQUESTS = {}
+
+# Managed downloader bots created by the dedicated Creator Bot.
+managed_bot_objects = {}
+managed_bot_threads = {}
+managed_bot_lock = threading.RLock()
+creator_sessions = {}
+# SUPPORT_TICKETS_COL is initialized after MongoDB db2 is ready.
+SUPPORT_TICKETS_COL = None
+SUPPORT_ADMIN_IDS = [7983838654, 8668532036]
+SUPPORT_ADMIN_CONTACT_PENDING = {}
+SUPPORT_TICKET_OPEN_STATUSES = {"under_review", "contacting"}
+
+def _destinations():
+    rows=get_setting(DESTINATION_KEY,[]) or []
+    return rows if isinstance(rows,list) else []
+
+def _save_destinations(rows):
+    clean=[]; seen=set()
+    for d in rows or []:
+        try:
+            cid=int(d.get("chat_id"))
+            if cid in seen: continue
+            seen.add(cid); clean.append({
+                "chat_id":cid,"type":str(d.get("type","group")),"title":str(d.get("title", "")),
+                "username":str(d.get("username", "")),"added_by":str(d.get("added_by", "")),
+                "added_at":str(d.get("added_at", datetime.now(timezone.utc).isoformat())),
+                "intro_sent":bool(d.get("intro_sent", False))
+            })
+        except Exception: pass
+    set_setting(DESTINATION_KEY,clean)
+
+def _destination_intro_text(dtype="group"):
+    if dtype == "channel":
+        return (
+            "🤖 <b>Download Bot Connected</b>\n\n"
+            "This channel is now connected to the bot.\n"
+            "The bot can send admin broadcasts and updates here. ⚡"
+        )
+    return (
+        "🤖 <b>Download Bot Connected</b>\n\n"
+        "🎵 <b>Search and download songs</b>\n"
+        "🎬 Download videos from supported platforms\n"
+        "🎧 Convert videos to MP3\n"
+        "⚡ Fast downloads with automatic music metadata\n\n"
+        "Thanks for adding <b>@Downloadvedioytibot</b> to this group."
+    )
+
+def _destination_admin_rights_for_promotion():
+    """Full practical group admin rights that the bot may grant to PRIMARY_ADMIN_ID."""
+    return dict(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=True,
+        can_manage_video_chats=True,
+        can_restrict_members=True,
+        can_change_info=True,
+        can_invite_users=True,
+        can_pin_messages=True,
+        can_promote_members=True,
+    )
+
+def _request_primary_admin_for_group(chat):
+    """Ask the primary admin to join a newly connected group, then Confirm/Reject."""
+    if not chat or str(getattr(chat,"type","") or "") not in {"group","supergroup"}:
+        return
+    cid=int(chat.id)
+    try:
+        link=bot.export_chat_invite_link(cid)
+    except Exception as e:
+        print("Group invite link export failed:",repr(e)); link=""
+    if not link:
+        # If the bot cannot export an invite link, the group owner/admin must
+        # manually add the primary admin before the bot can promote them.
+        link=""
+    code=secrets.token_urlsafe(8)
+    DESTINATION_ADMIN_REQUESTS[code]={"chat_id":cid,"created":time.time(),"link":link}
+    name=html.escape(getattr(chat,"title","") or str(cid))
+    text=(
+        "🆕 <b>NEW GROUP ADMIN REQUEST</b>\n\n"
+        f"👥 Group: <b>{name}</b>\n"
+        f"🆔 Chat ID: <code>{cid}</code>\n\n"
+        "The bot is already an administrator. To give the primary admin full admin rights, "
+        "join the group using the link below, then tap <b>CONFIRM</b>.\n\n"
+        + (f"🔗 <a href=\"{html.escape(link,quote=True)}\">Open Group Link</a>\n\n" if link else "⚠️ No invite link could be created; join the group manually.\n\n")
+        + "The bot will only promote the primary admin after confirmation."
+    )
+    kb=InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("✅ Confirm",callback_data=f"destadmin:confirm:{code}"),
+           InlineKeyboardButton("❌ Reject",callback_data=f"destadmin:reject:{code}"))
+    try:
+        bot.send_message(PRIMARY_ADMIN_ID,text,parse_mode="HTML",reply_markup=kb,disable_web_page_preview=True)
+    except Exception as e:
+        print("Primary admin group request send failed:",repr(e))
+
+def _promote_primary_admin_in_group(chat_id):
+    try:
+        member=bot.get_chat_member(chat_id,PRIMARY_ADMIN_ID)
+        status=str(getattr(member,"status","") or "")
+        if status=="creator": return True,"The primary admin is already the group owner."
+        if status not in {"member","administrator"}:
+            return False,"The primary admin has not joined the group yet. Open the group link first."
+        if status=="administrator":
+            # Re-apply full rights if the bot is allowed to edit this admin.
+            if not bool(getattr(member,"can_be_edited",False)):
+                return False,"Telegram does not allow this bot to edit the existing administrator."
+        ok=bot.promote_chat_member(chat_id,PRIMARY_ADMIN_ID,**_destination_admin_rights_for_promotion())
+        return (True,"Primary admin now has full available admin rights.") if ok else (False,"Telegram rejected the promotion.")
+    except Exception as e:
+        return False,str(e)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("destadmin:"))
+def destination_admin_request_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id,"❌ Admin only.",show_alert=True); return
+    parts=call.data.split(":")
+    if len(parts)!=3: return
+    action,code=parts[1],parts[2]
+    req=DESTINATION_ADMIN_REQUESTS.get(code)
+    if not req:
+        bot.answer_callback_query(call.id,"❌ This request has expired.",show_alert=True); return
+    if action=="reject":
+        DESTINATION_ADMIN_REQUESTS.pop(code,None)
+        bot.answer_callback_query(call.id,"Rejected")
+        try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        except Exception: pass
+        bot.send_message(call.message.chat.id,"❌ Group admin request rejected.")
+        return
+    ok,msg=_promote_primary_admin_in_group(int(req.get("chat_id")))
+    if ok:
+        DESTINATION_ADMIN_REQUESTS.pop(code,None)
+        bot.answer_callback_query(call.id,"✅ Confirmed")
+        try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        except Exception: pass
+        bot.send_message(call.message.chat.id,f"✅ <b>Confirmed</b>\n\n{html.escape(msg)}",parse_mode="HTML")
+    else:
+        bot.answer_callback_query(call.id,"⚠️ Not ready",show_alert=True)
+        bot.send_message(call.message.chat.id,
+            f"⚠️ <b>Confirmation not completed</b>\n\n{html.escape(msg)}\n\n"
+            "Join the group first, then press <b>Confirm</b> again.",parse_mode="HTML")
+
+def _send_destination_intro(chat_id, dtype):
+    try:
+        msg=bot.send_message(chat_id, _destination_intro_text(dtype), parse_mode="HTML")
+        try:
+            bot.pin_chat_message(chat_id,msg.message_id,disable_notification=True)
+        except Exception as e:
+            print("Destination pin error:",repr(e))
+        return True
+    except Exception as e:
+        print("Destination intro error:", repr(e))
+        return False
+
+def _upsert_destination(chat, added_by=None):
+    if not chat: return False, False
+    ctype=str(getattr(chat,"type","") or "")
+    if ctype not in {"group","supergroup","channel"}: return False, False
+    rows=_destinations(); cid=int(chat.id)
+    existing=next((x for x in rows if int(x.get("chat_id",0))==cid),None)
+    is_new = existing is None
+    data={
+        "chat_id":cid,
+        "type":ctype,
+        "title":getattr(chat,"title","") or "",
+        "username":getattr(chat,"username","") or "",
+        "added_by":str(added_by or (existing or {}).get("added_by", "")),
+        "added_at":(existing or {}).get("added_at",datetime.now(timezone.utc).isoformat()),
+        "intro_sent":bool((existing or {}).get("intro_sent", False))
+    }
+    if existing: existing.update(data)
+    else: rows.append(data)
+    _save_destinations(rows)
+    return is_new, data["intro_sent"]
+
+def _remove_destination(chat_id):
+    rows=[x for x in _destinations() if str(x.get("chat_id"))!=str(chat_id)]
+    _save_destinations(rows)
+
+def _destination_label(d):
+    return ("📢 " if d.get("type")=="channel" else "👥 ")+str(d.get("title") or d.get("username") or d.get("chat_id"))
+
+
+BOT_LOCKED = False
+LOCK_MESSAGE = "🔒 Bot is temporarily locked by admin."
+
+pending_post = {}
+channel_posts = {}
+
+VERIFY_ENABLED = False
+verify_pending = {}
+
+def _resume_verified_download(uid, chat_id):
+    """Resume a link that was queued by Verify Before Send after verification succeeds."""
+    uid=str(uid)
+    try:
+        pending=verify_pending.pop(int(uid),None) or verify_pending.pop(uid,None)
+    except Exception:
+        pending=verify_pending.pop(uid,None)
+    if not pending or not pending.get("link"): return
+    link=str(pending.get("link"))
+    quality=users.get(uid,{}).get("premium_quality") or ("1080" if is_quick_access(uid) else None)
+    try:
+        download_executor_for(uid).submit(_download_request_job,chat_id,link,quality,uid)
+    except Exception as e:
+        print("Verified download resume failed:",repr(e))
+
+email_verify_pending = {}
+phone_verify_pending = {}
+whatsapp_verify_pending = {}
+video_files = {}
+# Short-lived map used by the MUSIC button. The actual media is re-downloaded only when requested.
+music_pending = {}
+MUSIC_PENDING_TTL = int(os.getenv("MUSIC_PENDING_TTL", "1800"))
+song_search_pending = {}
+# Pending Search Song -> Add Group state.  This must exist before any handler
+# can reference it; otherwise one search can crash the polling thread with
+# NameError and no song results are shown.
+song_group_gate_pending = {}
+# Downloaded video directories kept briefly so the MUSIC button converts the exact
+# video the user already received instead of downloading the source again.
+music_cache_dirs = set()
+# Managed Video Downloader MUSIC buttons keep the exact downloaded file.
+managed_video_music_pending = {}
+_MAIN_BOT_USERNAME_CACHE = ""
+SONG_SEARCH_TTL = int(os.getenv("SONG_SEARCH_TTL", "900"))
+SONG_SEARCH_PAGE_SIZE = 10
+
+DOWNLOAD_CAPTION = "Downloaded Via\n@Downloadvedioytibot"
+MANAGED_POWERED_BY = "Powered by:\n@Downloadvedioytibot"
+MP3_COVER_DEFAULT = False
+
+
+# User-created downloader bots. Telegram's Managed Bots system creates the bot
+# account and gives the manager bot a token through getManagedBotToken. Tokens are
+# encrypted when MANAGED_TOKEN_ENCRYPTION_KEY is configured.
+managed_bot_objects = {}
+managed_bot_threads = {}
+managed_bot_lock = threading.RLock()
+creator_sessions = {}
+
+def _refresh_all_user_menus(message=None):
+    """Refresh state without broadcasting a message to every user.
+
+    Menu keyboards are rendered dynamically, so persisted settings take effect
+    on the next user interaction/start. This intentionally avoids flooding users
+    when an admin toggles creation/song-search controls.
+    """
+    return True
+
+def _creation_open():
+    return bool(get_setting("bot_creation_enabled", True))
+
+def _creation_verify_required():
+    return bool(get_setting("create_bot_verify_required", True))
+
+def _create_caption_open():
+    return bool(get_setting("create_bot_caption_enabled", True))
+
+def _create_caption_text():
+    return str(get_setting(
+        "create_bot_caption_text",
+        "One of The Best Bot For creation Bot\nYou can create Your own Bot 100%\n\nCreate Now",
+    ) or "").strip()
+
+def _active_managed_owner():
+    meta = _ACTIVE_MANAGED_META.get() or {}
+    return str(meta.get("owner_id") or "").strip()
+
+def _managed_premium_active_doc(doc):
+    try:
+        until=doc.get("premium_until") if doc else None
+        if not until: return False
+        dt=until if isinstance(until,datetime) else datetime.fromisoformat(str(until).replace("Z","+00:00"))
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        return dt > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+def _active_managed_premium():
+    meta=_ACTIVE_MANAGED_META.get() or {}; bid=str(meta.get("bot_id") or "")
+    if not bid: return False
+    try: return _managed_premium_active_doc(managed_bots_col.find_one({"bot_id":bid},{"premium_until":1}) or {})
+    except Exception: return False
+
+def _active_managed_caption():
+    meta = _ACTIVE_MANAGED_META.get() or {}
+    username = str(meta.get("username") or "").strip().lstrip("@")
+    return f"Downloaded Via: @{username}" if username else DOWNLOAD_CAPTION
+
+def _active_powered_text():
+    if _active_managed_premium(): return ""
+    return MANAGED_POWERED_BY
+
+def _managed_token_cipher():
+    if not (MANAGED_TOKEN_ENCRYPTION_KEY and Fernet):
+        return None
+    try:
+        return Fernet(MANAGED_TOKEN_ENCRYPTION_KEY.encode())
+    except Exception:
+        print("⚠️ MANAGED_TOKEN_ENCRYPTION_KEY is invalid; managed tokens will use legacy storage.")
+        return None
+
+def _encrypt_managed_token(token):
+    cipher=_managed_token_cipher()
+    if cipher:
+        try: return cipher.encrypt(str(token).encode()).decode()
+        except Exception: pass
+    return str(token)
+
+def _decrypt_managed_token(doc):
+    enc=str(doc.get("token_enc") or "").strip()
+    if enc:
+        cipher=_managed_token_cipher()
+        if cipher:
+            try: return cipher.decrypt(enc.encode()).decode()
+            except Exception: return ""
+        return ""
+    return str(doc.get("token") or "").strip()
+
+def _creator_bot_url():
+    global CREATOR_BOT_USERNAME
+    if CREATOR_BOT_USERNAME:
+        return f"https://t.me/{CREATOR_BOT_USERNAME}"
+    if not CREATOR_BOT_TOKEN:
+        return ""
+    try:
+        r=requests.post(f"https://api.telegram.org/bot{CREATOR_BOT_TOKEN}/getMe",timeout=10)
+        data=r.json().get("result") or {}; CREATOR_BOT_USERNAME=str(data.get("username") or "").lstrip("@")
+        if CREATOR_BOT_USERNAME:
+            return f"https://t.me/{CREATOR_BOT_USERNAME}"
+    except Exception as e: print("Creator getMe failed:",repr(e))
+    return ""
+
+
+
+ADS_ENABLED = False
+ADS_TEXT = ""
+ADS_BTN_TEXT = ""
+ADS_URL = ""
+
+# ================= MANAGED-BOT MONETAG TMA / REMOVE-ADS SYSTEM =================
+# Monetag Telegram Mini App Rewarded Interstitial.
+# The Mini App is served from the same Railway service/domain so every pending
+# request gets a private, expiring URL tied to the Telegram user + managed bot.
+MONETAG_ZONE_ID = os.getenv("MONETAG_ZONE_ID", "11909176").strip()
+MONETAG_DIRECT_LINK = os.getenv("MONETAG_DIRECT_LINK", "https://omg10.com/4/11909123").strip()
+AD_GATE_BASE_URL = (os.getenv("AD_GATE_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+if not AD_GATE_BASE_URL:
+    _railway_domain = str(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
+    if _railway_domain:
+        AD_GATE_BASE_URL = "https://" + _railway_domain
+AD_SHOW_INTERVAL_SECONDS = max(60, int(os.getenv("AD_SHOW_INTERVAL_SECONDS", "5400")))
+MONETAG_WATCH_SECONDS_DEFAULT = max(1, int(os.getenv("MONETAG_WATCH_SECONDS", "15")))
+MONETAG_ADS_PER_GATE_DEFAULT = max(1, min(3, int(os.getenv("MONETAG_ADS_PER_GATE", "1"))))
+MONETAG_REQUIRE_VALUED_DEFAULT = str(os.getenv("MONETAG_REQUIRE_VALUED", "1")).strip().lower() not in {"0","false","no","off"}
+REMOVE_ADS_STARS_DEFAULT = max(1, int(os.getenv("REMOVE_ADS_STARS", "50")))
+REMOVE_ADS_PLAN_DEFAULTS = {"3": 50, "6": 90, "12": 150}
+AD_GATE_PORT = int(os.getenv("PORT", "8080"))
+managed_ad_pending = {}
+managed_ad_pending_lock = threading.RLock()
+managed_ad_http_server = None
+
+# Premium/download state
+premium_pending = {}
+premium_quality_pending = {}
+PREMIUM_WARNING_SENT_DAYS = 7
+PREMIUM_CHECK_INTERVAL = 3600
+LANGUAGES = {
+    "en": {"name":"🇬🇧 English","currency":"USD","rate":1.0},
+    "so": {"name":"🇸🇴 Soomaali","currency":"SOS","rate":570.0},
+    "ar": {"name":"🇸🇦 العربية","currency":"SAR","rate":3.75},
+    "fr": {"name":"🇫🇷 Français","currency":"EUR","rate":0.85},
+    "es": {"name":"🇪🇸 Español","currency":"EUR","rate":0.85},
+}
+
+MAIN_LABELS = {
+ "en":{"balance":"💰 BALANCE","withdraw":"💸 WITHDRAWAL","ref":"👥 REFERRAL","id":"🆔 GET ID","premium":"💎 PREMIUM","music":"🎵 MUSIC","profile":"👤 Profile","topup":"💳 ADD BALANCE","history":"📜 HISTORY","lang":"🌐 CHANGE LANGUAGE","trial":"🎁 1 DAY FREE TRIAL","customer":"☎️ CUSTOMER","ai":"🤖 CUSTOMER AI","currency":"💱 CHANGE CURRENCY"},
+ "so":{"balance":"💰 HARAAGA","withdraw":"💸 BIXID","ref":"👥 CASUUMAAD","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIC","profile":"👤 PROFILE","topup":"💳 LACAG KU DAR","history":"📜 TAARIIKH","lang":"🌐 BEDEL LUQAD","trial":"🎁 1 MAALIN Tijaabo","customer":"☎️ MACMIILKA","ai":"🤖 CAWIMAAD AI","currency":"💱 BEDEL LACAG"},
+ "am":{"balance":"💰 ሂሳብ","withdraw":"💸 ማውጣት","ref":"👥 ሪፈራል","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIC","profile":"👤 መገለጫ","topup":"💳 ገንዘብ ጨምር","history":"📜 ታሪክ","lang":"🌐 ቋንቋ ቀይር","trial":"🎁 1 ቀን ሙከራ","customer":"☎️ ድጋፍ","ai":"🤖 AI","currency":"💱 ምንዛሬ ቀይር"},
+ "om":{"balance":"💰 HINDEEN","withdraw":"💸 BAASI","ref":"👥 REFERRAL","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIC","profile":"👤 PROFILE","topup":"💳 MAALLQA DABALI","history":"📜 SEENSA","lang":"🌐 AFAAN JIJJIIRI","trial":"🎁 YAALI 1 GUYYAA","customer":"☎️ DEEGARSA","ai":"🤖 AI","currency":"💱 MAALLQA JIJJIIRI"},
+ "ar":{"balance":"💰 الرصيد","withdraw":"💸 سحب","ref":"👥 إحالة","id":"🆔 المعرف","premium":"💎 بريميوم","music":"🎵 موسيقى","profile":"👤 الملف الشخصي","topup":"💳 إضافة رصيد","history":"📜 السجل","lang":"🌐 تغيير اللغة","trial":"🎁 تجربة مجانية يوم واحد","customer":"☎️ الدعم","ai":"🤖 دعم AI","currency":"💱 تغيير العملة"},
+ "fr":{"balance":"💰 SOLDE","withdraw":"💸 RETRAIT","ref":"👥 PARRAINAGE","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIQUE","profile":"👤 PROFIL","topup":"💳 AJOUTER","history":"📜 HISTORIQUE","lang":"🌐 CHANGER LANGUE","trial":"🎁 ESSAI 1 JOUR","customer":"☎️ SUPPORT","ai":"🤖 SUPPORT AI","currency":"💱 CHANGER DEVISE"},
+ "es":{"balance":"💰 SALDO","withdraw":"💸 RETIRAR","ref":"👥 REFERIDOS","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MÚSICA","profile":"👤 PERFIL","topup":"💳 AÑADIR SALDO","history":"📜 HISTORIAL","lang":"🌐 CAMBIAR IDIOMA","trial":"🎁 PRUEBA 1 DÍA","customer":"☎️ SOPORTE","ai":"🤖 SOPORTE AI","currency":"💱 CAMBIAR MONEDA"},
+ "de":{"balance":"💰 GUTHABEN","withdraw":"💸 AUSZAHLUNG","ref":"👥 EMPFEHLUNG","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIK","profile":"👤 PROFIL","topup":"💳 GUTHABEN AUFLADEN","history":"📜 VERLAUF","lang":"🌐 SPRACHE ÄNDERN","trial":"🎁 1 TAG TEST","customer":"☎️ SUPPORT","ai":"🤖 AI SUPPORT","currency":"💱 WÄHRUNG ÄNDERN"},
+ "pt":{"balance":"💰 SALDO","withdraw":"💸 SAQUE","ref":"👥 INDICAÇÕES","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MÚSICA","profile":"👤 PERFIL","topup":"💳 ADICIONAR SALDO","history":"📜 HISTÓRICO","lang":"🌐 MUDAR IDIOMA","trial":"🎁 TESTE 1 DIA","customer":"☎️ SUPORTE","ai":"🤖 SUPORTE AI","currency":"💱 ALTERAR MOEDA"},
+ "tr":{"balance":"💰 BAKİYE","withdraw":"💸 ÇEKİM","ref":"👥 REFERANS","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MÜZİK","profile":"👤 PROFİL","topup":"💳 BAKİYE EKLE","history":"📜 GEÇMİŞ","lang":"🌐 DİLİ DEĞİŞTİR","trial":"🎁 1 GÜN DENEME","customer":"☎️ DESTEK","ai":"🤖 AI DESTEK","currency":"💱 PARA BİRİMİNİ DEĞİŞTİR"},
+ "hi":{"balance":"💰 बैलेंस","withdraw":"💸 निकासी","ref":"👥 रेफरल","id":"🆔 ID","premium":"💎 प्रीमियम","music":"🎵 म्यूज़िक","profile":"👤 प्रोफ़ाइल","topup":"💳 बैलेंस जोड़ें","history":"📜 इतिहास","lang":"🌐 भाषा बदलें","trial":"🎁 1 दिन ट्रायल","customer":"☎️ सहायता","ai":"🤖 AI सहायता","currency":"💱 मुद्रा बदलें"},
+ "id":{"balance":"💰 SALDO","withdraw":"💸 PENARIKAN","ref":"👥 REFERAL","id":"🆔 ID","premium":"💎 PREMIUM","music":"🎵 MUSIK","profile":"👤 PROFIL","topup":"💳 TAMBAH SALDO","history":"📜 RIWAYAT","lang":"🌐 GANTI BAHASA","trial":"🎁 UJI COBA 1 HARI","customer":"☎️ BANTUAN","ai":"🤖 BANTUAN AI","currency":"💱 GANTI MATA UANG"},
+ "ja":{"balance":"💰 残高","withdraw":"💸 出金","ref":"👥 紹介","id":"🆔 ID","premium":"💎 プレミアム","music":"🎵 音楽","profile":"👤 プロフィール","topup":"💳 残高追加","history":"📜 履歴","lang":"🌐 言語変更","trial":"🎁 1日無料トライアル","customer":"☎️ サポート","ai":"🤖 AIサポート","currency":"💱 通貨を変更"},
+ "ko":{"balance":"💰 잔액","withdraw":"💸 출금","ref":"👥 추천","id":"🆔 ID","premium":"💎 프리미엄","music":"🎵 음악","profile":"👤 프로필","topup":"💳 잔액 충전","history":"📜 기록","lang":"🌐 언어 변경","trial":"🎁 1일 무료 체험","customer":"☎️ 고객지원","ai":"🤖 AI 지원","currency":"💱 통화 변경"},
+ "zh":{"balance":"💰 余额","withdraw":"💸 提现","ref":"👥 邀请","id":"🆔 ID","premium":"💎 高级版","music":"🎵 音乐","profile":"👤 个人资料","topup":"💳 充值","history":"📜 历史","lang":"🌐 更换语言","trial":"🎁 1天免费试用","customer":"☎️ 客服","ai":"🤖 AI客服","currency":"💱 更改货币"},
+}
+
+def lang_of(uid):
+    return users.get(str(uid),{}).get("language") or "en"
+
+# Backward-compatible helper used by Customer AI.
+def get_user_lang(uid):
+    return lang_of(uid)
+
+# ================= LIVE CURRENCY / CRYPTO ASSET SYSTEM =================
+# Each user owns an actual asset: amount + balance_asset. USD is not the hidden base.
+FIAT_CURRENCIES = {
+    "USD": ("🇺🇸", "US Dollar", 1.0), "SOS": ("🇸🇴", "Somali Shilling", 570.0),
+    "ETB": ("🇪🇹", "Ethiopian Birr", 188.0), "EUR": ("🇪🇺", "Euro", 0.85),
+    "SAR": ("🇸🇦", "Saudi Riyal", 3.75), "BRL": ("🇧🇷", "Brazilian Real", 5.40),
+    "TRY": ("🇹🇷", "Turkish Lira", 41.0), "INR": ("🇮🇳", "Indian Rupee", 83.5),
+    "IDR": ("🇮🇩", "Indonesian Rupiah", 16500.0), "JPY": ("🇯🇵", "Japanese Yen", 147.0),
+    "KRW": ("🇰🇷", "South Korean Won", 1380.0), "CNY": ("🇨🇳", "Chinese Yuan", 7.10),
+}
+CRYPTO_CURRENCIES = {
+    "BTC": ("₿", "Bitcoin", "bitcoin"), "ETH": ("Ξ", "Ethereum", "ethereum"),
+    "USDT": ("₮", "Tether", "tether"), "BNB": ("🟡", "BNB", "binancecoin"),
+    "SOL": ("◎", "Solana", "solana"), "XRP": ("✕", "XRP", "ripple"),
+    "USDC": ("◉", "USD Coin", "usd-coin"), "ADA": ("₳", "Cardano", "cardano"),
+    "DOGE": ("Ð", "Dogecoin", "dogecoin"), "TRX": ("🔺", "TRON", "tron"),
+    "AVAX": ("🔺", "Avalanche", "avalanche-2"), "LINK": ("🔗", "Chainlink", "chainlink"),
+    "DOT": ("●", "Polkadot", "polkadot"), "LTC": ("Ł", "Litecoin", "litecoin"),
+    "BCH": ("₿", "Bitcoin Cash", "bitcoin-cash"), "XLM": ("✦", "Stellar", "stellar"),
+    "TON": ("💎", "Toncoin", "the-open-network"), "SHIB": ("🐕", "Shiba Inu", "shiba-inu"),
+    "NEAR": ("🟢", "NEAR Protocol", "near"), "UNI": ("🦄", "Uniswap", "uniswap"),
+}
+AVAILABLE_CURRENCIES={**{k:k for k in FIAT_CURRENCIES},**{k:k for k in CRYPTO_CURRENCIES}}
+FX_CACHE={"fiat":{},"crypto":{},"sources":{}}
+FX_CACHE_TTL=300; CRYPTO_CACHE_TTL=120; FX_LOCK=threading.Lock(); CRYPTO_TX_LOCK=threading.RLock()
+
+def cur_code(uid):
+    u=users.get(str(uid),{}); return u.get("balance_asset") or u.get("currency") or "USD"
+def is_crypto(code): return code in CRYPTO_CURRENCIES
+
+def _fetch_fiat_rates():
+    now=time.time()
+    try:
+        quotes=','.join(c for c in FIAT_CURRENCIES if c!="USD")
+        r=requests.get("https://api.frankfurter.dev/v2/rates",params={"base":"USD","quotes":quotes},timeout=10); r.raise_for_status()
+        data=r.json(); rates={x.get("quote"):float(x.get("rate")) for x in data if x.get("quote") and x.get("rate")}; rates["USD"]=1.0
+        FX_CACHE["fiat"]={"rates":rates,"time":now}; FX_CACHE["sources"]["fiat"]="Frankfurter"; return rates
+    except Exception as e: print("Frankfurter FX update failed:",e)
+    try:
+        r=requests.get("https://open.er-api.com/v6/latest/USD",timeout=10); r.raise_for_status(); rates=r.json().get("rates") or {}; rates["USD"]=1.0
+        FX_CACHE["fiat"]={"rates":rates,"time":now}; FX_CACHE["sources"]["fiat"]="ExchangeRate-API fallback"; return rates
+    except Exception as e: print("FX fallback failed:",e)
+    return FX_CACHE.get("fiat",{}).get("rates",{})
+
+def _fetch_crypto_prices(force=False):
+    now=time.time(); c=FX_CACHE.get("crypto",{})
+    if not force and c and now-c.get("time",0)<CRYPTO_CACHE_TTL: return c.get("prices",{})
+    ids=','.join(v[2] for v in CRYPTO_CURRENCIES.values())
+    try:
+        r=requests.get("https://api.coingecko.com/api/v3/simple/price",params={"ids":ids,"vs_currencies":"usd"},timeout=12); r.raise_for_status(); data=r.json() or {}
+        prices={code:float(data[cid]["usd"]) for code,(_,_,cid) in CRYPTO_CURRENCIES.items() if cid in data and data[cid].get("usd") is not None}
+        if prices: FX_CACHE["crypto"]={"prices":prices,"time":now}; FX_CACHE["sources"]["crypto"]="CoinGecko"; return prices
+    except Exception as e: print("Crypto market update failed:",e)
+    return c.get("prices",{})
+
+def refresh_market_rates(force=False):
+    with FX_LOCK:
+        now=time.time(); f=FX_CACHE.get("fiat",{}); c=FX_CACHE.get("crypto",{})
+        if force or not f or now-f.get("time",0)>=FX_CACHE_TTL: _fetch_fiat_rates()
+        if force or not c or now-c.get("time",0)>=CRYPTO_CACHE_TTL: _fetch_crypto_prices(force)
+
+def market_refresh_worker():
+    """Background market updater. Keeps fiat and crypto prices fresh without blocking Telegram polling."""
     while True:
         try:
-            await sync_telesom_catalog()
-            await sync_telesom_numbers()
-        except Exception as e: log.warning('catalog sync loop: %r',e)
-        await asyncio.sleep(120)
+            refresh_market_rates(force=False)
+        except Exception as e:
+            print(f"Market refresh worker error: {e}")
+        # Crypto is refreshed every 2 minutes by refresh_market_rates();
+        # the worker wakes more often so expired cache is noticed promptly.
+        time.sleep(30)
 
-# Database initialization: legacy-safe indexes
-async def init_db():
-    specs=[('users','telegram_id',True,'telegram_id_unique'),('users','referral_code',True,'referral_code_unique'),('referrals','referred_id',True,'referred_id_unique'),('numbers','number',True,None),('orders','order_id',True,'order_id_unique'),('payments','payment_id',True,'payment_id_unique'),('requests','request_id',True,'request_id_unique'),('support','ticket_id',True,'ticket_id_unique'),('staff','telegram_id',True,'staff_telegram_id_unique')]
-    for col,field,unique,name in specs:
+def asset_usd_price(code):
+    refresh_market_rates(False)
+    if code=="USD": return 1.0
+    if is_crypto(code): return float(FX_CACHE.get("crypto",{}).get("prices",{}).get(code,0) or 0)
+    return float(FX_CACHE.get("fiat",{}).get("rates",{}).get(code,0) or 0)
+
+def asset_to_usd(code,amount):
+    p=asset_usd_price(code); return float(amount or 0)*p if p>0 else 0.0
+
+def usd_to_asset(code,usd):
+    p=asset_usd_price(code); return float(usd or 0)/p if p>0 else 0.0
+
+def fx_rate(uid):
+    code=cur_code(uid); p=asset_usd_price(code)
+    return 1.0 if code=="USD" else (1.0/p if is_crypto(code) and p>0 else p)
+
+def format_asset(code,amount):
+    if code=="USD": return f"${float(amount or 0):,.2f} USD"
+    return f"{float(amount or 0):,.8f} {code}" if is_crypto(code) else f"{float(amount or 0):,.2f} {code}"
+
+def money_text(uid,usd): return format_asset(cur_code(uid),usd_to_asset(cur_code(uid),usd))
+def market_rate_text(code):
+    p=asset_usd_price(code)
+    return "N/A" if not p else (f"1 {code} = ${p:,.8f}" if is_crypto(code) else f"1 USD = {p:,.4f} {code}")
+def balance_amount(uid): return float(users.get(str(uid),{}).get("balance",0) or 0)
+def blocked_amount(uid): return float(users.get(str(uid),{}).get("blocked",0) or 0)
+
+def pending_withdrawal_amount(uid):
+    """Return the amount currently waiting for admin approval.
+    Pending withdrawals are NOT part of Blocked Amount until an admin
+    explicitly uses the money-block action.
+    """
+    uid=str(uid); total=0.0; code=cur_code(uid)
+    for w in withdraws if "withdraws" in globals() else []:
+        if str(w.get("user")) != uid: continue
+        if str(w.get("status","pending")).lower() != "pending": continue
+        amount=float(w.get("amount",0) or 0)
+        # Pending Amount is displayed in the user's current asset.
+        if str(w.get("asset") or code)==code:
+            total += amount
+        else:
+            total += usd_to_asset(code,float(w.get("amount_usd",0) or 0))
+    return max(0.0,total)
+
+def pending_withdrawal_usd(uid):
+    uid=str(uid); total=0.0
+    for w in withdraws if "withdraws" in globals() else []:
+        if str(w.get("user")) != uid: continue
+        if str(w.get("status","pending")).lower() != "pending": continue
+        total += float(w.get("amount_usd",0) or 0)
+    return max(0.0,total)
+def hold_amount_usd(uid):
+    now=datetime.now(timezone.utc); total=0.0
+    for h in conversion_holds_col.find({"user_id":str(uid),"status":"hold"}):
+        exp=parse_seen_time(h.get("expires_at"))
+        if exp and exp>now: total+=float(h.get("usd_amount",0) or 0)
+    return total
+def available_asset_amount(uid):
+    code=cur_code(uid)
+    if balance_is_locked(uid): return 0.0
+    return max(0.0,balance_amount(uid)-blocked_amount(uid)-usd_to_asset(code,hold_amount_usd(uid)))
+
+def balance_locked_message(uid):
+    u=users.get(str(uid),{}); code=u.get("balance_activation_code") or ""; sec=balance_lock_remaining(uid)
+    days=max(0,sec//86400); hours=max(0,(sec%86400)//3600)
+    snap=balance_freezes_col.find_one({"user_id":str(uid),"status":"closed"}) if "balance_freezes_col" in globals() else None
+    saved_usd=0.0
+    if snap:
+        saved_usd=asset_to_usd(str(snap.get("balance_asset") or "USD"),float(snap.get("balance",0) or 0))+sum(asset_to_usd(c,float(a or 0)) for c,a in (snap.get("portfolio") or {}).items() if c in AVAILABLE_CURRENCIES)
+    return ("🔒 <b>Your Balance is temporarily closed.</b>\n\n"
+            f"💰 <b>Saved Balance Value:</b> ${saved_usd:,.2f} USD\n"
+            "Please contact Customer/Admin to reactivate it.\n"
+            f"🗝 <b>Activation Code:</b> <code>{html.escape(str(code))}</code>\n"
+            f"⏳ Automatic deletion in: <b>{days}d {hours}h</b>\n\n"
+            "⚠️ If it is not opened before the 10-day deadline, the saved balance will be permanently removed.")
+def balance_usd_value(uid): return asset_to_usd(cur_code(uid),balance_amount(uid))
+
+def migrate_legacy_ledger_once():
+    if get_setting("asset_ledger_migrated_v1",False): return
+    for _uid,_u in users.items():
+        if float(_u.get("balance",0) or 0)>0 and not balance_ledger_col.find_one({"user_id":_uid}):
+            code=_u.get("balance_asset","USD"); amt=float(_u.get("balance",0)); balance_ledger_col.insert_one({"user_id":_uid,"type":"migration","source":"legacy_balance","asset":code,"asset_amount":amt,"usd_amount":asset_to_usd(code,amt),"time":datetime.now(timezone.utc)})
+    set_setting("asset_ledger_migrated_v1",True)
+
+def ledger_credit(uid,usd_amount,source,meta=None):
+    uid=str(uid); code=cur_code(uid); a=usd_to_asset(code,usd_amount); users[uid]["balance"]=round(balance_amount(uid)+a,12); save_user(uid)
+    balance_ledger_col.insert_one({"user_id":uid,"type":"credit","source":source,"usd_amount":float(usd_amount),"asset":code,"asset_amount":a,"meta":meta or {},"time":datetime.now(timezone.utc)})
+    return a
+def ledger_debit(uid,asset_amount,source,meta=None):
+    uid=str(uid); a=float(asset_amount); users[uid]["balance"]=round(max(0,balance_amount(uid)-a),12); save_user(uid)
+    balance_ledger_col.insert_one({"user_id":uid,"type":"debit","source":source,"asset":cur_code(uid),"asset_amount":a,"usd_amount":asset_to_usd(cur_code(uid),a),"meta":meta or {},"time":datetime.now(timezone.utc)})
+def get_portfolio(uid):
+    u = users.get(str(uid), {})
+    p = u.get("portfolio")
+    if not isinstance(p, dict):
+        p = {}
+        u["portfolio"] = p
+    return p
+
+def portfolio_usd_value(uid):
+    total = 0.0
+    for code, amount in get_portfolio(uid).items():
+        if code in AVAILABLE_CURRENCIES:
+            total += asset_to_usd(code, float(amount or 0))
+    return total
+
+def total_assets_usd(uid):
+    return balance_usd_value(uid) + portfolio_usd_value(uid)
+
+def add_portfolio_asset(uid, code, amount):
+    if amount <= 0: return
+    p = get_portfolio(uid)
+    p[code] = round(float(p.get(code, 0) or 0) + float(amount), 12)
+    users[str(uid)]["portfolio"] = p
+    save_user(uid)
+
+def portfolio_text(uid):
+    rows=[]
+    p=get_portfolio(uid)
+    for code, amount in p.items():
+        amount=float(amount or 0)
+        if amount <= 0: continue
+        rows.append((asset_to_usd(code,amount), code, amount))
+    rows.sort(reverse=True)
+    return rows
+
+
+def crypto_min_deposit_usd():
+    try: return max(0.0,float(get_setting("crypto_min_deposit_usd",10.0) or 0))
+    except Exception: return 10.0
+
+def total_account_deposits_usd(uid):
+    """Cumulative real account credits, excluding conversions and legacy migration."""
+    uid=str(uid); total=0.0
+    try:
+        for row in balance_ledger_col.find({"user_id":uid,"type":"credit"}):
+            source=str(row.get("source","")).lower()
+            if source not in {"currency_conversion","crypto_conversion","migration","referral_network_commission"}:
+                total += float(row.get("usd_amount",0) or 0)
+    except Exception: pass
+    return max(0.0,total)
+
+def crypto_access_status(uid):
+    minimum=crypto_min_deposit_usd(); deposited=total_account_deposits_usd(uid)
+    if minimum<=0: return True,0.0,minimum
+    return deposited+1e-9>=minimum,max(0.0,minimum-deposited),minimum
+
+def crypto_system_open():
+    return bool(get_setting("crypto_enabled", True))
+
+def user_is_verified(uid):
+    """One canonical verification check for Gmail, SMS or WhatsApp."""
+    u=users.get(str(uid),{})
+    return bool(u.get("verified") or u.get("whatsapp_verified") or u.get("phone_verified") or u.get("email_verified"))
+
+def premium_verification_required():
+    return bool(get_setting("premium_verify_required", True))
+
+def balance_is_locked(uid):
+    return bool(users.get(str(uid),{}).get("balance_locked", False))
+
+def balance_lock_remaining(uid):
+    u=users.get(str(uid),{})
+    dt=parse_seen_time(u.get("balance_lock_until"))
+    if not dt: return 0
+    return max(0,int((dt-datetime.now(timezone.utc)).total_seconds()))
+
+def generate_balance_activation_code():
+    alphabet=string.ascii_uppercase+string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(25))
+
+def premium_platform_names():
+    # These are the complete Premium/Trial download platforms. Keep this list
+    # centralized so the Premium UI and access gate always agree.
+    base=["TikTok","Instagram","Facebook","Pinterest","Snapchat","X/Twitter","YouTube"]
+    return base + list(PREMIUM_EXTRA_PLATFORMS) if "PREMIUM_EXTRA_PLATFORMS" in globals() else base
+
+def premium_platform_keys():
+    return {
+        "reddit","threads","likee","vimeo","dailymotion","soundcloud","twitch",
+        "tumblr","streamable","odnoklassniki",
+    }
+
+def platform_display_name(platform):
+    names={
+        "tiktok":"TikTok","instagram":"Instagram","facebook":"Facebook","pinterest":"Pinterest",
+        "snapchat":"Snapchat","twitter":"X/Twitter","youtube":"YouTube","reddit":"Reddit",
+        "threads":"Threads","likee":"Likee","vimeo":"Vimeo","dailymotion":"Dailymotion",
+        "soundcloud":"SoundCloud","twitch":"Twitch","tumblr":"Tumblr","streamable":"Streamable",
+        "odnoklassniki":"OK.ru",
+    }
+    return names.get(platform, str(platform or "Unknown"))
+
+def youtube_full_free_enabled():
+    return bool(get_setting("youtube_full_free", YOUTUBE_FULL_FREE_DEFAULT))
+
+YOUTUBE_FREE_MAX_MINUTES = int(os.getenv("YOUTUBE_FREE_MAX_MINUTES", "15"))
+
+def _youtube_duration_seconds(link):
+    d,_=_youtube_duration_fast(link)
+    return d
+
+def _youtube_artwork_url(video_id):
+    """Return a stable YouTube thumbnail URL for Search Song album/artwork display."""
+    vid=str(video_id or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid):
+        return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    return ""
+
+def _youtube_duration_fast(link, rapid_data=None):
+    """Get YouTube duration without waiting on a full yt-dlp extraction.
+
+    RapidAPI is checked first because it is the configured primary YouTube
+    resolver. yt-dlp is only the metadata fallback when RapidAPI is unavailable.
+    """
+    if not link or detect_platform(link) != "youtube":
+        return None, rapid_data
+    data=rapid_data
+    if data is None and RAPIDAPI_YT_KEY:
         try:
-            info=await db[col].index_information(); compatible=False
-            for old,opts in info.items():
-                keys=dict(opts.get('key',[]))
-                if keys=={field:1} and bool(opts.get('unique',False))==unique:
-                    compatible=True; break
-            if not compatible:
-                kwargs={'unique':unique}
-                if name: kwargs['name']=name
-                await db[col].create_index([(field,1)],**kwargs)
-        except Exception as e: log.warning('index %s.%s: %r',col,field,e)
-    defaults={'registration_open':True,'orders_open':True,'payments_open':True,'support_open':True,'trial_days':1}
-    for k,v in defaults.items():
-        if await db.settings.find_one({'_id':k}) is None:await set_setting(k,v)
-    for name,dest in PAYMENT_DEFAULTS.items(): await db.payment_methods.update_one({'name':name},{'$set':{'destination':dest,'enabled':True},'$setOnInsert':{'name':name}},upsert=True)
-    await db.payment_methods.delete_many({'name':{'$in':['Golis','Telesom']}})
-    website_catalog=[
-        ('data','24 Hours Unlimited Data',0.50),
-        ('data','24 Hours Unlimited Calls + Data',1.00),
-        ('data','7 Days Unlimited Data',3.00),
-        ('data','30 Days Unlimited Data',15.00),
-        ('data','30 Days Unlimited Calls + Data',20.00),
-        ('data','24 Hours 400 MB',0.12),('data','24 Hours 1 GB',0.25),
-        ('data','7 Days 400 MB',0.12),('data','7 Days 3.5 GB',1.00),
-        ('data','7 Days 1.8 GB',0.50),('data','7 Days 900 MB',0.25),
-        ('data','30 Days 17 GB',5.00),
-        ('data','30 Days 8 GB VIP',3.00),('data','30 Days 25 GB VIP',5.00),
-        ('data','30 Days 55 GB VIP',10.00),('data','30 Days 100 GB VIP',15.00),
-        ('data','30 Days 130 GB VIP',20.00),('data','30 Days 140 GB VIP',25.00),
-        ('voice','24 Hours Unlimited Calls + 100 SMS',0.30),
-        ('voice','7 Days Unlimited Calls + 500 SMS',2.00),
-        ('voice','14 Days Unlimited Calls + 750 SMS',4.00),
-        ('voice','30 Days Unlimited Calls + 1000 SMS',7.00),
-        ('5g','24 Hours 10 GB',1.00),('5g','7 Days 5 GB/Day',4.00),
-        ('5g','30 Days 120 GB',15.00),('5g','30 Days 10 GB/Day',25.00),
-        ('5g','30 Days 20Mbps Fixed Wireless',30.00),('5g','30 Days 50Mbps Fixed Wireless',90.00),
-        ('5g','30 Days 100Mbps Fixed Wireless',150.00),
-        ('esim','Telesom eSIM',10.00),('sim','Regular SIM Card',10.00),
-        ('sim','VIP SIM Card — from',30.00),('business','Business SIM Card — from',10.00),('business','Business 20Mbps Fixed Wireless',30.00),('business','Business 50Mbps Fixed Wireless',90.00),('business','Business 100Mbps Fixed Wireless',150.00),
-    ]
-    for service,title,price in website_catalog:
-        await db.catalog.update_one({'service':service,'title':title},{'$setOnInsert':{'service':service,'title':title,'price':price,'enabled':True,'source':'telesom.com','created_at':now()}},upsert=True)
-    await client.admin.command('ping'); await sync_telesom_catalog(); await sync_telesom_numbers(); log.info('MongoDB connected')
+            vid=_extract_youtube_video_id(link)
+            if vid:
+                data=_rapidapi_youtube_details(vid)
+                d=_rapid_duration(data)
+                if d:
+                    return d, data
+        except Exception as e:
+            print("Fast YouTube duration RapidAPI probe failed:",repr(e))
+    if data is not None:
+        try:
+            d=_rapid_duration(data)
+            if d:
+                return d, data
+        except Exception: pass
+    # Last resort only. Keep this probe short so normal downloads are not held
+    # up unnecessarily when the API already returned the media metadata.
+    try:
+        opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"socket_timeout":5,"retries":1,"extractor_retries":1,"cachedir":False}
+        extra=_youtube_extractor_args()
+        if extra: opts["extractor_args"]=extra
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(link,download=False) or {}
+        d=int(info.get("duration") or 0)
+        return (d or None), data
+    except Exception as e:
+        print("Fast YouTube duration yt-dlp fallback failed:",repr(e))
+        return None, data
 
-async def health(request):return web.json_response({'status':'ok','service':'Telesombot'})
-async def health_server():
-    app=web.Application();app.router.add_get('/',health);app.router.add_get('/health',health);runner=web.AppRunner(app);await runner.setup();await web.TCPSite(runner,'0.0.0.0',PORT).start();return runner
-async def main():
-    await init_db(); asyncio.create_task(telesom_sync_loop()); await bot.delete_webhook(drop_pending_updates=False); await health_server(); log.info('Telesombot button system started; admin=%s',MAIN_ADMIN); await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
-if __name__=='__main__': asyncio.run(main())
+def premium_required_for_platform(platform, uid, link=None):
+    """Return whether this exact link requires Premium/Trial access."""
+    uid=str(uid)
+    if is_admin(uid) or is_quick_access(uid):
+        return False
+    platform=str(platform or "unknown")
+    # IMPORTANT: YouTube has its own duration policy. Do this BEFORE the generic
+    # premium-platform list because older settings may contain "youtube" there.
+    # Otherwise every free YouTube URL is incorrectly rejected before RapidAPI
+    # ever gets a chance to download it.
+    if platform == "youtube":
+        if link and youtube_is_short(link):
+            return False
+        if youtube_full_free_enabled():
+            return False
+        duration=_youtube_duration_seconds(link) if link else None
+        # Unknown duration is allowed to reach the downloader; RapidAPI/yt-dlp
+        # metadata probing inside the worker is the final safety check.
+        return bool(duration and duration > YOUTUBE_FREE_MAX_MINUTES*60)
+    if platform in premium_platform_keys():
+        return True
+    return False
+
+def premium_gate_message(uid, platform, duration_seconds=None):
+    name=html.escape(platform_display_name(platform))
+    count=len(premium_platform_names())
+    lang=str(users.get(str(uid),{}).get("language") or users.get(str(uid),{}).get("customer_ai_language") or "en")
+    if platform == "youtube" and duration_seconds and duration_seconds > YOUTUBE_FREE_MAX_MINUTES*60:
+        mins=max(13, int(round(duration_seconds/60.0)))
+        if lang=="so":
+            return ("💎 <b>Premium ayaa loo baahan yahay</b>\n\n"
+                    f"YouTube video-kan waa qiyaastii <b>{mins} daqiiqo</b>. Free users waxaa loo oggol yahay YouTube ilaa <b>{YOUTUBE_FREE_MAX_MINUTES} daqiiqo</b>.\n\n"
+                    "Si aad u dajiso video-kan, fur Premium/Trial.\n⚡ Download degdeg ah • 🎥 Quality sare • ▶️ YouTube access")
+        return ("💎 <b>Premium Required</b>\n\n"
+                f"This YouTube video is about <b>{mins} minutes</b>. Free users can download YouTube videos up to <b>{YOUTUBE_FREE_MAX_MINUTES} minutes</b>.\n\n"
+                "Open Premium/Trial to download this video.\n⚡ Faster downloads • 🎥 Higher quality • ▶️ YouTube access")
+    if lang=="so":
+        return (f"💎 <b>Premium ayaa loo baahan yahay</b>\n\n"
+                f"<b>{name}</b> wuxuu u baahan yahay Premium/Trial.\n\n"
+                f"🌐 Premium/Trial: <b>{count} platforms</b>\n⚡ Priority & faster downloads\n🎥 Quality sare\nFur Premium si aad u isticmaasho.")
+    return (f"💎 <b>Premium Required</b>\n\n"
+            f"<b>{name}</b> requires Premium/Trial access.\n\n"
+            f"🌐 Premium/Trial includes <b>{count} platforms</b>\n⚡ Priority & faster downloads\n🎥 Higher quality\n\nOpen Premium to continue.")
+
+def user_timezone(uid):
+    """Best-effort timezone from stored city or verified phone country; Telegram does not expose device timezone."""
+    u=users.get(str(uid),{})
+    city=str(u.get("city") or "").lower()
+    city_map={"somalia":"Africa/Mogadishu","mogadishu":"Africa/Mogadishu","ethiopia":"Africa/Addis_Ababa","addis ababa":"Africa/Addis_Ababa","kenya":"Africa/Nairobi","nairobi":"Africa/Nairobi","uganda":"Africa/Kampala","tanzania":"Africa/Dar_es_Salaam","djibouti":"Africa/Djibouti","saudi arabia":"Asia/Riyadh","riyadh":"Asia/Riyadh","uae":"Asia/Dubai","dubai":"Asia/Dubai","united arab emirates":"Asia/Dubai","india":"Asia/Kolkata","pakistan":"Asia/Karachi","turkey":"Europe/Istanbul","uk":"Europe/London","united kingdom":"Europe/London","france":"Europe/Paris","germany":"Europe/Berlin"}
+    zone=next((z for k,z in city_map.items() if k in city),None)
+    phone=str(u.get("phone") or "")
+    if not zone and phone:
+        prefix_map={"+252":"Africa/Mogadishu","+251":"Africa/Addis_Ababa","+254":"Africa/Nairobi","+255":"Africa/Dar_es_Salaam","+256":"Africa/Kampala","+253":"Africa/Djibouti","+966":"Asia/Riyadh","+971":"Asia/Dubai","+91":"Asia/Kolkata","+92":"Asia/Karachi","+90":"Europe/Istanbul","+33":"Europe/Paris","+49":"Europe/Berlin","+44":"Europe/London"}
+        for prefix,z in prefix_map.items():
+            if phone.startswith(prefix): zone=z; break
+    if ZoneInfo and zone:
+        try: return ZoneInfo(zone)
+        except Exception: pass
+    return timezone.utc
+
+def local_datetime_text(uid, dt):
+    dt=parse_seen_time(dt) or datetime.now(timezone.utc)
+    local=dt.astimezone(user_timezone(uid))
+    return local.strftime("%Y-%m-%d %H:%M %Z")
+
+def crypto_hold_open():
+    return bool(get_setting("crypto_hold_enabled", True))
+
+def crypto_fee_percent():
+    try: return max(0.0, float(get_setting("crypto_fee_percent", 1.0) or 0.0))
+    except Exception: return 1.0
+
+def live_network_gas_usd(code):
+    """Best-effort live network fee estimate; falls back to admin reserve.
+    This is an estimate for a normal transfer, not a guaranteed swap/withdrawal fee.
+    Internal ledger conversions do not broadcast a blockchain transaction.
+    """
+    try:
+        if code == "ETH":
+            r=requests.post("https://ethereum-rpc.publicnode.com",json={"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1},timeout=5); wei=int(r.json()["result"],16)
+            return (wei*21000/1e18)*asset_usd_price("ETH")
+        if code == "BNB":
+            r=requests.post("https://bsc-dataseed.bnbchain.org",json={"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1},timeout=5); wei=int(r.json()["result"],16)
+            return (wei*21000/1e18)*asset_usd_price("BNB")
+        if code == "BTC":
+            r=requests.get("https://mempool.space/api/v1/fees/recommended",timeout=5); sat_vb=float(r.json().get("fastestFee",0) or 0)
+            # Approximate simple transaction size; actual UTXO/input/output count varies.
+            btc_fee=(sat_vb*140)/100_000_000
+            return btc_fee*asset_usd_price("BTC")
+    except Exception as e:
+        print("Live network fee lookup failed:", code, e)
+    return None
+
+def crypto_gas_fee_usd(code=None):
+    mode=str(get_setting("crypto_gas_mode","AUTO") or "AUTO").upper()
+    if mode=="AUTO" and code in CRYPTO_CURRENCIES:
+        live=live_network_gas_usd(code)
+        if live is not None and live>=0: return live
+    try: return max(0.0, float(get_setting("crypto_gas_fee_usd", 0.10) or 0.0))
+    except Exception: return 0.10
+
+def crypto_fee_usd(gross_usd, code=None):
+    gross=float(gross_usd or 0.0)
+    pct=gross*crypto_fee_percent()/100.0
+    gas=crypto_gas_fee_usd(code) if is_crypto(code) else 0.0
+    return pct, gas, pct+gas
+
+def conversion_preview(uid,new_code,source_amount=None):
+    old=cur_code(uid); available=available_asset_amount(uid)
+    amount=available if source_amount is None else float(source_amount)
+    gross_usd=asset_to_usd(old,amount)
+    fee_usd,gas_usd,total_fee=crypto_fee_usd(gross_usd,new_code)
+    net_usd=max(0.0,gross_usd-total_fee)
+    new_amt=usd_to_asset(new_code,net_usd)
+    return old,amount,gross_usd,fee_usd,gas_usd,total_fee,net_usd,new_amt
+
+def currency_kb():
+    kb=InlineKeyboardMarkup(); btn=[]
+    if not crypto_system_open():
+        for code,(flag,_,_) in FIAT_CURRENCIES.items(): btn.append(InlineKeyboardButton(f"{flag} {code}",callback_data=f"currency:{code}"))
+    else:
+        for code,(flag,_,_) in FIAT_CURRENCIES.items(): btn.append(InlineKeyboardButton(f"{flag} {code}",callback_data=f"currency:{code}"))
+        for code,(icon,_,_) in CRYPTO_CURRENCIES.items(): btn.append(InlineKeyboardButton(f"{icon} {code}",callback_data=f"currency:{code}"))
+    for i in range(0,len(btn),2): kb.row(*btn[i:i+2])
+    kb.add(InlineKeyboardButton("🔄 UPDATE MARKET",callback_data="currency_refresh"))
+    return kb
+
+def currency_is_available(code):
+    return code in FIAT_CURRENCIES or (code in CRYPTO_CURRENCIES and crypto_system_open())
+
+def record_crypto_fee(uid, from_code, to_code, gross_usd, fee_usd, gas_usd, source_amount, net_usd):
+    crypto_fee_ledger_col.insert_one({
+        "user_id":str(uid), "type":"conversion_fee", "from_asset":from_code, "to_asset":to_code,
+        "gross_usd":float(gross_usd), "fee_usd":float(fee_usd), "gas_fee_usd":float(gas_usd),
+        "net_usd":float(net_usd), "source_amount":float(source_amount),
+        "time":datetime.now(timezone.utc)
+    })
+
+def get_crypto_fee_stats_today():
+    now=datetime.now(timezone.utc); start=now.replace(hour=0,minute=0,second=0,microsecond=0)
+    pipe=[{"$match":{"time":{"$gte":start}}},{"$group":{"_id":None,"fee":{"$sum":"$fee_usd"},"gas":{"$sum":"$gas_fee_usd"},"count":{"$sum":1}}}]
+    r=list(crypto_fee_ledger_col.aggregate(pipe))
+    return (float(r[0].get("fee",0)),float(r[0].get("gas",0)),int(r[0].get("count",0))) if r else (0.0,0.0,0)
+
+
+def language_kb(prefix="lang"):
+    # 5 popular languages displayed in a compact picker.
+    kb=InlineKeyboardMarkup(row_width=3)
+    items=[InlineKeyboardButton(v["name"],callback_data=f"{prefix}:{code}") for code,v in LANGUAGES.items()]
+    for i in range(0,len(items),3):
+        kb.row(*items[i:i+3])
+    return kb
+
+
+
+START_MESSAGE_DEFAULT = """🎉 <b>WELCOME TO DOWNLOAD BOT</b> 🎉
+
+👋 Hello <b>{name}</b>, Welcome!
+
+🚀 Download your favorite content
+quickly and easily.
+
+━━━━━━━━━━━━━━━━━━
+
+🎬 <b>VIDEO</b>
+TikTok • Instagram • Facebook
+Pinterest • Snapchat • X
+YouTube • Reddit • Threads
+Likee • Vimeo • Dailymotion
+Twitch • Tumblr • OK.ru
+
+🎵 <b>MUSIC</b>
+Convert Video → MP3
+🎼 Correct Song Name
+👤 Correct Artist
+💿 Search Your ❤️ Sign
+
+💎 <b>PREMIUM</b>
+High Quality • Faster Downloads
+More Platforms • More Features
+
+━━━━━━━━━━━━━━━━━━
+
+📥 Send your link now!
+
+⚡ Fast • Easy • Powerful
+❤️ Thanks for using us!"""
+
+def _bot_destination_url(dtype):
+    """Open Telegram's native group/channel selector with admin rights preselected."""
+    try: username=str(bot.get_me().username or "").lstrip("@")
+    except Exception: username=""
+    if not username: return None
+    if dtype=="channel":
+        return (f"https://t.me/{username}?startchannel&admin="
+                "change_info+post_messages+edit_messages+delete_messages")
+    return (f"https://t.me/{username}?startgroup=add_group&admin="
+            "change_info+delete_messages+restrict_members+invite_users+pin_messages+promote_members")
+
+def welcome_destination_markup():
+    kb=InlineKeyboardMarkup(row_width=2); buttons=[]
+    if bool(get_setting("add_group_enabled", True)):
+        u=_bot_destination_url("group")
+        if u: buttons.append(InlineKeyboardButton("➕ Add Group",url=u))
+    if bool(get_setting("add_channel_enabled", True)):
+        u=_bot_destination_url("channel")
+        if u: buttons.append(InlineKeyboardButton("➕ Add Channel",url=u))
+    if buttons: kb.add(*buttons)
+    return kb if buttons else None
+
+def music_destination_markup():
+    kb=InlineKeyboardMarkup(row_width=2); buttons=[]
+    if bool(get_setting("add_group_enabled", True)):
+        u=_bot_destination_url("group")
+        if u: buttons.append(InlineKeyboardButton("➕ Add Group",url=u))
+    if bool(get_setting("add_channel_enabled", True)):
+        u=_bot_destination_url("channel")
+        if u: buttons.append(InlineKeyboardButton("➕ Add Channel",url=u))
+    if buttons: kb.add(*buttons)
+    return kb if buttons else None
+
+def render_start_message(uid):
+    """Render the admin-configurable welcome message with safe user placeholders."""
+    uid = str(uid)
+    u = users.get(uid, {})
+    name = (u.get("first_name") or "there").strip()
+    username = u.get("username") or ""
+    text = get_setting("start_message", START_MESSAGE_DEFAULT)
+    replacements = {
+        "{name}": name,
+        "{username}": username,
+        "{id}": uid,
+    }
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    return text
+
+# ================= MONGODB SETUP (DUAL DATABASE) =================
+
+MONGO_URI_1 = os.getenv("MONGO_URI_1", os.getenv("MONGO_URI", "mongodb://localhost:27017/user_db"))
+MONGO_URI_2 = os.getenv("MONGO_URI_2", "mongodb://localhost:27017/stats_db")
+
+try:
+    mongo_client1 = MongoClient(MONGO_URI_1)
+    try:
+        db1 = mongo_client1.get_default_database()
+    except Exception:
+        db1 = mongo_client1["user_db"]
+    
+    users_col = db1["users"]
+    withdraws_col = db1["withdraws"]
+    print("✅ MongoDB 1 (Users & Withdraws) Connected Successfully")
+except Exception as e:
+    print(f"❌ MongoDB 1 Connection Error: {e}")
+    exit()
+
+try:
+    mongo_client2 = MongoClient(MONGO_URI_2)
+    try:
+        db2 = mongo_client2.get_default_database()
+    except Exception:
+        db2 = mongo_client2["stats_db"]
+    
+    videos_col = db2["videos"]
+    feedback_col = db2["feedback"]
+    print("✅ MongoDB 2 (Videos, Stats & Feedback) Connected Successfully")
+except Exception as e:
+    print(f"❌ MongoDB 2 Connection Error: {e}")
+    exit()
+
+# ================= SETTINGS SETUP =================
+
+settings_col = db1["settings"]
+managed_bots_col = db1["managed_bots"]
+managed_ad_users_col = db1["managed_ad_users"]
+managed_ad_clicks_col = db1["managed_ad_clicks"]
+creator_sessions_col = db1["creator_sessions"]
+premium_logs_col = db1["premium_logs"]
+activity_col = db1["activity_logs"]
+ratings_col = db1["bot_ratings"]
+rating_campaigns_col = db1["rating_campaigns"]
+referral_commissions_col = db1["referral_commissions"]
+balance_ledger_col = db1["balance_ledger"]
+conversion_holds_col = db1["conversion_holds"]
+crypto_fee_ledger_col = db1["crypto_fee_ledger"]
+song_stats_col = db2["song_stats"]
+balance_freezes_col = db1["balance_freezes"]
+# Support tickets live in the second database; initialize only after db2 exists.
+SUPPORT_TICKETS_COL = db2["support_tickets"]
+
+def get_setting(key, default):
+    res = settings_col.find_one({"_id": key})
+    return res["value"] if res else default
+
+def set_setting(key, value):
+    settings_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+
+def touch_user(uid, save=True):
+    uid=str(uid)
+    if uid not in users:
+        return
+    users[uid]["last_seen_at"]=datetime.now(timezone.utc).isoformat()
+    if save:
+        save_user(uid)
+    # Streak progress is driven by real user activity. The helper is defined
+    # later in the file, so keep this safe during module initialization.
+    try:
+        if "_streak_touch" in globals():
+            _streak_touch(uid)
+    except Exception as e:
+        print("Streak touch error:", repr(e))
+
+def current_trial_version():
+    return int(get_setting("trial_version",1) or 1)
+
+def trial_days():
+    return max(1,int(get_setting("trial_days",1) or 1))
+
+def trial_enabled():
+    return bool(get_setting("trial_enabled",True))
+
+def trial_available(uid):
+    uid=str(uid)
+    if not trial_enabled() or uid not in users:
+        return False
+    return users[uid].get("trial_version_used") != current_trial_version()
+
+def open_trial_campaign(days):
+    days=int(days)
+    if days<1 or days>3650:
+        raise ValueError("invalid trial days")
+    version=current_trial_version()+1
+    set_setting("trial_days",days); set_setting("trial_version",version); set_setting("trial_enabled",True)
+    return version,days
+
+def referral_reward_amount():
+    return max(0.0,float(get_setting("referral_reward",0.2) or 0.0))
+
+def referral_network_percent():
+    return max(0.0,float(get_setting("referral_network_percent",0.01) or 0.0))
+
+def process_referral_signup(uid,pending_ref):
+    uid=str(uid); code=str(pending_ref or "").strip()
+    if not code or uid not in users:
+        return None
+    ref_user=next((u for u,d in users.items() if str(d.get("ref"))==code and str(u)!=uid),None)
+    if not ref_user or users[uid].get("referred_by"):
+        return None
+    reward=referral_reward_amount()
+    users[uid]["referred_by"]=ref_user; users[uid].pop("pending_ref",None)
+    ledger_credit(ref_user,reward,"referral_reward",{"referred_user":uid})
+    users[ref_user]["invited"]=users[ref_user].get("invited",0)+1
+    save_user(uid); save_user(ref_user); log_activity(ref_user,"referral",{"referred_user":uid,"reward":reward})
+    try: bot.send_message(int(ref_user),f"🎉 <b>New Referral!</b>\n\n👤 A new user joined through your link.\n💰 Earned: <b>${reward:.2f}</b>")
+    except Exception: pass
+    if users[ref_user]["invited"]>=50 and not users[ref_user].get("referral_50_rewarded"):
+        until=grant_premium_days(ref_user,7,"referral_50_reward"); users[ref_user]["referral_50_rewarded"]=True; save_user(ref_user)
+        try: bot.send_message(int(ref_user),"🎉 <b>50 REFERRALS!</b>\n\n💎 You earned 7 days Premium!")
+        except Exception: pass
+        send_premium_email(ref_user,"Premium Reward — 50 Referrals",0,0,until)
+    return ref_user
+
+def distribute_referral_network_commission(source_uid,amount,reason="balance_credit"):
+    pct=referral_network_percent(); amount=float(amount or 0); source_uid=str(source_uid)
+    if pct<=0 or amount<=0 or source_uid not in users:
+        return []
+    current=users[source_uid].get("referred_by"); seen={source_uid}; results=[]
+    for level in range(1,11):
+        if not current or str(current) in seen:
+            break
+        parent=str(current); seen.add(parent)
+        if parent not in users:
+            break
+        commission=round(amount*pct/100.0,8)
+        if commission<=0:
+            break
+        ledger_credit(parent,commission,"referral_network_commission",{"source_user":source_uid,"level":level})
+        referral_commissions_col.insert_one({"source_user":source_uid,"recipient_user":parent,"level":level,"source_amount":amount,"percent":pct,"commission":commission,"reason":reason,"time":datetime.now(timezone.utc)})
+        log_activity(parent,"referral_network_commission",{"source_user":source_uid,"level":level,"percent":pct,"commission":commission,"reason":reason})
+        results.append((parent,level,commission)); current=users[parent].get("referred_by")
+    return results
+
+def credit_user_balance(uid,amount,reason="credit",network_commission=False):
+    uid=str(uid); amount=float(amount or 0)
+    if uid not in users or amount<=0: return 0.0,[]
+    asset_amt=ledger_credit(uid,amount,reason)
+    commissions=distribute_referral_network_commission(uid,amount,reason) if network_commission else []
+    return asset_amt,commissions
+
+def parse_seen_time(value):
+    if isinstance(value,datetime): dt=value
+    else:
+        try: dt=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        except Exception: return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+# ================= MONGODB DATABASE FUNCTIONS =================
+
+def load_users():
+    users_dict = {}
+    for user in users_col.find():
+        uid = str(user["_id"])
+        user_data = user.copy()
+        user_data.pop("_id", None)
+        users_dict[uid] = user_data
+    return users_dict
+
+def save_user(uid):
+    uid_str = str(uid)
+    if uid_str in users:
+        data = users[uid_str].copy()
+        data.pop("_id", None)
+        users_col.update_one({"_id": uid_str}, {"$set": data}, upsert=True)
+
+users = load_users()
+for _uid,_u in users.items():
+    _u.setdefault("currency","USD"); _u.setdefault("balance_asset", "USD"); _u.setdefault("blocked",0.0); _u.setdefault("conversion_holds",[]); _u.setdefault("portfolio",{})
+
+def log_activity(uid, action, details=None):
+    try:
+        activity_col.insert_one({"user_id": str(uid), "action": action, "details": details or {}, "time": datetime.now(timezone.utc)})
+    except Exception as e:
+        print("Activity log error:", e)
+
+def save_users():
+    for uid in users:
+        save_user(uid)
+
+def load_withdraws():
+    return list(withdraws_col.find({}, {"_id": False}))
+
+withdraws = load_withdraws()
+
+def migrate_pending_withdrawals_v2():
+    """One-time migration from the old design where pending withdrawals
+    were stored inside user.blocked. New pending withdrawals are separate.
+    """
+    if get_setting("pending_withdrawals_v2_migrated",False): return
+    changed=set()
+    for uid in list(users):
+        pending=[]
+        for w in withdraws:
+            if str(w.get("user"))==str(uid) and str(w.get("status","pending")).lower()=="pending":
+                amt=float(w.get("amount",w.get("blocked",0)) or 0)
+                if str(w.get("asset") or cur_code(uid))==cur_code(uid):
+                    pending.append(amt)
+                else:
+                    pending.append(usd_to_asset(cur_code(uid),float(w.get("amount_usd",0) or 0)))
+        if pending:
+            reserved=sum(pending); old_block=float(users[uid].get("blocked",0) or 0)
+            # Old versions put exactly the pending reservation in blocked.
+            # Remove only up to the known pending total; never create negative blocked.
+            if old_block>0:
+                users[uid]["blocked"]=round(max(0.0,old_block-reserved),12)
+                save_user(uid); changed.add(uid)
+    set_setting("pending_withdrawals_v2_migrated",True)
+    if changed: print("Migrated pending withdrawals for",len(changed),"users")
+
+migrate_pending_withdrawals_v2()
+
+def save_withdraws():
+    withdraws_col.delete_many({})
+    if withdraws:
+        clean_withdraws = [{**w} for w in withdraws]
+        withdraws_col.insert_many(clean_withdraws)
+
+def load_videos():
+    v_data = videos_col.find_one({"_id": "stats"})
+    if not v_data:
+        default_data = {
+            "_id": "stats",
+            "total": 0,
+            "feedback_enabled": False,
+            "platforms": {
+                "tiktok": 0,
+                "youtube": 0,
+                "facebook": 0,
+                "pinterest": 0,
+                "instagram": 0,
+                "snapchat": 0,
+                "twitter": 0
+            },
+            "users": {}
+        }
+        videos_col.insert_one(default_data)
+        return default_data
+    v_data.pop("_id", None)
+    return v_data
+
+videos_data = load_videos()
+
+def save_videos():
+    data = videos_data.copy()
+    data.pop("_id", None)
+    videos_col.update_one({"_id": "stats"}, {"$set": data}, upsert=True)
+
+# ================= HELPER FUNCTIONS =================
+
+def random_ref():
+    return str(random.randint(1000000000, 9999999999))
+
+def random_botid():
+    return str(random.randint(10000000000, 99999999999))
+
+def now_month():
+    return datetime.now().month
+
+def get_admin_ids():
+    try:
+        saved = get_setting("admin_ids", None)
+        if isinstance(saved, list):
+            ids = [int(x) for x in saved]
+        else:
+            ids = [int(x) for x in ADMIN_IDS]
+    except Exception:
+        ids = [int(x) for x in ADMIN_IDS]
+    if PRIMARY_ADMIN_ID not in ids:
+        ids.insert(0, PRIMARY_ADMIN_ID)
+    return list(dict.fromkeys(ids))
+
+def save_admin_ids(ids):
+    ids = list(dict.fromkeys(int(x) for x in ids))
+    if PRIMARY_ADMIN_ID not in ids:
+        ids.insert(0, PRIMARY_ADMIN_ID)
+    set_setting("admin_ids", ids)
+    ADMIN_IDS[:] = ids
+
+def is_admin(uid):
+    try:
+        return int(uid) in get_admin_ids()
+    except Exception:
+        return False
+
+def is_quick_access(uid):
+    return bool(users.get(str(uid), {}).get("quick_access", False))
+
+def is_priority_user(uid):
+    """Priority tier: Admin Quick Access > active Premium/Trial > Normal."""
+    uid=str(uid)
+    return is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)
+
+def download_executor_for(uid):
+    """Return the fastest queue available to this user."""
+    uid=str(uid)
+    if is_quick_access(uid):
+        return quick_executor
+    if is_priority_user(uid):
+        return vip_executor
+    return normal_executor
+
+def find_user_by_botid(bid):
+    for u, data in users.items():
+        if data.get("bot_id") == bid:
+            return u
+    return None
+
+def banned_guard(m):
+    uid = str(m.from_user.id)
+    if uid in users and users[uid].get("banned"):
+        try:
+            bot.send_message(m.chat.id, "🚫 You are banned.")
+        except:
+            pass
+        return True
+    return False
+
+def bot_locked_guard(message):
+    global BOT_LOCKED, LOCK_MESSAGE
+    if BOT_LOCKED and not is_admin(message.from_user.id):
+        try:
+            bot.send_message(message.chat.id, LOCK_MESSAGE)
+        except:
+            pass
+        return True
+    return False
+
+def send_html_email(to_email, subject, html_body):
+    if not RESEND_API_KEY:
+        print("❌ RESEND_API_KEY is not set in environment variables.")
+        return False
+    
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "from": SENDER_EMAIL,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code in [200, 201]:
+            return True
+        else:
+            print(f"RESEND API ERROR: {response.text}")
+            return False
+    except Exception as e:
+        print(f"EMAIL API ERROR: {e}")
+        return False
+
+# ================= OTP PROVIDERS =================
+
+def send_d7_sms(phone_number, text):
+    """Send a managed OTP through D7 Verify API.
+
+    Returns (ok, detail, otp_id). D7 generates and validates the OTP itself;
+    the bot never stores the plaintext OTP when this provider succeeds.
+    """
+    if not D7_TOKEN:
+        return False, "D7_TOKEN is not configured", None
+    headers = {
+        "Authorization": f"Bearer {D7_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "originator": os.getenv("D7_ORIGINATOR", "SignOTP"),
+        "recipient": phone_number,
+        "content": "Your Downloader Bot Verification Code is: {}",
+        "expiry": 600,
+        "data_coding": "text",
+        "channel": "SMS",
+        "otp_code_length": 6,
+        "otp_type": "numeric",
+        "retry_delay": 60,
+        "retry_count": 5,
+    }
+    try:
+        r = requests.post(D7_VERIFY_SEND_URL, json=payload, headers=headers, timeout=30)
+        try: body = r.json()
+        except Exception: body = {"raw": r.text}
+        if r.status_code in (200, 201, 202):
+            otp_id = body.get("otp_id") or body.get("id") or body.get("request_id")
+            if otp_id:
+                return True, body, str(otp_id)
+        return False, f"HTTP {r.status_code}: {body}", None
+    except Exception as e:
+        return False, str(e), None
+
+def resend_d7_sms(otp_id):
+    if not D7_TOKEN or not otp_id:
+        return False, "Missing D7 token or otp_id", None
+    headers = {"Authorization": f"Bearer {D7_TOKEN}", "Content-Type": "application/json", "Accept": "application/json"}
+    try:
+        r=requests.post(D7_VERIFY_RESEND_URL, json={"otp_id": str(otp_id)}, headers=headers, timeout=30)
+        try: body=r.json()
+        except Exception: body={"raw":r.text}
+        if r.status_code in (200,201,202):
+            return True, body, str(body.get("otp_id") or otp_id)
+        return False, f"HTTP {r.status_code}: {body}", None
+    except Exception as e:
+        return False, str(e), None
+
+def d7_otp_status(otp_id):
+    if not D7_TOKEN or not otp_id:
+        return False,"Missing D7 token or otp_id"
+    headers={"Authorization":f"Bearer {D7_TOKEN}","Accept":"application/json"}
+    try:
+        r=requests.get(f"{D7_VERIFY_STATUS_URL}/{urllib.parse.quote(str(otp_id),safe='')}",headers=headers,timeout=20)
+        try: body=r.json()
+        except Exception: body={"raw":r.text}
+        return r.status_code==200,body
+    except Exception as e:
+        return False,str(e)
+
+def verify_d7_sms(otp_id, code):
+    if not D7_TOKEN or not otp_id:
+        return False, "Missing D7 token or otp_id"
+    headers = {"Authorization": f"Bearer {D7_TOKEN}", "Content-Type": "application/json", "Accept": "application/json"}
+    try:
+        r=requests.post(D7_VERIFY_CHECK_URL, json={"otp_id": str(otp_id), "otp_code": str(code)}, headers=headers, timeout=30)
+        try: body=r.json()
+        except Exception: body={"raw":r.text}
+        return r.status_code == 200 and str(body.get("status","")).upper() in {"APPROVED","SUCCESS","VERIFIED"}, body
+    except Exception as e:
+        return False, str(e)
+
+def _waforge_request_urls(primary, legacy):
+    return list(dict.fromkeys([primary, legacy]))
+
+
+def _waforge_headers(api_key_header="Authorization"):
+    """Build auth headers while supporting WaForge deployments that use Bearer or X-API-Key."""
+    key = WAFORGE_API_KEY
+    common = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key_header.lower() in {"x-api-key", "x_api_key", "api-key", "api_key"}:
+        common["X-API-Key"] = key
+    elif api_key_header.lower() == "authorization-raw":
+        common["Authorization"] = key
+    else:
+        common["Authorization"] = f"Bearer {key}"
+    return common
+
+
+def _waforge_success(body, status_code):
+    if status_code not in (200, 201, 202):
+        return False
+    if not isinstance(body, dict):
+        return True
+    status = str(body.get("status") or body.get("message") or "").lower()
+    # A 2xx response from the provider is normally a successful send/verify unless
+    # it explicitly reports failure.
+    if body.get("success") is False or body.get("verified") is False or body.get("sent") is False:
+        return False
+    if any(word in status for word in ("error", "failed", "invalid", "denied")):
+        return False
+    return True
+
+
+def _waforge_response_id(body):
+    if not isinstance(body, dict):
+        return None
+    return body.get("id") or body.get("request_id") or body.get("requestId") or body.get("uuid") or body.get("session_id") or body.get("sessionId")
+
+
+def send_waforge_whatsapp(phone_number, user_id):
+    """Send WhatsApp OTP using WaForge's current documented API contract."""
+    if not WAFORGE_API_KEY:
+        return False, "WAFORGE_API_KEY is not configured", None
+
+    phone = re.sub(r"[\s().-]", "", str(phone_number or "").strip())
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        return False, "Invalid international WhatsApp number", None
+
+    # Current WaForge contract: POST /api/otp/send with Bearer wf_sk and {to}.
+    attempts = [
+        (WAFORGE_OTP_SEND_URL, {"to": phone}, "Authorization"),
+        (WAFORGE_OTP_SEND_URL, {"to": phone}, "X-API-Key"),
+    ]
+    # Compatibility attempts for older account/API deployments.
+    for url in _waforge_request_urls(WAFORGE_OTP_SEND_URL, WAFORGE_OTP_SEND_LEGACY_URL):
+        for payload in ({"to": phone}, {"phone": phone}):
+            for header_mode in (WAFORGE_API_KEY_HEADER, "Authorization", "X-API-Key"):
+                item=(url,payload,header_mode)
+                if item not in attempts:
+                    attempts.append(item)
+
+    last = None
+    for url, payload, header_mode in attempts:
+        try:
+            r = requests.post(url, json=payload, headers=_waforge_headers(header_mode), timeout=30)
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:1000]}
+            last = (r.status_code, body, url, header_mode, payload)
+            if _waforge_success(body, r.status_code):
+                return True, body, _waforge_response_id(body)
+        except Exception as e:
+            last = ("EXCEPTION", str(e), url, header_mode, payload)
+
+    print("WaForge send failure:", repr(last))
+    return False, f"WaForge OTP send failed: {last}", None
+
+def verify_waforge_whatsapp(phone_number, code, request_id=None):
+    """Verify against the WaForge OTP session. Never uses D7 for WhatsApp."""
+    if not WAFORGE_API_KEY:
+        return False, "WAFORGE_API_KEY is not configured"
+
+    endpoints = _waforge_request_urls(WAFORGE_OTP_VERIFY_URL, WAFORGE_OTP_VERIFY_LEGACY_URL)
+    payloads = []
+    p1 = {"to": phone_number, "code": str(code)}
+    if request_id:
+        p1["request_id"] = str(request_id)
+    payloads.append(p1)
+    p2 = {"phone": phone_number, "code": str(code)}
+    if request_id:
+        p2["request_id"] = str(request_id)
+    payloads.append(p2)
+
+    last = None
+    for url in endpoints:
+        for payload in payloads:
+            header_modes = [WAFORGE_API_KEY_HEADER]
+            if WAFORGE_API_KEY_HEADER.lower() == "authorization":
+                header_modes.append("X-API-Key")
+            for header_mode in header_modes:
+                try:
+                    r = requests.post(url, json=payload, headers=_waforge_headers(header_mode), timeout=30)
+                    try:
+                        body = r.json()
+                    except Exception:
+                        body = {"raw": r.text}
+                    last = (r.status_code, body, url, header_mode, payload)
+                    status = str(body.get("status") or "").lower() if isinstance(body, dict) else ""
+                    ok = (
+                        r.status_code in (200, 201, 202)
+                        and isinstance(body, dict)
+                        and (
+                            body.get("verified") is True
+                            or body.get("success") is True
+                            or body.get("matched") is True
+                            or status in {"verified", "approved", "success"}
+                        )
+                    )
+                    if ok:
+                        return True, body
+                    if r.status_code in (401, 403):
+                        continue
+                    if r.status_code in (404, 405, 415, 422):
+                        break
+                except Exception as e:
+                    last = (None, str(e), url, header_mode, payload)
+                    break
+    return False, last
+
+
+def expire_whatsapp_session(uid, created_at):
+    """Expire one WhatsApp OTP session after exactly 5 minutes."""
+    time.sleep(WHATSAPP_OTP_TTL)
+    data = whatsapp_verify_pending.get(str(uid))
+    if not data:
+        return
+    # Do not expire a newer/resend session.
+    if data.get("time") != created_at:
+        return
+    whatsapp_verify_pending.pop(str(uid), None)
+    try:
+        bot.send_message(
+            int(uid),
+            "⏰ <b>This code has expired.</b>\n\n"
+            "The WhatsApp verification code is valid for 5 minutes. "
+            "Please start verification again or request a new code.",
+        )
+    except Exception:
+        pass
+
+
+def whatsapp_otp_keyboard():
+    """Telegram controls for an active WhatsApp OTP session."""
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🔄 Resend WhatsApp", callback_data="resend_whatsapp_code"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process"),
+    )
+    return kb
+
+def extract_url(text):
+    """Extract the first real URL from any surrounding text.
+
+    Download links may be pasted like: Look at this video... 👀https://pin.it/abc123
+    Trailing punctuation is removed so captions such as `(url)` do not poison the
+    extractor.
+    """
+    if not text:
+        return None
+    match = re.search(r'https?://[^\s<>"\']+', str(text), flags=re.I)
+    if not match:
+        return None
+    url = match.group(0).rstrip('.,!?;:)]}\'"')
+    return url or None
+
+# ================= MENUS =================
+
+def user_menu(show_admin=False):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("💰 BALANCE", "💸 WITHDRAWAL")
+    kb.add("👥 REFERRAL", "🆔 GET ID")
+    kb.add("💎 PREMIUM", "👤 Profile")
+    kb.add("☎️ CUSTOMER", "🤖CUSTOMER AI")
+    if _song_search_is_open():
+        kb.add("🔎 Search Song")
+    if show_admin:
+        kb.add("👑 ADMIN PANEL")
+    return kb
+
+def admin_menu():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("📊 STATS", "📢 BROADCAST")
+    kb.add("⚡ QUICK ACCESS", "👥 SEE LIST")
+    kb.add("➕ ADD BALANCE", "➖ REMOVE MONEY")
+    kb.add("🚫 BAN USER MANUAL", "💳 WITHDRAWAL CHECK")
+    kb.add("💰 UNBLOCK MONEY", "🔍 RAADI")
+    kb.add("⏳ HOLD CHECK", "✅ RELEASE HOLD")
+    kb.add("📜 HOLD HISTORY")
+    kb.add("🔥 UN BAN-USER", "📌 POST CHANNEL")
+    kb.add("🔎 SEARCH USER", "📢 ADD ADS")
+    kb.add("🗑 DELETE ADS", "✅ VERIFY ON")
+    kb.add("❌ VERIFY OFF", "CHANNEL POST")
+    kb.add("🟢 Open Verify Before Send", "🔴 Close Verify Before Send")
+    kb.add("🔒 LOCK BOT")
+    kb.add("🔓 UNLOCK BOT", "❌ CLOSE WINDOWS")
+    kb.add("CLOSE CHANNEL POST", "📢 BROADCAST MEDIA")
+    kb.add("SEND PAY", "📥 IMPORT USERS")
+    kb.add("🔗 GET REFERRAL CODE", "📊 Feedback Stats")
+    kb.add("🟢 Open Feedback", "🔴 Close Feedback")
+    kb.add("🗑️ Reset All Feedbacks", "🔓 OPEN 30 MIN")
+    kb.add("🟢 Add Group REQUIRED", "🔴 Add Group OPTIONAL")
+    kb.add("➕ ADD NEW ADMIN")
+    kb.add("🟢 Open add channel", "🔴 Close add channel")
+    kb.add("🟢 Open mp3 Cover", "🔴 Close mp3 Cover")
+    kb.add("📢 REFERRAL BROADCAST")
+    kb.add("📣 Send all G/CH")
+    kb.add("🟢 Open song in bot", "🔴 Close Song in bot")
+    kb.add("📤 SEND TO CREATE BOT")
+    kb.add("🟢 OPEN VERIFY CREATE BOT", "🔴 CLOSE VERIFY CREATE BOT")
+    kb.add("🟢 OPEN CREATE CAPTION", "🔴 CLOSE CREATE CAPTION")
+    kb.add("🟢 Open Creation", "🔴 Close Creation")
+    kb.add("🤖 See All Bots", "📊 Bot Stats")
+    kb.add("✏️ SONG CLOSED MESSAGE")
+    kb.add("⚡ AUTO SONG SEARCH ON", "⛔ AUTO SONG SEARCH OFF")
+    # Keep the legacy song admin controls from the previous bot version.
+    kb.add("➕ ADD CAPTION", "📝 DEFAULT CAPTION")
+    kb.add("📊 SONG STATS", "🏆 TOP SONGS")
+    kb.add("🏆 TOP SONG SEARCHERS")
+    kb.add("📉 CHANGE MINIMUM", "➕ ADD FEE")
+    kb.add("➕ ADD LOW FEE", "🎁 GIFT ALL")
+    kb.add("🗑️ REMOVE ALL")
+    kb.add("📢 Send Email All")
+    kb.add("⏱️ FREE MAX MIN", "⏱️ PREMIUM MAX MIN")
+    kb.add("📦 FREE MAX MB", "📦 TRIAL MAX MB")
+    kb.add("📦 PREMIUM MAX MB", "⚙️ DOWNLOAD LIMITS")
+    kb.add("▶️ YOUTUBE FREE ACCESS", "📺 FREE YOUTUBE MB")
+    kb.add("📺 PREMIUM YOUTUBE MB", "📋 YOUTUBE LIMITS")
+    kb.add("📸 INSTAGRAM API", "📸 INSTAGRAM STATUS")
+    kb.add("🛰️ COBALT STATUS")
+    kb.add("✅ Verified Users", "🏷️ Sticker")
+    kb.add("Reveral Prices", "Delete Pay", "Open Pay rev")
+    kb.add("Send verify")
+    kb.add("🟢 Open SMS", "🔴 CLOSE SMS")
+    kb.add("🟢 OPEN VIA WHATSAPP", "🔴 CLOSE VIA WHATSAPP")
+    kb.add("♻️ Reset all Verify")
+    # Premium administration
+    kb.add("💎 PREMIUM PANEL", "💰 PREMIUM PRICES")
+    kb.add("🔓 OPEN PREMIUM", "🔒 CLOSE PREMIUM")
+    kb.add("🎁 GIVE PREMIUM ALL", "🎁 TRIAL PREMIUM")
+    kb.add("🎁 OPEN TRIAL DAYS")
+    kb.add("👑 PREMIUM USERS", "💵 REFERRAL REWARD")
+    kb.add("🔗 NETWORK REFERRAL %", "👥 AVAILABLE USERS")
+    kb.add("⭐ RATE BOT", "📊 RATE STATS")
+    kb.add("🗑 DELETE DATABASE USER", "📨 SEND LANGUAGE")
+    kb.add("📨 SEND LANGUAGE", "🌍 LANGUAGE STATS")
+    kb.add("⚥ SEND GENDER", "📊 GENDER STATS")
+    kb.add("🏙 SEND CITY", "📊 CITY STATS")
+    kb.add("💱 CHANGE MONEY", "⭐ STARS SETTINGS")
+    kb.add("👥 CURRENCY USERS", "📊 CURRENCY STATS")
+    kb.add("📊 MARKET STATUS")
+    kb.add("➕ ADD NEW ADMIN", "➖ REMOVE ADMIN")
+    kb.add("🔒 CLOSE ALL BALANCE", "🔓 OPEN ALL BALANCE")
+    kb.add("🔓 OPEN PERSON BALANCE", "🗑 REMOVE ALL BALANCE")
+    kb.add("🔐 PREMIUM VERIFY ON", "🔓 PREMIUM VERIFY OFF")
+    kb.add("🤖 CUSTOMER AI")
+    kb.add("👑 ADMIN LIST", "💰 SEE BALANCE")
+    kb.add("📊 SEE ALL BALANCE", "💼 PORTFOLIO STATS")
+    kb.add("➕ ADD CUSTOMER", "💱 MIN CHANGE CURRENCY")
+    kb.add("🟢 OPEN CRYPTO", "🔴 CLOSE CRYPTO")
+    kb.add("🟢 OPEN HOLD", "🔴 CLOSE HOLD")
+    kb.add("💸 CRYPTO FEE", "⛽ GAS FEE")
+    kb.add("💰 CRYPTO MIN DEPOSIT")
+    kb.add("📈 CRYPTO FEE STATS")
+    kb.add("🔥 STREAK SYSTEM")
+    kb.add("✏️ EDIT START MESSAGE")
+    kb.add("🔙 BACK MAIN MENU")
+    return kb
+
+def localized_user_menu(uid):
+    uid=str(uid); lang=lang_of(uid); d=MAIN_LABELS.get(lang,MAIN_LABELS["en"])
+    kb=ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(d["balance"],d["withdraw"])
+    kb.add(d["ref"],d["id"])
+    kb.add(d["premium"],d["profile"])
+    kb.add(d["topup"],d.get("currency","💱 CHANGE CURRENCY"))
+    if trial_available(uid):
+        kb.add(d["trial"])
+    kb.add(d["customer"],d["ai"])
+    if _song_search_is_open():
+        kb.add("🔎 Search Song")
+    if is_admin(uid): kb.add("👑 ADMIN PANEL")
+    return kb
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("setlang:"))
+def setlang_callback(call):
+    uid=str(call.from_user.id); code=call.data.split(":",1)[1]
+    if code not in LANGUAGES: return
+    users[uid]["language"]=code; pending=users[uid].pop("pending_ref",None); save_user(uid)
+    bot.answer_callback_query(call.id,"✅ Language saved")
+    try: bot.edit_message_text(f"✅ {LANGUAGES[code]['name']} selected.",call.message.chat.id,call.message.message_id)
+    except Exception: pass
+    if pending:
+        process_referral_signup(uid,pending)
+    check_membership(call.from_user.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("change_lang:"))
+def change_lang_callback(call):
+    uid=str(call.from_user.id); code=call.data.split(":",1)[1]
+    if code in LANGUAGES:
+        users.setdefault(uid,{})["language"]=code; save_user(uid); bot.answer_callback_query(call.id,"✅")
+        confirmations={
+            "en":"🌍 <b>Language updated successfully.</b>","so":"🌍 <b>Luqadda si guul leh ayaa loo beddelay.</b>",
+            "am":"🌍 <b>ቋንቋ በተሳካ ሁኔታ ተቀይሯል።</b>","om":"🌍 <b>Afaan milkaa'inaan jijjiirameera.</b>",
+            "ar":"🌍 <b>تم تحديث اللغة بنجاح.</b>","fr":"🌍 <b>Langue mise à jour.</b>",
+            "es":"🌍 <b>Idioma actualizado.</b>","de":"🌍 <b>Sprache erfolgreich aktualisiert.</b>",
+            "pt":"🌍 <b>Idioma atualizado.</b>","tr":"🌍 <b>Dil başarıyla güncellendi.</b>",
+            "hi":"🌍 <b>भाषा सफलतापूर्वक अपडेट हो गई।</b>","id":"🌍 <b>Bahasa berhasil diperbarui.</b>",
+            "ja":"🌍 <b>言語を更新しました。</b>","ko":"🌍 <b>언어가 업데이트되었습니다.</b>","zh":"🌍 <b>语言已成功更新。</b>"
+        }
+        bot.send_message(call.message.chat.id,confirmations.get(code,confirmations["en"]),reply_markup=localized_user_menu(uid),parse_mode="HTML")
+
+def back_to_main_menu(m):
+    uid = str(m.from_user.id)
+    try:
+        bot.send_message(
+            m.chat.id,
+            "🔙 Returning to main menu",
+            reply_markup=localized_user_menu(uid)
+        )
+    except:
+        pass
+
+@bot.message_handler(func=lambda m: m.text == "🔙 BACK MAIN MENU")
+def back_button_handler(m):
+    back_to_main_menu(m)
+
+# ================= STREAK SYSTEM =================
+STREAK_WINDOW_HOURS=26
+
+def streak_enabled(): return bool(get_setting("streak_system_enabled",False))
+def streak_campaign_version(): return int(get_setting("streak_campaign_version",0) or 0)
+def streak_reward_balance(): return max(0.0,float(get_setting("streak_reward_balance",0.10) or 0))
+def streak_reward_premium_days(): return max(0,int(get_setting("streak_reward_premium_days",0) or 0))
+def streak_milestone_every(): return max(1,int(get_setting("streak_milestone_every",7) or 7))
+def streak_milestone_balance(): return max(0.0,float(get_setting("streak_milestone_balance",0.50) or 0))
+def streak_milestone_premium_days(): return max(0,int(get_setting("streak_milestone_premium_days",1) or 0))
+
+def _streak_dt(v):
+    if not v: return None
+    try:
+        dt=v if isinstance(v,datetime) else datetime.fromisoformat(str(v).replace("Z","+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+def streak_user_active(uid): return bool(users.get(str(uid),{}).get("streak_active",False)) and users.get(str(uid),{}).get("streak_campaign_version")==streak_campaign_version()
+
+def _streak_touch(uid):
+    uid=str(uid)
+    u=users.get(uid)
+    if not u or not streak_user_active(uid): return
+    now=datetime.now(timezone.utc); last=_streak_dt(u.get("streak_last_activity_at")); due=_streak_dt(u.get("streak_next_reward_at"))
+    if last and now-last>=timedelta(hours=STREAK_WINDOW_HOURS):
+        u["streak_active"]=False; u["streak_broken_at"]=now.isoformat(); save_user(uid)
+        return
+    u["streak_last_activity_at"]=now.isoformat();
+    if due and now>=due:
+        count=int(u.get("streak_count",0) or 0)+1; u["streak_count"]=count; u["streak_next_reward_at"]=(now+timedelta(hours=STREAK_WINDOW_HOURS)).isoformat(); u["streak_reminder_10_sent"]=False; u["streak_reminder_5_sent"]=False
+        bal=streak_reward_balance(); pd=streak_reward_premium_days()
+        if bal>0: ledger_credit(uid,bal,"streak_reward",{"streak":count})
+        if pd>0: grant_premium_days(uid,pd,"streak_reward")
+        mb=mp=0
+        if count%streak_milestone_every()==0:
+            mb=streak_milestone_balance(); mp=streak_milestone_premium_days()
+            if mb>0: ledger_credit(uid,mb,"streak_milestone",{"streak":count})
+            if mp>0: grant_premium_days(uid,mp,"streak_milestone")
+        save_user(uid)
+        reward=[]
+        if bal>0: reward.append(f"💰 +${bal:.2f}")
+        if pd>0: reward.append(f"💎 +{pd} Premium day(s)")
+        if mb>0: reward.append(f"🏆 Milestone +${mb:.2f}")
+        if mp>0: reward.append(f"🏆 Milestone +{mp} Premium day(s)")
+        try: bot.send_message(int(uid),f"🔥 <b>STREAK DAY {count}!</b>\n\n"+("\n".join(reward) if reward else "🎉 Streak continued!")+f"\n\n⏳ Next reward window: 26 hours.")
+        except: pass
+    else:
+        u["streak_last_activity_at"]=now.isoformat(); save_user(uid)
+
+def _streak_remaining(uid):
+    d=_streak_dt(users.get(str(uid),{}).get("streak_last_activity_at"));
+    return max(0.0,(d+timedelta(hours=STREAK_WINDOW_HOURS)-datetime.now(timezone.utc)).total_seconds()) if d else 0
+
+def streak_broadcast_text():
+    bal=streak_reward_balance(); pd=streak_reward_premium_days(); me=streak_milestone_every(); mb=streak_milestone_balance(); mp=streak_milestone_premium_days()
+    rewards=[]
+    if bal>0: rewards.append(f"💰 ${bal:.2f} balance every 26 hours")
+    if pd>0: rewards.append(f"💎 {pd} Premium day(s)")
+    if mb>0 or mp>0: rewards.append(f"🏆 Milestone every {me} days: ${mb:.2f} + {mp} Premium day(s)")
+    return ("🔥 <b>STREAK SYSTEM</b> 🔥\n\n"
+            "Use the bot regularly and keep your streak alive!\n\n"
+            + "\n".join(rewards) + "\n\n"
+            "⏳ You have <b>26 hours</b> between activities.\n"
+            "⚠️ If you pass 26 hours without using the bot, your streak breaks.\n\n"
+            "Tap <b>START NOW</b> to activate your streak.")
+
+def _streak_start(uid):
+    uid=str(uid); now=datetime.now(timezone.utc); ver=streak_campaign_version()
+    users[uid]["streak_active"]=True; users[uid]["streak_campaign_version"]=ver; users[uid]["streak_count"]=0; users[uid]["streak_started_at"]=now.isoformat(); users[uid]["streak_last_activity_at"]=now.isoformat(); users[uid]["streak_next_reward_at"]=(now+timedelta(hours=STREAK_WINDOW_HOURS)).isoformat(); users[uid]["streak_reminder_10_sent"]=False; users[uid]["streak_reminder_5_sent"]=False; users[uid].pop("streak_broken_at",None); save_user(uid)
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("streak_start:"))
+def streak_start_callback(call):
+    uid=str(call.from_user.id)
+    try: campaign=int(call.data.split(":",1)[1])
+    except Exception: campaign=-1
+    if not streak_enabled(): bot.answer_callback_query(call.id,"Streak is currently closed.",show_alert=True); return
+    if campaign!=streak_campaign_version():
+        bot.answer_callback_query(call.id,"This streak campaign has ended. Wait for the next one.",show_alert=True); return
+    if streak_user_active(uid):
+        bot.answer_callback_query(call.id,"🔥 Your streak is already active.",show_alert=True); return
+    _streak_start(uid); bot.answer_callback_query(call.id,"🔥 Streak started!")
+    try: bot.delete_message(call.message.chat.id,call.message.message_id)
+    except: pass
+    bot.send_message(call.message.chat.id,"🔥 <b>STREAK STARTED!</b>\n\nDay <b>0</b> is active. Use the bot before 26 hours to keep it alive and earn your first reward.",reply_markup=localized_user_menu(uid),parse_mode="HTML")
+
+def streak_worker():
+    while True:
+        try:
+            if streak_enabled():
+                now=datetime.now(timezone.utc)
+                for uid,u in list(users.items()):
+                    if not streak_user_active(uid): continue
+                    last=_streak_dt(u.get("streak_last_activity_at"))
+                    if not last: continue
+                    rem=(last+timedelta(hours=STREAK_WINDOW_HOURS)-now).total_seconds()
+                    if rem<=0:
+                        u["streak_active"]=False; u["streak_broken_at"]=now.isoformat(); save_user(uid); continue
+                    # Reminders only while active; after break there are no more streak notifications.
+                    for hours_left,key in ((10,"streak_reminder_10_sent"),(5,"streak_reminder_5_sent")):
+                        if rem<=hours_left*3600 and not u.get(key):
+                            u[key]=True; save_user(uid)
+                            try: bot.send_message(int(uid),f"⚠️ <b>STREAK REMINDER</b>\n\n🔥 Your streak is still active. Only about <b>{hours_left} hours</b> remain before the 26-hour deadline.\n\nUse the bot now to keep your streak alive!")
+                            except: pass
+        except Exception as e: print("Streak worker error:",repr(e))
+        time.sleep(60)
+
+@bot.message_handler(func=lambda m: m.text=="🔥 STREAK SYSTEM")
+def streak_admin_start(m):
+    if not is_admin(m.from_user.id): return
+    kb=InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("📢 SEND ALL",callback_data="streak_admin:send"),InlineKeyboardButton("🟢 OPEN",callback_data="streak_admin:open"))
+    kb.add(InlineKeyboardButton("🔴 CLOSE",callback_data="streak_admin:close"),InlineKeyboardButton("⚙️ REWARDS",callback_data="streak_admin:rewards"))
+    kb.add(InlineKeyboardButton("📊 STATS",callback_data="streak_admin:stats"),InlineKeyboardButton("♻️ RESET USER",callback_data="streak_admin:reset"))
+    bot.send_message(m.chat.id,"🔥 <b>STREAK ADMIN CONTROL</b>\n\nUsers never start automatically. They only join after tapping START NOW from your broadcast.\n\nCurrent status: <b>"+("OPEN" if streak_enabled() else "CLOSED")+"</b>",reply_markup=kb,parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("streak_admin:"))
+def streak_admin_callback(call):
+    if not is_admin(call.from_user.id): return
+    action=call.data.split(":",1)[1]
+    if action=="open": set_setting("streak_system_enabled",True); bot.answer_callback_query(call.id,"Streak OPEN")
+    elif action=="close": set_setting("streak_system_enabled",False); bot.answer_callback_query(call.id,"Streak CLOSED")
+    elif action=="send":
+        ver=streak_campaign_version()+1; set_setting("streak_campaign_version",ver); set_setting("streak_system_enabled",True)
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🔥 START NOW",callback_data=f"streak_start:{ver}"))
+        text=streak_broadcast_text()
+        sent,failed=broadcast_users(lambda uid: bot.send_message(int(uid),text,reply_markup=kb,parse_mode="HTML"), list(users.keys()))
+        bot.send_message(call.message.chat.id,f"✅ Streak campaign sent to <b>{sent}</b> users.\n❌ Failed: <b>{failed}</b>\n\nUsers must tap START NOW.",parse_mode="HTML")
+    elif action=="rewards":
+        msg=bot.send_message(call.message.chat.id,"⚙️ Send:\n<code>daily_balance | daily_premium_days | milestone_every | milestone_balance | milestone_premium_days</code>\n\nExample: <code>0.10 | 0 | 7 | 0.50 | 1</code>",parse_mode="HTML")
+        bot.register_next_step_handler(msg,streak_rewards_process)
+    elif action=="stats":
+        active=sum(1 for u in users.values() if streak_user_active(str(u.get("_id", "")) or ""))
+        active=sum(1 for uid in users if streak_user_active(uid))
+        counts=sorted([(int(u.get("streak_count",0) or 0),uid) for uid,u in users.items() if int(u.get("streak_count",0) or 0)>0],reverse=True)[:10]
+        lines=["🔥 <b>STREAK STATS</b>","",f"Active: <b>{active}</b>",f"Reward: <b>${streak_reward_balance():.2f}</b> + <b>{streak_reward_premium_days()}d Premium</b>","","Top streaks:"]
+        lines += [f"{i}. <code>{uid}</code> — 🔥 {c}" for i,(c,uid) in enumerate(counts,1)]
+        bot.send_message(call.message.chat.id,"\n".join(lines),parse_mode="HTML")
+    elif action=="reset":
+        msg=bot.send_message(call.message.chat.id,"♻️ Send Telegram ID or BOT ID to reset streak:")
+        bot.register_next_step_handler(msg,streak_reset_process)
+
+def streak_rewards_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        p=[x.strip() for x in (m.text or "").split("|")]
+        if len(p)<5: raise ValueError("5 values required")
+        set_setting("streak_reward_balance",float(p[0])); set_setting("streak_reward_premium_days",int(p[1])); set_setting("streak_milestone_every",int(p[2])); set_setting("streak_milestone_balance",float(p[3])); set_setting("streak_milestone_premium_days",int(p[4]))
+        bot.send_message(m.chat.id,"✅ Streak rewards updated.",reply_markup=admin_menu())
+    except Exception as e: bot.send_message(m.chat.id,f"❌ {html.escape(str(e))}")
+
+def streak_reset_process(m):
+    if not is_admin(m.from_user.id): return
+    target=(m.text or "").strip(); uid=target if target in users else find_user_by_botid(target)
+    if not uid: bot.send_message(m.chat.id,"❌ User not found."); return
+    for k in ["streak_active","streak_count","streak_started_at","streak_last_activity_at","streak_next_reward_at","streak_broken_at","streak_reminder_10_sent","streak_reminder_5_sent"]: users[uid].pop(k,None)
+    save_user(uid); bot.send_message(m.chat.id,f"✅ Streak reset for <code>{uid}</code>.",parse_mode="HTML")
+
+# ================= ADMIN SMS CONTROL =================
+
+@bot.message_handler(func=lambda m: m.text in ["🟢 Open SMS", "🔴 CLOSE SMS", "🟢 OPEN VIA WHATSAPP", "🔴 CLOSE VIA WHATSAPP", "♻️ Reset all Verify"])
+def sms_admin_manager(m):
+    if not is_admin(m.from_user.id): return
+    
+    if m.text == "🟢 Open SMS":
+        set_setting("sms_enabled", True)
+        try:
+            bot.send_message(m.chat.id, "🟢 SMS Verification system is now OPEN. Users can choose Gmail or Phone.")
+        except: pass
+    elif m.text == "🔴 CLOSE SMS":
+        set_setting("sms_enabled", False)
+        try:
+            bot.send_message(m.chat.id, "🔴 SMS Verification system is now CLOSED. Users will only use Gmail.")
+        except: pass
+    elif m.text == "🟢 OPEN VIA WHATSAPP":
+        if not WAFORGE_API_KEY:
+            try:
+                bot.send_message(m.chat.id, "❌ WhatsApp cannot be opened because WAFORGE_API_KEY is missing.")
+            except: pass
+            return
+        set_setting("whatsapp_verify_enabled", True)
+        try:
+            bot.send_message(m.chat.id, "🟢 WhatsApp verification is now OPEN. Users can request OTP via WaForge WhatsApp.")
+        except: pass
+    elif m.text == "🔴 CLOSE VIA WHATSAPP":
+        set_setting("whatsapp_verify_enabled", False)
+        try:
+            bot.send_message(m.chat.id, "🔴 WhatsApp verification is now CLOSED.")
+        except: pass
+    elif m.text == "♻️ Reset all Verify":
+        # Make every user unverified and clear all active verification sessions.
+        changed = 0
+        for uid, data in users.items():
+            if data.get("verified") or data.get("whatsapp_verified") or data.get("email") or data.get("phone"):
+                data["verified"] = False
+                data["whatsapp_verified"] = False
+                data["phone_verified"] = False
+                data["email_verified"] = False
+                data["verification_method"] = None
+                data.pop("email", None)
+                data.pop("phone", None)
+                data.pop("sticker", None)
+                save_user(uid)
+                changed += 1
+        email_verify_pending.clear()
+        phone_verify_pending.clear()
+        whatsapp_verify_pending.clear()
+        try:
+            bot.send_message(m.chat.id, f"♻️ Reset complete. {changed} users are now Unverified and can verify again.")
+        except: pass
+
+# ================= PROFILE & VERIFICATION LOGIC =================
+
+@bot.message_handler(func=lambda m: m.text == "👤 Profile")
+def profile_handler(m):
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m):
+        return
+    uid = str(m.from_user.id)
+    u_data = users.get(uid, {})
+    
+    verified = u_data.get("verified", False)
+    status_str = f"Verified{_verified_badge_html()}" if verified else "Not Verified"
+    joined = u_data.get("joined_date", datetime.now().strftime("%Y-%m-%d"))
+    downloads = videos_data.get("users", {}).get(uid, 0)
+    balance = u_data.get("balance", 0.0)
+    email = u_data.get("email", "")
+    phone = u_data.get("phone", "")
+    contact_info = email if email else (phone if phone else "Not Set")
+    premium_status = f"💎 Active until {premium_until_text(uid)}" if is_premium(uid) else "❌ Not Active"
+    
+    text = (
+        f"<b>👤 USER PROFILE</b>\n\n"
+        f"• Status: {status_str}\n"
+        f"• Premium: {premium_status}\n"
+        f"• Contact: {contact_info}\n"
+        f"• Date Joined: {joined}\n"
+        f"• Total Downloads: {downloads}\n"
+        f"• Balance: {format_asset(cur_code(uid), balance)}\n• USD Value: ${asset_to_usd(cur_code(uid), balance):,.2f} USD"
+    )
+    kb = InlineKeyboardMarkup(row_width=1)
+    if not verified:
+        kb.add(InlineKeyboardButton("🔐 Verify", callback_data="start_verify_flow"))
+    try:
+        bot.send_message(m.chat.id, text, reply_markup=kb)
+    except:
+        pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile_history")
+def profile_history_callback(call):
+    uid=str(call.from_user.id); rows=list(activity_col.find({"user_id":uid}).sort("time",-1).limit(20)); lines=["📜 <b>YOUR HISTORY</b>",""]
+    for r in rows:
+        t=r.get("time"); ts=t.strftime("%Y-%m-%d %H:%M") if hasattr(t,"strftime") else str(t); lines.append(f"• {str(r.get('action','event')).replace('_',' ').title()} — {ts}")
+    if not rows: lines.append("No history yet.")
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"\n".join(lines))
+
+@bot.callback_query_handler(func=lambda call: call.data == "profile_language")
+def profile_language_callback(call):
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"🌍 <b>Select your language</b>",reply_markup=language_kb("change_lang"))
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_verify_flow")
+def start_verify_flow(call):
+    try:
+        sms_enabled = get_setting("sms_enabled", False)
+        whatsapp_enabled = get_setting("whatsapp_verify_enabled", False) and bool(WAFORGE_API_KEY)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("📧 Gmail", callback_data="verify_choice_gmail"))
+        if sms_enabled:
+            kb.add(InlineKeyboardButton("📱 SMS", callback_data="verify_choice_phone"))
+        if whatsapp_enabled:
+            kb.add(InlineKeyboardButton("🟢 WhatsApp OTP", callback_data="verify_choice_whatsapp"))
+        if len(kb.keyboard) > 0:
+            bot.edit_message_text(
+                "Please choose your verification method:",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=kb
+            )
+        else:
+            bot.answer_callback_query(call.id,"No verification method is currently available.",show_alert=True); return
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        print(f"Verify flow error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_choice_"))
+def handle_verify_choice(call):
+    choice = call.data.split("_", 2)[2]
+    try:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Cancel Verification", callback_data="cancel_verify_process"))
+        if choice == "gmail":
+            msg = bot.send_message(call.message.chat.id, "Please enter your Gmail address:", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_email)
+        elif choice == "phone":
+            msg = bot.send_message(call.message.chat.id, "Please send your phone number with country code (e.g. +252... or +251...):", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_phone)
+        elif choice == "whatsapp":
+            if not get_setting("whatsapp_verify_enabled", False) or not WAFORGE_API_KEY:
+                bot.answer_callback_query(call.id, "WhatsApp verification is not configured.", show_alert=True)
+                return
+            msg = bot.send_message(call.message.chat.id, "📱 Send the WhatsApp number with country code (e.g. +252... or +251...):", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_whatsapp)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        print("Verify choice error:", e)
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_verify_process")
+def cancel_verify_process(call):
+    """Cancel verification cleanly and immediately return the user to the normal menu."""
+    uid=str(call.from_user.id)
+    email_verify_pending.pop(uid,None)
+    phone_verify_pending.pop(uid,None)
+    whatsapp_verify_pending.pop(uid,None)
+    # telebot's next-step handler otherwise remains attached to the chat and can
+    # consume the next normal menu button/text as if it were an OTP.
+    try:
+        bot.clear_step_handler_by_chat_id(call.message.chat.id)
+    except Exception:
+        pass
+    try:
+        bot.answer_callback_query(call.id,"✅ Verification cancelled. You can use the menu now.")
+    except Exception: pass
+    try:
+        bot.edit_message_text("❌ <b>Verification cancelled.</b>\n\nYou can use all bot buttons normally now.",call.message.chat.id,call.message.message_id,reply_markup=None)
+    except Exception: pass
+    try:
+        bot.send_message(call.message.chat.id,"🏠 <b>Main Menu</b>",reply_markup=localized_user_menu(uid))
+    except Exception: pass
+
+# Expire local verification state after the same 10-minute lifetime used by D7.
+def delayed_cancel_session(chat_id,message_id,uid):
+    """Expire Gmail/SMS verification 10 minutes after the latest OTP request.
+
+    The loop deliberately re-checks the stored timestamp so a resend extends
+    the lifetime instead of letting the original timer kill the new OTP.
+    """
+    while True:
+        data=email_verify_pending.get(uid) or phone_verify_pending.get(uid)
+        if not data: return
+        created=float(data.get("time",0) or 0)
+        remaining=600-(time.time()-created)
+        if remaining <= 0: break
+        time.sleep(min(remaining,30))
+    email_verify_pending.pop(uid,None)
+    phone_verify_pending.pop(uid,None)
+    try: bot.clear_step_handler_by_chat_id(chat_id)
+    except Exception: pass
+    try:
+        bot.edit_message_text("⏰ <b>Verification session expired.</b>\n\nPlease start verification again if needed.",chat_id,message_id,reply_markup=None)
+    except Exception: pass
+    try:
+        bot.send_message(chat_id,"🏠 <b>Main Menu</b>",reply_markup=localized_user_menu(uid))
+    except Exception: pass
+
+# ----- GMAIL VERIFICATION LOGIC ----- #
+
+def process_verification_email(m):
+    uid = str(m.from_user.id)
+    email = (m.text or "").strip()
+    
+    menu_buttons = ["👤 Profile", "👑 ADMIN PANEL", "💰 BALANCE", "💸 WITHDRAWAL", "👥 REFERRAL", "🆔 GET ID", "☎️ CUSTOMER", "🤖CUSTOMER AI", "🔙 BACK MAIN MENU", "💳 PAY"]
+    if email in menu_buttons or "@" not in email:
+        try:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Cancel Verification", callback_data="cancel_verify_process"))
+            msg = bot.send_message(m.chat.id, "❌ Invalid email address. Please enter a valid Gmail address:", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_email)
+        except: pass
+        return
+
+    code = str(random.randint(100000, 999999))
+    current_time = time.time()
+    email_verify_pending[uid] = {
+        "email": email,
+        "code": code,
+        "time": current_time,
+        "last_resend": current_time
+    }
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+        <div style="max-width: 600px; background: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h2 style="color: #333;">Email Verification</h2>
+            <p>Hello,</p>
+            <p>Your 6-digit verification code for the bot is:</p>
+            <div style="font-size: 24px; font-weight: bold; color: #4CAF50; background: #e8f5e9; padding: 15px; text-align: center; border-radius: 4px; letter-spacing: 5px;">
+                {code}
+            </div>
+            <p style="margin-top: 20px; color: #666; font-size: 12px;">If you didn't request this, please ignore this email.</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    success = send_html_email(email, "Your Bot Verification Code", html_content)
+    if success:
+        try:
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🔄 Resend", callback_data="resend_verify_code"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process")
+            )
+            msg = bot.send_message(m.chat.id, f"📩 A 6-digit verification code has been sent to your email ({email}). Please enter the code here:", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_code)
+            threading.Thread(target=delayed_cancel_session, args=(m.chat.id, msg.message_id, uid), daemon=True).start()
+        except: pass
+    else:
+        try:
+            bot.send_message(m.chat.id, "❌ Failed to send verification email. Please try again later.")
+        except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "resend_verify_code")
+def resend_verify_code_callback(call):
+    uid = str(call.from_user.id)
+    if uid not in email_verify_pending:
+        bot.answer_callback_query(call.id, "❌ Verification session expired. Please start again from your profile.", show_alert=True)
+        return
+        
+    data = email_verify_pending[uid]
+    current_time = time.time()
+    last_resend_time = data.get("last_resend", data.get("time", 0))
+    cooldown = 60  # 1 minute for Gmail
+    elapsed = current_time - last_resend_time
+    
+    if elapsed < cooldown:
+        remaining = int(cooldown - elapsed)
+        bot.answer_callback_query(call.id, f"⏳ Please wait {remaining}s before requesting another code.", show_alert=True)
+        return
+        
+    data["last_resend"] = current_time
+    email = data["email"]
+    code = str(random.randint(100000, 999999))
+    data["code"] = code
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+        <div style="max-width: 600px; background: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h2 style="color: #333;">Email Verification (Resend)</h2>
+            <p>Hello,</p>
+            <p>Your new 6-digit verification code for the bot is:</p>
+            <div style="font-size: 24px; font-weight: bold; color: #4CAF50; background: #e8f5e9; padding: 15px; text-align: center; border-radius: 4px; letter-spacing: 5px;">
+                {code}
+            </div>
+            <p style="margin-top: 20px; color: #666; font-size: 12px;">If you didn't request this, please ignore this email.</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    success = send_html_email(email, "Your New Bot Verification Code", html_content)
+    if success:
+        bot.answer_callback_query(call.id, "✅ A new code has been sent to your email!")
+        try:
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🔄 Resend", callback_data="resend_verify_code"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process")
+            )
+            msg = bot.send_message(call.message.chat.id, f"📩 A new 6-digit verification code has been resent to your email ({email}). Please enter the code here:", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_code)
+            threading.Thread(target=delayed_cancel_session, args=(call.message.chat.id, msg.message_id, uid), daemon=True).start()
+        except: pass
+    else:
+        bot.answer_callback_query(call.id, "❌ Failed to resend verification email.", show_alert=True)
+
+def process_verification_code(m):
+    uid = str(m.from_user.id)
+    code_input = (m.text or "").strip()
+    
+    if uid not in email_verify_pending:
+        try:
+            bot.send_message(m.chat.id, "❌ Verification session expired or already completed. Please start again from your profile.")
+        except: pass
+        return
+
+    menu_buttons = ["👤 Profile", "👑 ADMIN PANEL", "💰 BALANCE", "💸 WITHDRAWAL", "👥 REFERRAL", "🆔 GET ID", "☎️ CUSTOMER", "🤖CUSTOMER AI", "🔙 BACK MAIN MENU", "💳 PAY"]
+    if code_input in menu_buttons or not code_input.isdigit() or len(code_input) != 6:
+        try:
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🔄 Resend", callback_data="resend_verify_code"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process")
+            )
+            msg = bot.send_message(
+                m.chat.id,
+                "⚠️ <b>Action not allowed!</b>\n"
+                "You must enter the 6-digit code sent to your Gmail first.\n\n"
+                "Please enter the correct code:",
+                reply_markup=kb
+            )
+            bot.register_next_step_handler(msg, process_verification_code)
+        except: pass
+        return
+
+    data = email_verify_pending[uid]
+    if code_input == data["code"]:
+        users[uid]["verified"] = True
+        users[uid]["email_verified"] = True
+        users[uid]["verification_method"] = "Gmail"
+        users[uid]["email"] = data["email"]
+        if "sticker" not in users[uid] or not users[uid]["sticker"]:
+            users[uid]["sticker"] = "🌟"
+        save_user(uid)
+        email_verify_pending.pop(uid, None)
+        _resume_verified_download(uid,m.chat.id)
+        trial_activated=activate_pending_trial(uid,m.chat.id)
+        try:
+            bot.send_message(m.chat.id, "✅ Congratulations! Your account is now Verified. Your pending 1-Day Trial was activated automatically." if trial_activated else "✅ Congratulations! Your account is now Verified. You can check your profile status.", reply_markup=localized_user_menu(str(m.from_user.id)))
+        except: pass
+    else:
+        try:
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🔄 Resend", callback_data="resend_verify_code"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process")
+            )
+            msg = bot.send_message(m.chat.id, "❌ Incorrect verification code. Please enter the correct 6-digit code:", reply_markup=kb)
+            bot.register_next_step_handler(msg, process_verification_code)
+            threading.Thread(target=delayed_cancel_session, args=(m.chat.id, msg.message_id, uid), daemon=True).start()
+        except: pass
+
+# ----- PHONE VERIFICATION LOGIC ----- #
+
+def process_verification_phone(m):
+    uid = str(m.from_user.id)
+    phone_input = (m.text or "").strip().replace(" ", "")
+    menu_buttons = ["👤 Profile", "👑 ADMIN PANEL", "💰 BALANCE", "💸 WITHDRAWAL", "👥 REFERRAL", "🆔 GET ID", "☎️ CUSTOMER", "🤖CUSTOMER AI", "🔙 BACK MAIN MENU", "💳 PAY"]
+    if phone_input in menu_buttons or not re.fullmatch(r"\+[1-9]\d{9,14}", phone_input):
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process"))
+        msg=bot.send_message(m.chat.id,"❌ Invalid number. Please send a valid phone number with country code (e.g. +252... or +251...).",reply_markup=kb)
+        bot.register_next_step_handler(msg,process_verification_phone); return
+    ok, detail, otp_id = send_d7_sms(phone_input, "")
+    if not ok:
+        print("D7 Verify send error:", detail)
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_verify_process"))
+        bot.send_message(m.chat.id,"❌ <b>SMS OTP could not be sent.</b>\n\nPlease check the phone number, D7 balance/Sender ID, and try again.",reply_markup=kb); return
+    now=time.time()
+    phone_verify_pending[uid]={"phone":phone_input,"otp_id":otp_id,"time":now,"last_resend":now}
+    kb=InlineKeyboardMarkup(); kb.row(InlineKeyboardButton("🔄 Resend SMS",callback_data="resend_phone_code"),InlineKeyboardButton("❌ Cancel",callback_data="cancel_verify_process"))
+    msg=bot.send_message(m.chat.id,f"📲 <b>SMS OTP request accepted</b> for <code>{phone_input}</code>.\n\nEnter the 6-digit code when it arrives.\n⏳ Valid for 10 minutes.",reply_markup=kb)
+    bot.register_next_step_handler(msg,process_phone_code)
+    threading.Thread(target=delayed_cancel_session,args=(m.chat.id,msg.message_id,uid),daemon=True).start()
+
+@bot.callback_query_handler(func=lambda call: call.data == "resend_phone_code")
+def resend_phone_code_callback(call):
+    uid=str(call.from_user.id); data=phone_verify_pending.get(uid)
+    if not data:
+        bot.answer_callback_query(call.id,"❌ Session expired. Start verification again.",show_alert=True); return
+    elapsed=time.time()-data.get("last_resend",data.get("time",0))
+    if elapsed<60:
+        bot.answer_callback_query(call.id,f"⏳ Please wait {int(60-elapsed)}s.",show_alert=True); return
+    ok,detail,new_id=resend_d7_sms(data.get("otp_id"))
+    if not ok:
+        print("D7 Verify resend error:",detail); bot.answer_callback_query(call.id,"❌ SMS resend failed.",show_alert=True); return
+    now=time.time(); data["otp_id"]=new_id; data["last_resend"]=now; data["time"]=now
+    bot.answer_callback_query(call.id,"✅ New SMS OTP sent")
+    kb=InlineKeyboardMarkup(); kb.row(InlineKeyboardButton("🔄 Resend SMS",callback_data="resend_phone_code"),InlineKeyboardButton("❌ Cancel",callback_data="cancel_verify_process"))
+    msg=bot.send_message(call.message.chat.id,"📲 <b>New SMS OTP request accepted.</b>\n\nEnter the new 6-digit code when it arrives.",reply_markup=kb)
+    bot.register_next_step_handler(msg,process_phone_code)
+
+def process_phone_code(m):
+    uid=str(m.from_user.id); code_input=(m.text or "").strip(); data=phone_verify_pending.get(uid)
+    if not data:
+        bot.send_message(m.chat.id,"❌ Verification session expired. Please start again from your profile."); return
+    if not re.fullmatch(r"\d{6}",code_input):
+        kb=InlineKeyboardMarkup(); kb.row(InlineKeyboardButton("🔄 Resend SMS",callback_data="resend_phone_code"),InlineKeyboardButton("❌ Cancel",callback_data="cancel_verify_process"))
+        msg=bot.send_message(m.chat.id,"⚠️ Enter the 6-digit SMS code first.",reply_markup=kb); bot.register_next_step_handler(msg,process_phone_code); return
+    ok,detail=verify_d7_sms(data.get("otp_id"),code_input)
+    if ok:
+        users[uid]["verified"]=True; users[uid]["phone_verified"]=True; users[uid]["verification_method"]="SMS"; users[uid]["phone"]=data["phone"]; users[uid]["sticker"]=users[uid].get("sticker") or "🌟"; save_user(uid); phone_verify_pending.pop(uid,None)
+        _resume_verified_download(uid,m.chat.id)
+        trial_activated=activate_pending_trial(uid,m.chat.id)
+        bot.send_message(m.chat.id,"✅ Congratulations! Your account is now Verified. Your pending 1-Day Trial was activated automatically." if trial_activated else "✅ Congratulations! Your account is now Verified. You can check your profile status.",reply_markup=localized_user_menu(uid)); return
+    print("D7 Verify check error:",detail)
+    detail_text=str(detail).lower()
+    if "expired" in detail_text:
+        phone_verify_pending.pop(uid,None); bot.send_message(m.chat.id,"⏰ <b>This SMS code has expired.</b> Please start verification again."); return
+    kb=InlineKeyboardMarkup(); kb.row(InlineKeyboardButton("🔄 Resend SMS",callback_data="resend_phone_code"),InlineKeyboardButton("❌ Cancel",callback_data="cancel_verify_process"))
+    msg=bot.send_message(m.chat.id,"❌ Incorrect SMS code. Please enter the correct 6-digit code:",reply_markup=kb); bot.register_next_step_handler(msg,process_phone_code)
+
+# ----- WHATSAPP VERIFICATION LOGIC (WaForge) ----- #
+
+def process_verification_whatsapp(m):
+    uid=str(m.from_user.id); phone_input=(m.text or '').strip()
+    if phone_input.lower() in {"cancel", "❌ cancel", "cancel verification"}:
+        whatsapp_verify_pending.pop(uid,None); bot.clear_step_handler_by_chat_id(m.chat.id); bot.send_message(m.chat.id,"❌ <b>Verification cancelled.</b> You can use the menu now.",reply_markup=localized_user_menu(uid)); return
+    if not re.fullmatch(r"\+[1-9]\d{7,14}",phone_input):
+        msg=bot.send_message(m.chat.id,"❌ Invalid WhatsApp number. Use full international format, e.g. +2519xxxxxxxx")
+        bot.register_next_step_handler(msg,process_verification_whatsapp); return
+    ok,detail,request_id=send_waforge_whatsapp(phone_input,uid)
+    if not ok:
+        print("WhatsApp OTP send error:", detail)
+        bot.send_message(m.chat.id,"❌ <b>WhatsApp OTP could not be sent.</b>\n\nPlease check your WhatsApp number and try again. If the problem continues, contact Customer/Admin.")
+        return
+    now=time.time(); whatsapp_verify_pending[uid]={"phone":phone_input,"request_id":request_id,"time":now,"last_resend":now}
+    msg=bot.send_message(m.chat.id,"📲 <b>WhatsApp OTP sent</b>\n\nEnter the 6-digit code sent to your WhatsApp.\n⏳ <b>This code expires in 5 minutes.</b>",reply_markup=whatsapp_otp_keyboard())
+    bot.register_next_step_handler(msg,process_whatsapp_code)
+    threading.Thread(target=expire_whatsapp_session,args=(uid,now),daemon=True).start()
+
+@bot.callback_query_handler(func=lambda call: call.data == "resend_whatsapp_code")
+def resend_whatsapp_code_callback(call):
+    uid=str(call.from_user.id); data=whatsapp_verify_pending.get(uid)
+    if not data:
+        bot.answer_callback_query(call.id,"Session expired.",show_alert=True); return
+    if time.time()-data.get("last_resend",data.get("time",0))<60:
+        bot.answer_callback_query(call.id,"⏳ Please wait 60 seconds between OTP requests.",show_alert=True); return
+    ok,detail,request_id=send_waforge_whatsapp(data["phone"],uid)
+    if not ok:
+        print("WaForge resend error:",detail); bot.answer_callback_query(call.id,"Could not send WhatsApp OTP.",show_alert=True); return
+    now=time.time(); data.update({"request_id":request_id,"last_resend":now,"time":now})
+    bot.answer_callback_query(call.id,"✅ New WhatsApp OTP sent")
+    msg=bot.send_message(call.message.chat.id,"📲 <b>New WhatsApp OTP sent.</b>\n\nEnter the new 6-digit code.\n⏳ <b>This code expires in 5 minutes.</b>",reply_markup=whatsapp_otp_keyboard())
+    bot.register_next_step_handler(msg,process_whatsapp_code)
+    threading.Thread(target=expire_whatsapp_session,args=(uid,now),daemon=True).start()
+
+def process_whatsapp_code(m):
+    uid=str(m.from_user.id); data=whatsapp_verify_pending.get(uid)
+    if (m.text or '').strip().lower() in {"cancel","❌ cancel","cancel verification"}:
+        whatsapp_verify_pending.pop(uid,None); bot.clear_step_handler_by_chat_id(m.chat.id); bot.send_message(m.chat.id,"❌ <b>Verification cancelled.</b> You can use the menu now.",reply_markup=localized_user_menu(uid)); return
+    if not data:
+        bot.send_message(m.chat.id,"⏰ <b>This code has expired.</b>\n\nPlease request a new WhatsApp OTP."); return
+    if time.time()-data.get("time",0)>=WAFORGE_OTP_TTL:
+        whatsapp_verify_pending.pop(uid,None); bot.send_message(m.chat.id,"⏰ <b>This code has expired.</b>\n\nPlease request a new WhatsApp OTP."); return
+    code=(m.text or '').strip()
+    if not re.fullmatch(r"\d{6}",code):
+        msg=bot.send_message(m.chat.id,"⚠️ Please enter the 6-digit WhatsApp code:",reply_markup=whatsapp_otp_keyboard()); bot.register_next_step_handler(msg,process_whatsapp_code); return
+    ok,detail=verify_waforge_whatsapp(data["phone"],code,data.get("request_id"))
+    if not ok:
+        print("WaForge verify error:",detail); detail_text=str(detail).lower()
+        if "expired" in detail_text or "expire" in detail_text or "410" in detail_text:
+            whatsapp_verify_pending.pop(uid,None); bot.send_message(m.chat.id,"⏰ <b>This code has expired.</b>\n\nPlease request a new WhatsApp OTP."); return
+        msg=bot.send_message(m.chat.id,"❌ Incorrect WhatsApp code. Please try again:",reply_markup=whatsapp_otp_keyboard()); bot.register_next_step_handler(msg,process_whatsapp_code); return
+    users[uid]["verified"]=True; users[uid]["phone_verified"]=True; users[uid]["verification_method"]="WhatsApp"; users[uid]["phone"]=data["phone"]; users[uid]["whatsapp_verified"]=True; users[uid]["sticker"]=users[uid].get("sticker") or "🌟"; save_user(uid); whatsapp_verify_pending.pop(uid,None)
+    _resume_verified_download(uid,m.chat.id)
+    trial_activated=activate_pending_trial(uid,m.chat.id)
+    bot.send_message(m.chat.id,"✅ <b>WhatsApp verification successful.</b> Your account is now verified."+("\n\n🎁 Your pending 1-Day Premium Trial was activated automatically." if trial_activated else ""),reply_markup=localized_user_menu(uid))
+
+
+# ================= GLOBAL VERIFIED CUSTOM EMOJI =================
+def _custom_emoji_from_message(message):
+    """Return (custom_emoji_id, fallback_emoji) from a Telegram custom-emoji text message."""
+    text=str(getattr(message,"text","") or "")
+    for ent in (getattr(message,"entities",None) or []):
+        typ=str(getattr(ent,"type","") or "")
+        if typ != "custom_emoji":
+            continue
+        cid=str(getattr(ent,"custom_emoji_id","") or "").strip()
+        if not cid:
+            continue
+        try:
+            off=int(getattr(ent,"offset",0)); ln=int(getattr(ent,"length",1))
+            raw=text.encode("utf-16-le")
+            alt=raw[off*2:(off+ln)*2].decode("utf-16-le") or "💠"
+        except Exception:
+            alt="💠"
+        return cid, alt
+    return "", ""
+
+def _verified_badge_html():
+    cid=str(get_setting("verified_badge_custom_emoji_id","") or "").strip()
+    alt=str(get_setting("verified_badge_custom_emoji_alt","💠") or "💠").strip() or "💠"
+    if cid:
+        return f'<tg-emoji emoji-id="{html.escape(cid, quote=True)}">{html.escape(alt)}</tg-emoji>'
+    return "💠"
+
+# ================= ADMIN VERIFIED USERS & STICKER MANAGER =================
+
+@bot.message_handler(func=lambda m: m.text == "✅ Verified Users")
+def verified_users_list(m):
+    if not is_admin(m.from_user.id):
+        return
+    verified_list = [uid for uid, data in users.items() if user_is_verified(uid)]
+    if not verified_list:
+        try:
+            bot.send_message(m.chat.id, "No verified users found.")
+        except: pass
+        return
+    
+    text = f"✅ VERIFIED USERS ({len(verified_list)})\n\n"
+    for uid in verified_list[:30]:
+        u_data = users[uid]
+        sticker = u_data.get("sticker", "N/A")
+        email = u_data.get('email', '')
+        phone = u_data.get('phone', '')
+        contact = email if email else (phone if phone else "No Contact Info")
+        method = u_data.get("verification_method", "Unknown")
+        text += f"• <a href='tg://user?id={uid}'>{uid}</a> | {contact} | Method: {method} | Sticker: {sticker}\n"
+    try:
+        bot.send_message(m.chat.id, text, parse_mode="HTML")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🏷️ Sticker")
+def sticker_admin_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(
+            m.chat.id,
+            "🏷️ <b>GLOBAL VERIFIED BADGE</b>\n\n"
+            "Send one Telegram <b>custom emoji</b> from your Telegram Premium/custom-emoji picker.\n\n"
+            "The custom emoji ID will be saved and shown to every verified user.\n"
+            "Do <b>not</b> type an emoji ID and do not use a normal keyboard emoji.",
+            parse_mode="HTML"
+        )
+        bot.register_next_step_handler(msg, sticker_admin_process)
+    except Exception as e:
+        print("Sticker admin start error:",repr(e))
+
+def sticker_admin_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    cid,alt=_custom_emoji_from_message(m)
+    if not cid:
+        bot.send_message(m.chat.id,"❌ That is not a Telegram custom emoji. Please send a custom emoji from Telegram.",parse_mode="HTML")
+        return
+    set_setting("verified_badge_custom_emoji_id",cid)
+    set_setting("verified_badge_custom_emoji_alt",alt or "💠")
+    bot.send_message(
+        m.chat.id,
+        f"✅ <b>Global verified badge updated.</b>\n\nBadge: {_verified_badge_html()}\n\nIt will now appear on every verified user's profile.",
+        parse_mode="HTML"
+    )
+
+# ================= ADMIN SEND EMAIL ALL =================
+
+@bot.message_handler(func=lambda m: m.text == "📢 Send Email All")
+def send_email_all_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send the HTML content or message you want to email to all users who have an email registered:")
+        bot.register_next_step_handler(msg, send_email_all_process)
+    except: pass
+
+def send_email_all_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    html_content = m.text
+    
+    count = 0
+    for uid, data in users.items():
+        email = data.get("email")
+        if email:
+            success = send_html_email(email, "Announcement from Video Downloader Bot", html_content)
+            if success:
+                count += 1
+    try:
+        bot.send_message(m.chat.id, f"✅ HTML Email successfully sent to {count} verified users with email addresses.")
+    except: pass
+
+# ================= YOUTUBE 30 MIN ADMIN CONTROL =================
+
+@bot.message_handler(func=lambda m: m.text == "🔓 OPEN 30 MIN")
+def open_30_min_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send User ID or BOT ID to grant 30-min YouTube access:")
+        bot.register_next_step_handler(msg, open_30_min_process)
+    except: pass
+
+def open_30_min_process(m):
+    if not is_admin(m.from_user.id): return
+    uid_str = (m.text or "").strip()
+    uid = uid_str if uid_str in users else find_user_by_botid(uid_str)
+    
+    if not uid or uid not in users:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found.")
+        except: pass
+        return
+    users[uid]["youtube_30m"] = True
+    save_user(uid)
+    try:
+        bot.send_message(m.chat.id, f"✅ User {uid} can now download YouTube videos up to 30 minutes.")
+        bot.send_message(int(uid), "🎉 Congratulations! You have been granted special access to download YouTube videos up to 30 minutes long!")
+    except: pass
+
+# ================= QUICK ACCESS ADMIN CONTROLS =================
+
+@bot.message_handler(func=lambda m: m.text == "⚡ QUICK ACCESS")
+def quick_access_admin(m):
+    if not is_admin(m.from_user.id):
+        return
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Add User Access", callback_data="qa_add"))
+    kb.add(InlineKeyboardButton("🔴 Remove User Access", callback_data="qa_remove"))
+    try:
+        bot.send_message(m.chat.id, "⚡ Quick Access Management", reply_markup=kb)
+    except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("qa_"))
+def handle_qa_callbacks(call):
+    if not is_admin(call.from_user.id):
+        return
+    if call.data == "qa_add":
+        try:
+            msg = bot.send_message(call.message.chat.id, "Send User ID or BOT ID to grant Quick Access:")
+            bot.register_next_step_handler(msg, lambda m: grant_qa(m, True))
+        except: pass
+    elif call.data == "qa_remove":
+        try:
+            msg = bot.send_message(call.message.chat.id, "Send User ID or BOT ID to remove Quick Access:")
+            bot.register_next_step_handler(msg, lambda m: grant_qa(m, False))
+        except: pass
+
+def grant_qa(m, status):
+    if not is_admin(m.from_user.id):
+        return
+    text_input = (m.text or "").strip()
+    uid = text_input if text_input in users else find_user_by_botid(text_input)
+    if uid and uid in users:
+        users[uid]["quick_access"] = status
+        save_user(uid)
+        try:
+            if status:
+                bot.send_message(m.chat.id, f"⚡ Quick Access enabled for user {uid}. Priority queue, all {len(premium_platform_names())} Premium/Trial platforms, unlimited-duration YouTube access and faster MP3/video processing are now unlocked.")
+                bot.send_message(int(uid), "⚡ <b>Quick Access Activated!</b>\n\nYou now have priority download processing, access to all Premium/Trial platforms, and extended YouTube access.\n\n🚀 Your downloads will use the fastest available queue.", parse_mode="HTML")
+            else:
+                bot.send_message(m.chat.id, f"🔴 Quick Access disabled for user {uid}.")
+                bot.send_message(int(uid), "🔴 <b>Quick Access Disabled</b>\n\nYour account has returned to its normal download priority.", parse_mode="HTML")
+        except Exception: pass
+    else:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found.")
+        except: pass
+
+# ================= FEEDBACK LOGIC =================
+
+def send_feedback_request(chat_id, platform, download_id):
+    feedback_request_id = str(uuid.uuid4())
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("👍 Good", callback_data=f"rate_good_{feedback_request_id}_{platform}"),
+        InlineKeyboardButton("👎 Bad", callback_data=f"rate_bad_{feedback_request_id}_{platform}")
+    )
+    kb.add(InlineKeyboardButton("💬 Feedback", callback_data=f"rate_text_{feedback_request_id}"))
+    
+    try:
+        bot.send_message(chat_id, "How was your experience with our service? ❤️", reply_markup=kb)
+    except Exception as e:
+        print(f"Feedback send error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("rate_good_", "rate_bad_")))
+def handle_rating(call):
+    parts = call.data.split("_")
+    rating = parts[1]
+    req_id = parts[2]
+    platform = parts[3]
+    user_id = call.from_user.id
+    
+    feedback_col.update_one(
+        {"user_id": user_id, "feedback_request_id": req_id},
+        {
+            "$set": {
+                "username": call.from_user.username or "N/A",
+                "rating": rating,
+                "platform": platform,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {"created_at": datetime.now()}
+        },
+        upsert=True
+    )
+    bot.answer_callback_query(call.id, "Thank you for your feedback! ❤️")
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        bot.edit_message_text("Thank you for your feedback! ❤️", call.message.chat.id, call.message.message_id)
+    except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rate_text_"))
+def ask_written_feedback(call):
+    req_id = call.data.split("_")[2]
+    try:
+        msg = bot.send_message(call.message.chat.id, "Please tell us how we can improve our service.")
+        bot.register_next_step_handler(msg, save_written_feedback, req_id)
+    except: pass
+
+def save_written_feedback(m, req_id):
+    if not m.text:
+        try:
+            bot.send_message(m.chat.id, "Please send text feedback.")
+        except: pass
+        return
+        
+    feedback_col.update_one(
+        {"user_id": m.from_user.id, "feedback_request_id": req_id},
+        {
+            "$set": {
+                "username": m.from_user.username or "N/A",
+                "feedback_text": m.text,
+                "updated_at": datetime.now()
+            },
+            "$setOnInsert": {"created_at": datetime.now()}
+        },
+        upsert=True
+    )
+    try:
+        bot.send_message(m.chat.id, "Thank you! Your feedback has been received. ❤️")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text in ["📊 Feedback Stats", "🟢 Open Feedback", "🔴 Close Feedback", "🗑️ Reset All Feedbacks"])
+def feedback_admin_manager(m):
+    if not is_admin(m.from_user.id): return
+    
+    if m.text == "🟢 Open Feedback":
+        videos_data["feedback_enabled"] = True
+        save_videos()
+        try:
+            bot.send_message(m.chat.id, "🟢 Feedback system is now OPEN.")
+        except: pass
+    elif m.text == "🔴 Close Feedback":
+        videos_data["feedback_enabled"] = False
+        save_videos()
+        try:
+            bot.send_message(m.chat.id, "🔴 Feedback system is now CLOSED.")
+        except: pass
+    elif m.text == "📊 Feedback Stats":
+        goods = feedback_col.count_documents({"rating": "good"})
+        bads = feedback_col.count_documents({"rating": "bad"})
+        written = feedback_col.count_documents({"feedback_text": {"$exists": True}})
+        total = goods + bads
+        sat = "No ratings yet."
+        if total > 0:
+            pct = (goods / total) * 100
+            sat = f"{pct:.2f}%"
+        status = "OPEN" if videos_data.get("feedback_enabled") else "CLOSED"
+        text = f"📊 FEEDBACK STATISTICS\n\n👍 Good: {goods}\n👎 Bad: {bads}\n💬 Written Feedback: {written}\n📊 Total Ratings: {total}\n❤️ Satisfaction: {sat}\n\n🟢 Status: {status}"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💬 View Feedback", callback_data="view_fb_0"))
+        try:
+            bot.send_message(m.chat.id, text, reply_markup=kb)
+        except: pass
+    elif m.text == "🗑️ Reset All Feedbacks":
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✅ Yes, Reset Everything", callback_data="reset_fb_confirm"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data="reset_fb_cancel"))
+        try:
+            bot.send_message(m.chat.id, "⚠️ Are you sure you want to delete all existing feedback data? This action cannot be undone.", reply_markup=kb)
+        except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_fb_"))
+def view_feedback_pagination(call):
+    if not is_admin(call.from_user.id): return
+    page = int(call.data.split("_")[2])
+    all_fb = list(feedback_col.find({"feedback_text": {"$exists": True}}).sort("created_at", -1))
+    
+    if not all_fb:
+        bot.answer_callback_query(call.id, "No feedback yet.")
+        return
+    item = all_fb[page]
+    text = f"💬 USER FEEDBACK\n\n👤 User: @{item.get('username', 'N/A')}\n📅 Date: {item.get('created_at').strftime('%Y-%m-%d')}\n\n📝 {item.get('feedback_text')}"
+    kb = InlineKeyboardMarkup()
+    btns = []
+    if page > 0:
+        btns.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_fb_{page-1}"))
+    if page < len(all_fb) - 1:
+        btns.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_fb_{page+1}"))
+    if btns:
+        kb.row(*btns)
+    kb.add(InlineKeyboardButton("🔙 Back", callback_data="close_fb"))
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+    except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data in ["reset_fb_confirm", "reset_fb_cancel", "close_fb"])
+def reset_callback_handler(call):
+    if not is_admin(call.from_user.id): return
+    if call.data == "reset_fb_confirm":
+        try:
+            feedback_col.delete_many({})
+            bot.edit_message_text("✅ ALL FEEDBACKS RESET. All previous feedback data has been successfully deleted.", call.message.chat.id, call.message.message_id)
+        except:
+            bot.edit_message_text("❌ RESET FAILED", call.message.chat.id, call.message.message_id)
+    elif call.data == "reset_fb_cancel":
+        bot.edit_message_text("❌ Reset cancelled.", call.message.chat.id, call.message.message_id)
+    elif call.data == "close_fb":
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+
+CHANNEL_USERNAME = "@tiktokvediodownload"
+
+# ================= DOWNLOAD MEDIA FUNCTION =================
+
+PLATFORM_PATTERNS = {
+    "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+    "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
+    "facebook": ("facebook.com", "fb.watch", "m.facebook.com", "facebook.watch"),
+    "instagram": ("instagram.com",),
+    "pinterest": ("pinterest.com", "pin.it"),
+    "snapchat": ("snapchat.com",),
+    "twitter": ("twitter.com", "x.com"),
+    "reddit": ("reddit.com", "redd.it"),
+    "threads": ("threads.net", "threads.com"),
+    "likee": ("likee.video", "like.video"),
+    "vimeo": ("vimeo.com",),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+    "soundcloud": ("soundcloud.com", "on.soundcloud.com"),
+    "twitch": ("twitch.tv", "clips.twitch.tv"),
+    "tumblr": ("tumblr.com",),
+    "streamable": ("streamable.com",),
+    "odnoklassniki": ("ok.ru", "odnoklassniki.ru"),
+}
+
+def detect_platform(link):
+    try:
+        text = (link or "").strip()
+        parsed = urllib.parse.urlparse(text if "://" in text else "https://" + text)
+        host = (parsed.netloc or "").lower().split(":", 1)[0]
+        host = host[4:] if host.startswith("www.") else host
+        # Prefer hostname matching over substring matching so a random URL
+        # containing a platform name is not misclassified.
+        for platform, patterns in PLATFORM_PATTERNS.items():
+            for pattern in patterns:
+                p = pattern.lower().removeprefix("www.")
+                if host == p or host.endswith("." + p):
+                    return platform
+        # Short/redirect links can occasionally be malformed; retain a safe
+        # substring fallback for the known domains only.
+        low = text.lower()
+        for platform, patterns in PLATFORM_PATTERNS.items():
+            if any(p in low for p in patterns):
+                return platform
+    except Exception:
+        pass
+    return "unknown"
+
+def _is_image_file(path):
+    return os.path.splitext(path)[1].lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+def _is_video_file(path):
+    return os.path.splitext(path)[1].lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv"}
+
+def _is_audio_file(path):
+    return os.path.splitext(path)[1].lower() in {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
+
+def _download_limit_seconds(uid):
+    """Return the duration limit, including admin/special YouTube access."""
+    uid=str(uid)
+    # Quick Access is an admin-granted priority tier: no artificial duration cap.
+    # A large practical ceiling is used because yt-dlp expects a numeric filter.
+    if is_quick_access(uid):
+        # Practical unlimited ceiling for extractor APIs that require a number.
+        return 3650 * 24 * 60 * 60
+    if is_admin(uid):
+        return max(1, int(get_setting("admin_max_minutes", 1440) or 1440)) * 60
+    if users.get(uid,{}).get("youtube_30m"):
+        return max(30, int(get_setting("youtube_special_minutes", 30) or 30)) * 60
+    if is_premium(uid) or _is_trial_active(uid):
+        # Premium and Trial use the Premium duration ceiling; default is 180 minutes.
+        # Admin settings can raise or lower this limit.
+        minutes=int(get_setting("premium_max_minutes",PREMIUM_MAX_MINUTES_DEFAULT) or PREMIUM_MAX_MINUTES_DEFAULT)
+    else:
+        minutes=int(get_setting("free_max_minutes",FREE_MAX_MINUTES_DEFAULT) or FREE_MAX_MINUTES_DEFAULT)
+    return max(1,minutes)*60
+
+
+def _extract_youtube_video_id(link):
+    """Extract a canonical 11-character YouTube video id from common URL forms."""
+    text = (link or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(text if "://" in text else "https://" + text)
+        host = (parsed.netloc or "").lower().split(":", 1)[0]
+        path = parsed.path or ""
+        if host in {"youtu.be", "www.youtu.be"}:
+            candidate = path.strip("/").split("/")[0]
+        elif "youtube.com" in host or host.endswith("youtube-nocookie.com"):
+            qs = urllib.parse.parse_qs(parsed.query)
+            candidate = (qs.get("v") or [""])[0]
+            if not candidate:
+                parts = [x for x in path.split("/") if x]
+                if parts and parts[0] in {"shorts", "embed", "live", "v"} and len(parts) > 1:
+                    candidate = parts[1]
+        else:
+            candidate = ""
+        candidate = urllib.parse.unquote(candidate).split("?", 1)[0].split("&", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+            return candidate
+    except Exception:
+        pass
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", text)
+    return m.group(1) if m else None
+
+
+def _rapidapi_youtube_details(video_id):
+    """Fetch YouTube details from the RapidAPI YouTube Media Downloader.
+
+    The provider documents /v2/video/details with urlAccess=normal and the
+    videos/audios switches. We try the normal simplified response first and
+    then the raw-format response if a provider revision returns no usable
+    direct URLs.
+    """
+    if not RAPIDAPI_YT_KEY:
+        raise RuntimeError("RAPIDAPI_YT_KEY is not configured.")
+    video_id=str(video_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}",video_id):
+        raise RuntimeError("Invalid YouTube video ID.")
+    headers={
+        "x-rapidapi-key":RAPIDAPI_YT_KEY,
+        "x-rapidapi-host":RAPIDAPI_YT_HOST,
+        "Accept":"application/json",
+        "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+    }
+    endpoint=RAPIDAPI_YT_DETAILS_URL
+    variants=[
+        {"videoId":video_id,"urlAccess":"normal","videos":"auto","audios":"auto","lang":"en-US"},
+        {"videoId":video_id,"urlAccess":"normal","videos":"true","audios":"true","lang":"en-US"},
+        {"videoId":video_id,"urlAccess":"normal","videos":"raw","audios":"raw","lang":"en-US"},
+    ]
+    last_error=None
+    for params in variants:
+        try:
+            r=requests.get(endpoint,params=params,headers=headers,timeout=RAPIDAPI_TIMEOUT)
+            body=None
+            try: body=r.json()
+            except Exception: body={"raw":r.text}
+            if r.status_code in (200,201) and isinstance(body,dict):
+                if _rapid_formats(body) or _rapid_duration(body) is not None:
+                    return body
+                # Return metadata too; caller can report a precise provider issue.
+                last_error=RuntimeError("RapidAPI returned no direct video/audio URLs.")
+                continue
+            if r.status_code==429:
+                raise RuntimeError("RapidAPI YouTube quota/rate limit reached.")
+            if r.status_code in (401,403):
+                raise RuntimeError("RapidAPI YouTube authentication/subscription failed.")
+            if r.status_code==404:
+                raise RuntimeError("RapidAPI YouTube video was not found.")
+            detail=str(body)[:500]
+            last_error=RuntimeError(f"RapidAPI YouTube HTTP {r.status_code}: {detail}")
+        except RuntimeError as e:
+            last_error=e
+            # Auth/quota/404 are not fixed by changing response mode.
+            if any(x in str(e).lower() for x in ("quota","authentication","subscription","not found")):
+                break
+        except Exception as e:
+            last_error=e
+    raise last_error or RuntimeError("RapidAPI YouTube request failed.")
+
+def _rapid_walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _rapid_walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _rapid_walk(v)
+
+def _rapid_num(d, keys):
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            m = re.search(r"\d+(?:\.\d+)?", v)
+            if m:
+                try: return float(m.group())
+                except Exception: pass
+    return None
+
+def _rapid_bool(d, keys):
+    for k in keys:
+        if k in d:
+            v=d.get(k)
+            if isinstance(v,bool): return v
+            if isinstance(v,str) and v.lower() in {"true","yes","1"}: return True
+            if isinstance(v,str) and v.lower() in {"false","no","0"}: return False
+    return None
+
+def _rapid_url(d):
+    """Extract a direct media URL from changing RapidAPI response shapes."""
+    if not isinstance(d,dict): return None
+    keys=("url","downloadUrl","download_url","downloadUrlHttps","download_url_https","videoUrl","video_url","audioUrl","audio_url","playbackUrl","playback_url","streamUrl","stream_url","contentUrl","content_url","mediaUrl","media_url","directUrl","direct_url","downloadLink","download_link","fileUrl","file_url","link")
+    for k in keys:
+        v=d.get(k)
+        if isinstance(v,str) and v.startswith(("http://","https://")):
+            low=v.lower()
+            if not any(x in low for x in (".jpg",".jpeg",".png",".webp","thumbnail","/thumb",".m3u8","manifest")): return v
+        elif isinstance(v,dict):
+            got=_rapid_url(v)
+            if got: return got
+    for k in ("download","media","source","stream","file","files"):
+        v=d.get(k)
+        if isinstance(v,dict):
+            got=_rapid_url(v)
+            if got: return got
+        elif isinstance(v,list):
+            for item in v:
+                got=_rapid_url(item) if isinstance(item,dict) else (item if isinstance(item,str) and item.startswith(("http://","https://")) else None)
+                if got: return got
+        elif isinstance(v,str) and v.startswith(("http://","https://")):
+            return v
+    return None
+
+def _rapid_formats(data):
+    """Normalize RapidAPI YouTube v2 videos.items/audios.items plus raw fallback shapes."""
+    out=[]; seen=set()
+    def add_item(d, forced_video=None, forced_audio=None):
+        if not isinstance(d,dict): return
+        url=_rapid_url(d)
+        if not url or url in seen: return
+        text=" ".join(str(d.get(k,"")) for k in ("type","mimeType","mime","quality","qualityLabel","format","container","codec","audioQuality","itag")).lower()
+        height=_rapid_num(d,("height","videoHeight","resolutionHeight")) or 0
+        width=_rapid_num(d,("width","videoWidth","resolutionWidth")) or 0
+        fps=_rapid_num(d,("fps","frameRate")) or 0
+        has_audio=_rapid_bool(d,("hasAudio","audio","has_audio","isAudioIncluded"))
+        has_video=_rapid_bool(d,("hasVideo","video","has_video"))
+        video=bool(forced_video) if forced_video is not None else (bool(has_video) if has_video is not None else (height>0 or any(x in text for x in ("video","mp4","webm","avc","h264"))))
+        audio=bool(forced_audio) if forced_audio is not None else (bool(has_audio) if has_audio is not None else any(x in text for x in ("audio","mp4a","m4a","opus")))
+        if video or audio:
+            seen.add(url); out.append({"url":url,"height":int(height),"width":int(width),"fps":fps,"audio":audio,"video":video,"text":text,"raw":d})
+    if isinstance(data,dict):
+        videos=((data.get("videos") or {}).get("items") if isinstance(data.get("videos"),dict) else data.get("videos")) or []
+        audios=((data.get("audios") or {}).get("items") if isinstance(data.get("audios"),dict) else data.get("audios")) or []
+        if isinstance(videos,list):
+            for d in videos: add_item(d,forced_video=True)
+        if isinstance(audios,list):
+            for d in audios: add_item(d,forced_audio=True)
+    for d in _rapid_walk(data):
+        url=_rapid_url(d)
+        if not url or url in seen: continue
+        text=" ".join(str(d.get(k,"")) for k in ("type","mimeType","mime","quality","qualityLabel","format","container","codec","audioQuality")).lower()
+        height=_rapid_num(d,("height","videoHeight","resolutionHeight")) or 0
+        width=_rapid_num(d,("width","videoWidth","resolutionWidth")) or 0
+        fps=_rapid_num(d,("fps","frameRate")) or 0
+        has_audio=_rapid_bool(d,("hasAudio","audio","has_audio","isAudioIncluded"))
+        has_video=_rapid_bool(d,("hasVideo","video","has_video"))
+        audio = bool(has_audio) if has_audio is not None else any(x in text for x in ("audio","mp4a","m4a","opus"))
+        video = bool(has_video) if has_video is not None else (height>0 or any(x in text for x in ("video","mp4","webm","avc","h264")))
+        image_only=any(x in text for x in ("image/jpeg","image/png","image/webp","image/gif","thumbnail")) and not any(x in text for x in ("video/mp4","video/webm","video","avc","h264"))
+        if image_only:
+            continue
+        if video or audio:
+            seen.add(url)
+            out.append({"url":url,"height":int(height),"width":int(width),"fps":fps,"audio":audio,"video":video,"text":text,"raw":d})
+    return out
+
+def _rapid_duration(data):
+    for d in _rapid_walk(data):
+        v=_rapid_num(d,("duration","durationSeconds","lengthSeconds","length"))
+        if v and 0<v<172800: return int(v)
+    return None
+
+def _rapid_choose_pair(data, quality):
+    fs=_rapid_formats(data)
+    videos=[x for x in fs if x["video"]]
+    audios=[x for x in fs if x["audio"] and not x["video"]]
+    if not videos: raise RuntimeError("RapidAPI returned no downloadable video formats.")
+    target=2160 if str(quality)=="2160" else int(quality or 720)
+    under=[x for x in videos if x["height"] and x["height"]<=target]
+    pool=under or videos
+    # Prefer MP4 and streams with audio already included.
+    pool.sort(key=lambda x:(0 if "mp4" in x["text"] else 1, 0 if x["audio"] else 1, abs((x["height"] or target)-target), -x["fps"]))
+    video=pool[0]
+    audio=None
+    if not video["audio"] and audios:
+        audios.sort(key=lambda x:(0 if "mp4" in x["text"] or "m4a" in x["text"] else 1, -x["fps"]))
+        audio=audios[0]
+    return video,audio
+
+def _rapid_download_file(url, path, max_bytes=0):
+    """Stream a RapidAPI direct-media URL with a long read timeout."""
+    headers={
+        "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept":"*/*",
+    }
+    with requests.get(url,headers=headers,stream=True,timeout=(20,max(60,RAPIDAPI_TIMEOUT)),allow_redirects=True) as r:
+        r.raise_for_status()
+        total=0
+        with open(path,"wb") as f:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                if not chunk: continue
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise RuntimeError("Downloaded file is larger than the configured download limit.")
+                f.write(chunk)
+    return path
+
+def _rapid_download_audio(link,tmp_dir,chat_id=None):
+    """Fast YouTube audio path using the configured RapidAPI direct audio URL."""
+    vid=_extract_youtube_video_id(link)
+    if not vid: raise RuntimeError("Could not extract the YouTube video ID.")
+    data=_rapidapi_youtube_details(vid)
+    fs=_rapid_formats(data)
+    audios=[x for x in fs if x["audio"]]
+    if not audios: raise RuntimeError("RapidAPI returned no downloadable audio format.")
+    audios.sort(key=lambda x:(0 if "m4a" in x["text"] or "mp4" in x["text"] else 1, -x.get("height",0)))
+    src=audios[0]["url"]
+    raw=os.path.join(tmp_dir,f"youtube_{vid}_audio.m4a")
+    mb=_download_max_mb(str(chat_id) if chat_id is not None else "0", platform="youtube", link=link)
+    _rapid_download_file(src,raw,(mb*1024*1024 if mb else 0))
+    out=os.path.join(tmp_dir,f"youtube_{vid}.mp3")
+    return _ffmpeg_convert_to_mp3(raw,out,bitrate="192k",timeout=300)
+
+def _rapid_download(link,tmp_dir,quality,max_seconds,chat_id=None):
+    """RapidAPI-first YouTube downloader with combined-stream and quality fallback."""
+    vid=_extract_youtube_video_id(link)
+    if not vid: raise RuntimeError("Could not extract the YouTube video ID.")
+    data=_rapidapi_youtube_details(vid)
+    duration=_rapid_duration(data)
+    if duration and max_seconds and duration>max_seconds:
+        raise RuntimeError(f"YouTube video is too long. Maximum is {max_seconds//60} minutes.")
+    fs=_rapid_formats(data)
+    videos=[x for x in fs if x["video"]]
+    audios=[x for x in fs if x["audio"] and not x["video"]]
+    if not videos: raise RuntimeError("RapidAPI returned no downloadable YouTube video streams.")
+    target=2160 if str(quality)=="2160" else int(quality or 720)
+    heights=[]
+    for h in (target,1080,720,480,360,240,144):
+        if h not in heights: heights.append(h)
+    ordered=[]; seen=set()
+    for h in heights:
+        candidates=[x for x in videos if x.get("height") and x["height"]<=h]
+        if not candidates: continue
+        candidates.sort(key=lambda x:(0 if (x["audio"] and "mp4" in x["text"]) else 1,abs((x["height"] or h)-h),0 if "mp4" in x["text"] else 1,-x.get("fps",0)))
+        for x in candidates:
+            if x["url"] not in seen: seen.add(x["url"]); ordered.append(x)
+    if not ordered: ordered=videos
+    mb=_download_max_mb(str(chat_id) if chat_id is not None else "0",platform="youtube",link=link)
+    max_bytes=mb*1024*1024 if mb else 0
+    last=None
+    for video in ordered:
+        attempt=os.path.join(tmp_dir,uuid.uuid4().hex); os.makedirs(attempt,exist_ok=True)
+        try:
+            if video["audio"]:
+                path=os.path.join(attempt,f"youtube_{vid}.mp4")
+                _rapid_download_file(video["url"],path,max_bytes)
+                if os.path.getsize(path)>1000: return [path]
+                raise RuntimeError("RapidAPI returned an empty video file.")
+            if not audios:
+                path=os.path.join(attempt,f"youtube_{vid}.mp4")
+                _rapid_download_file(video["url"],path,max_bytes)
+                return [path]
+            audio=sorted(audios,key=lambda x:(0 if ("m4a" in x["text"] or "mp4" in x["text"]) else 1,-x.get("fps",0)))[0]
+            vp=os.path.join(attempt,f"youtube_{vid}_video.mp4"); ap=os.path.join(attempt,f"youtube_{vid}_audio.m4a")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fv=pool.submit(_rapid_download_file,video["url"],vp,max_bytes)
+                fa=pool.submit(_rapid_download_file,audio["url"],ap,max_bytes)
+                fv.result(); fa.result()
+            ffmpeg=_ffmpeg_bin()
+            if not ffmpeg: raise RuntimeError("FFmpeg is required to merge RapidAPI YouTube streams.")
+            merged=os.path.join(attempt,f"youtube_{vid}.mp4")
+            proc=subprocess.run([ffmpeg,"-y","-hide_banner","-loglevel","error","-i",vp,"-i",ap,"-c:v","copy","-c:a","aac","-shortest","-threads","0",merged],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=max(120,RAPIDAPI_TIMEOUT))
+            if proc.returncode!=0 or not os.path.isfile(merged):
+                raise RuntimeError((proc.stderr or b"").decode("utf-8","ignore")[-1000:] or "FFmpeg merge failed")
+            return [merged]
+        except Exception as e:
+            last=e; print(f"RapidAPI YouTube format fallback {video.get('height')}p:",repr(e))
+            shutil.rmtree(attempt,ignore_errors=True)
+    raise last or RuntimeError("RapidAPI YouTube download failed.")
+
+def _instagram_api_config():
+    """Load Instagram downloader API config from MongoDB first, env vars second."""
+    return (
+        str(get_setting("instagram_api_url", RAPIDAPI_IG_URL) or "").strip(),
+        str(get_setting("instagram_api_host", RAPIDAPI_IG_HOST) or "").strip(),
+        str(get_setting("instagram_api_key", RAPIDAPI_IG_KEY) or "").strip(),
+    )
+
+def _instagram_api_enabled():
+    url,host,key=_instagram_api_config()
+    return bool(url and host and key)
+
+def _instagram_api_walk(obj):
+    if isinstance(obj,dict):
+        yield obj
+        for v in obj.values(): yield from _instagram_api_walk(v)
+    elif isinstance(obj,list):
+        for v in obj: yield from _instagram_api_walk(v)
+
+def _instagram_api_urls(data):
+    """Extract direct media URLs from the RapidAPI Instagram Reels response.
+
+    The API commonly returns data.medias[].url. We also accept a few
+    equivalent shapes so the downloader remains compatible with response
+    revisions.
+    """
+    out=[]; seen=set()
+
+    def add(v, media_type=None):
+        if not isinstance(v,str) or not v.startswith(("http://","https://")) or v in seen:
+            return
+        seen.add(v)
+        low=v.lower()
+        is_video = (str(media_type or '').lower() in {'video','mp4','reel'} or
+                    any(x in low for x in ('.mp4','video','videoplayback')))
+        out.append((v, '.mp4' if is_video else '.jpg'))
+
+    # Exact/current shape: {"data":{"medias":[{"url":"...","type":"video"}]}}
+    medias = data.get('data',{}).get('medias',[]) if isinstance(data,dict) else []
+    if isinstance(medias,list):
+        for item in medias:
+            if isinstance(item,dict):
+                add(item.get('url'), item.get('type') or item.get('mediaType'))
+                add(item.get('downloadUrl') or item.get('download_url'), item.get('type'))
+
+    # Generic fallback for API response revisions.
+    for d in _instagram_api_walk(data):
+        if not isinstance(d,dict):
+            continue
+        media_type=d.get('type') or d.get('mediaType') or d.get('media_type')
+        for k in ('url','downloadUrl','download_url','mediaUrl','media_url','videoUrl','video_url','imageUrl','image_url'):
+            add(d.get(k), media_type)
+    return out
+
+def _instagram_api_download(link,tmp_dir):
+    url,host,key=_instagram_api_config()
+    if not (url and host and key): raise RuntimeError("Instagram RapidAPI is not configured in Admin Panel.")
+    headers={"x-rapidapi-host":host,"x-rapidapi-key":key,"Accept":"application/json","User-Agent":"Mozilla/5.0"}
+    try:
+        # This endpoint is GET-only: /download?url=<instagram_url>.
+        r=requests.get(url,params={"url":link},headers=headers,timeout=RAPIDAPI_TIMEOUT)
+        if r.status_code in (401,403):
+            raise RuntimeError("Instagram RapidAPI authentication/subscription failed.")
+        if r.status_code==429:
+            raise RuntimeError("Instagram RapidAPI quota/rate limit reached.")
+        r.raise_for_status()
+        data=r.json()
+        links=_instagram_api_urls(data)
+        if not links:
+            raise RuntimeError(f"Instagram API returned no media URL. Response: {str(data)[:500]}")
+        paths=[]
+        for i,(media_url,ext) in enumerate(links[:20]):
+            path=os.path.join(tmp_dir,f"instagram_{i}{ext}")
+            with requests.get(media_url,headers={"User-Agent":"Mozilla/5.0"},stream=True,timeout=RAPIDAPI_TIMEOUT) as rr:
+                rr.raise_for_status(); total=0
+                with open(path,"wb") as f:
+                    for c in rr.iter_content(1024*256):
+                        if not c: continue
+                        total+=len(c)
+                        if total > 1024*1024*1024:
+                            raise RuntimeError("Instagram media is too large.")
+                        f.write(c)
+            paths.append(path)
+        return paths
+    except requests.HTTPError as e:
+        raise RuntimeError(f"Instagram RapidAPI HTTP error: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Instagram RapidAPI failed: {e}") from e
+
+SAVEAPI_SUPPORTED_PLATFORMS = {"tiktok","instagram","facebook","twitter","pinterest","likee","snapchat","threads"}
+
+def _saveapi_enabled():
+    return bool(SAVEAPI_KEY and SAVEAPI_URL)
+
+def _saveapi_download(link, tmp_dir, uid=None, platform=None, prefer="video"):
+    """Fast universal SaveAPI resolver; returns locally downloaded media files."""
+    if not _saveapi_enabled():
+        raise RuntimeError("SAVEAPI_KEY is not configured")
+    headers={
+        "Authorization":f"Bearer {SAVEAPI_KEY}",
+        "Accept":"application/json",
+        "User-Agent":"Downloadvedioytibot/1.0",
+    }
+    max_mb=_download_max_mb(str(uid or "0"),platform=platform,link=link) if uid is not None else MAX_UPLOAD_MB
+    params={"url":link}
+    if int(max_mb or 0)>0:
+        params["limit_mb"]=int(max_mb)
+    r=requests.get(SAVEAPI_URL,params=params,headers=headers,timeout=SAVEAPI_TIMEOUT)
+    if r.status_code in (401,403):
+        raise RuntimeError("SaveAPI authentication or platform permission failed")
+    if r.status_code==429:
+        raise RuntimeError("SaveAPI rate/credit limit reached")
+    r.raise_for_status()
+    body=r.json() or {}
+    if not body.get("success"):
+        raise RuntimeError(str(body.get("error") or body.get("message") or "SaveAPI did not return media"))
+    medias=body.get("medias") or []
+    if not isinstance(medias,list) or not medias:
+        raise RuntimeError("SaveAPI returned no media")
+    max_bytes=(int(max_mb)*1024*1024) if int(max_mb or 0)>0 else 0
+    # Do not download every rendition/image returned by the resolver. That was
+    # needlessly slowing the bot, especially on TikTok/Pinterest albums. Pick
+    # the media class the caller actually needs. Photo posts keep all images.
+    normalized=[]
+    for item in medias:
+        if not isinstance(item,dict): continue
+        kind=str(item.get("type") or "video").lower()
+        normalized.append((kind,item))
+    videos=[item for kind,item in normalized if kind in {"video","mp4"}]
+    audios=[item for kind,item in normalized if kind in {"audio","mp3","m4a","aac","ogg","opus"}]
+    images=[item for kind,item in normalized if kind in {"image","photo","jpg","jpeg","png","webp","gif"}]
+    if prefer=="audio" and audios:
+        medias=audios[:5]
+    elif prefer=="audio" and videos:
+        medias=videos[:1]
+    elif prefer=="video" and videos:
+        medias=videos[:5]
+    elif images:
+        medias=images[:20]
+    elif audios:
+        medias=audios[:5]
+    else:
+        medias=normalized[:10] and [x[1] for x in normalized[:10]] or []
+    saved=[]
+    for i,item in enumerate(medias):
+        if not isinstance(item,dict): continue
+        url=item.get("url")
+        if not isinstance(url,str) or not url.startswith(("http://","https://")): continue
+        kind=str(item.get("type") or "video").lower()
+        ext=str(item.get("ext") or "").lower().strip(".")
+        if ext not in {"mp4","webm","mov","m4v","mkv","jpg","jpeg","png","webp","gif","mp3","m4a","aac","ogg","opus"}:
+            ext={"video":"mp4","image":"jpg","photo":"jpg","audio":"mp3","gif":"gif"}.get(kind,"mp4")
+        path=os.path.join(tmp_dir,f"saveapi_{i}.{ext}")
+        with requests.get(url,headers={"User-Agent":"Mozilla/5.0","Referer":link},stream=True,timeout=SAVEAPI_TIMEOUT) as dl:
+            dl.raise_for_status(); total=0
+            with open(path,"wb") as f:
+                for chunk in dl.iter_content(1024*512):
+                    if not chunk: continue
+                    total+=len(chunk)
+                    if max_bytes and total>max_bytes:
+                        raise RuntimeError(f"SaveAPI media exceeds the configured {int(max_mb)} MB limit")
+                    f.write(chunk)
+        if os.path.isfile(path) and os.path.getsize(path)>1000:
+            saved.append(path)
+    if not saved: raise RuntimeError("SaveAPI returned empty media files")
+    return saved
+
+def _cobalt_headers():
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    return headers
+
+
+def _cobalt_enabled():
+    return bool(COBALT_API_URL)
+
+
+def _cobalt_process(link, tmp_dir, quality="720", mode="auto", max_mb=0):
+    """Resolve a public media URL through a Cobalt instance and save returned media."""
+    if not _cobalt_enabled():
+        raise RuntimeError("Cobalt is not configured. Set COBALT_API_URL to your own Cobalt instance.")
+
+    q = str(quality or "720")
+    if q not in {"144", "240", "360", "480", "720", "1080", "1440", "2160", "4320", "max"}:
+        q = "720"
+    payload = {
+        "url": link,
+        "videoQuality": q,
+        "downloadMode": mode,
+        "filenameStyle": "basic",
+        "alwaysProxy": True,
+        "youtubeVideoCodec": "h264",
+        "disableMetadata": False,
+        "youtubeHLS": True,
+    }
+    r = requests.post(COBALT_API_URL + "/", json=payload, headers=_cobalt_headers(), timeout=COBALT_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    status = data.get("status")
+
+    if status == "error":
+        err = data.get("error") or {}
+        code = err.get("code", "unknown") if isinstance(err, dict) else str(err)
+        context = err.get("context", {}) if isinstance(err, dict) else {}
+        limit = context.get("limit") if isinstance(context, dict) else None
+        extra = f" (limit: {limit}s)" if limit else ""
+        raise RuntimeError(f"Cobalt error: {code}{extra}")
+
+    items = []
+    if status in {"tunnel", "redirect"} and data.get("url"):
+        items = [{"type": "video", "url": data["url"], "filename": data.get("filename") or "download.mp4"}]
+    elif status == "picker":
+        items = list(data.get("picker") or [])
+        if not items:
+            raise RuntimeError("Cobalt returned an empty media picker.")
+    else:
+        raise RuntimeError(f"Unsupported Cobalt response: {status}")
+
+    saved = []
+    for index, item in enumerate(items[:20]):
+        url = item.get("url")
+        if not url:
+            continue
+        kind = item.get("type", "audio" if mode == "audio" else "video")
+        filename = item.get("filename") or os.path.basename(url.split("?", 1)[0]) or (f"media_{index}.mp3" if mode == "audio" else f"media_{index}.mp4")
+        filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)[:180] or f"media_{index}.mp4"
+        ext = os.path.splitext(filename)[1].lower()
+        if not ext:
+            ext = {"photo": ".jpg", "gif": ".gif", "video": ".mp4", "audio": ".mp3"}.get(kind, ".mp3" if mode == "audio" else ".mp4")
+            filename += ext
+        path = os.path.join(tmp_dir, f"{index:02d}_{filename}")
+
+        with requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=COBALT_TIMEOUT) as dl:
+            dl.raise_for_status()
+            total = 0
+            max_bytes = (int(max_mb) * 1024 * 1024) if int(max_mb or 0) > 0 else 0
+            with open(path, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=1024 * 256):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise RuntimeError(f"Downloaded file is larger than the configured Telegram limit ({int(max_mb)} MB).")
+                    f.write(chunk)
+        saved.append(path)
+    if not saved:
+        raise RuntimeError("Cobalt returned no downloadable media.")
+    return saved
+
+
+def _cobalt_health():
+    if not _cobalt_enabled():
+        return False, "COBALT_API_URL is not configured."
+    try:
+        r = requests.get(COBALT_API_URL + "/", headers=_cobalt_headers(), timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        c = data.get("cobalt", {})
+        services = c.get("services") or []
+        return True, f"Cobalt {c.get('version','unknown')} • {len(services)} services • duration limit {c.get('durationLimit','?')}s"
+    except Exception as e:
+        return False, str(e)[:180]
+
+
+def _is_trial_active(uid):
+    """True only while the current Premium access came from a trial campaign."""
+    uid=str(uid); u=users.get(uid,{})
+    if not u.get("trial_used"): return False
+    until=u.get("premium_until")
+    try:
+        dt=until if isinstance(until,datetime) else datetime.fromisoformat(str(until).replace("Z","+00:00"))
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        return dt > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+def _ensure_download_limit_defaults_v2():
+    """Migrate the old 49MB/2048MB Premium-Trial defaults to Unlimited once.
+    Admin-selected non-default values are left untouched.
+    """
+    if get_setting("download_limits_defaults_v2",False): return
+    try:
+        old_p=get_setting("premium_max_mb",None)
+        old_t=get_setting("trial_max_mb",None)
+        old_ty=get_setting("trial_youtube_max_mb",None)
+        old_pm=get_setting("premium_max_minutes",None)
+        if old_p == 49: set_setting("premium_max_mb",0)
+        if old_t == 49: set_setting("trial_max_mb",0)
+        if old_ty == 2048: set_setting("trial_youtube_max_mb",0)
+        if old_pm == 120: set_setting("premium_max_minutes",180)
+        set_setting("download_limits_defaults_v2",True)
+    except Exception as e:
+        print("Download limit default migration skipped:",repr(e))
+
+def _download_max_mb(uid, platform=None, link=None):
+    """Return the admin-controlled upload ceiling. 0 means Unlimited."""
+    _ensure_download_limit_defaults_v2()
+    uid=str(uid); platform=platform or ""
+    # Quick Access is explicitly unlimited: no artificial MB ceiling for any platform.
+    if is_quick_access(uid):
+        return 0
+    if is_admin(uid):
+        return max(1,int(get_setting("admin_max_mb",2048) or 2048))
+    if platform == "youtube" or (link and detect_platform(link) == "youtube"):
+        if users.get(uid,{}).get("youtube_30m"):
+            return max(1,int(get_setting("youtube_special_max_mb",49) or 49))
+        if _is_trial_active(uid):
+            v=int(get_setting("trial_youtube_max_mb",TRIAL_YOUTUBE_MAX_MB_DEFAULT) or 0)
+            return v
+        if is_premium(uid):
+            v=int(get_setting("premium_youtube_max_mb",PREMIUM_YOUTUBE_MAX_MB_DEFAULT) or 0)
+            return v
+        return max(1,int(get_setting("free_youtube_max_mb",FREE_YOUTUBE_MAX_MB_DEFAULT) or FREE_YOUTUBE_MAX_MB_DEFAULT))
+    if _is_trial_active(uid):
+        return max(0,int(get_setting("trial_max_mb",0) or 0))
+    if is_premium(uid):
+        return max(0,int(get_setting("premium_max_mb",0) or 0))
+    return max(1,int(get_setting("free_max_mb",49) or 49))
+
+def _download_max_mb_label(uid):
+    if _is_trial_active(uid): return "TRIAL"
+    return "PREMIUM" if is_premium(uid) else "FREE"
+
+def _safe_send_file(chat_id, path, caption="", reply_markup=None, platform=None, link=None):
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    max_mb = _download_max_mb(chat_id, platform=platform, link=link)
+    if max_mb > 0 and size_mb > max_mb:
+        raise RuntimeError(f"Telegram upload limit exceeded: {size_mb:.1f} MB > {max_mb} MB. Choose a lower quality/smaller media.")
+    with open(path, "rb") as f:
+        if _is_image_file(path):
+            return bot.send_photo(chat_id, f, caption=caption, reply_markup=reply_markup)
+        elif _is_video_file(path):
+            return bot.send_video(chat_id, f, caption=caption, supports_streaming=True, reply_markup=reply_markup)
+        elif _is_audio_file(path):
+            return bot.send_audio(chat_id, f, caption=caption, reply_markup=reply_markup)
+        else:
+            return bot.send_document(chat_id, f, caption=caption, reply_markup=reply_markup)
+
+def _collect_downloaded_files(tmp_dir):
+    out = []
+    for root, _, names in os.walk(tmp_dir):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path) and not name.endswith(('.part', '.ytdl', '.temp')):
+                out.append(path)
+    return sorted(out, key=lambda p: os.path.getmtime(p))
+
+def _broadcast_wait_slot():
+    """Rate-limit free broadcasts without serializing the whole broadcast."""
+    if PAID_BROADCAST_ENABLED:
+        return
+    global _broadcast_last_send
+    interval=1.0/max(BROADCAST_RATE,1.0)
+    with _broadcast_rate_lock:
+        now=time.monotonic()
+        wait=interval-(now-_broadcast_last_send)
+        if wait>0:
+            time.sleep(wait)
+        _broadcast_last_send=time.monotonic()
+
+def _broadcast_call(fn,*args,**kwargs):
+    """Send one broadcast item with safe Telegram throttling and 429 tolerance."""
+    _broadcast_wait_slot()
+    if PAID_BROADCAST_ENABLED:
+        kwargs.setdefault("allow_paid_broadcast", True)
+    try:
+        return fn(*args,**kwargs)
+    except TypeError as e:
+        # Older pyTelegramBotAPI versions may not expose allow_paid_broadcast.
+        if PAID_BROADCAST_ENABLED and "allow_paid_broadcast" in str(e):
+            kwargs.pop("allow_paid_broadcast",None)
+            return fn(*args,**kwargs)
+        raise
+    except Exception as e:
+        # One short retry handles transient Telegram 429/5xx/network errors.
+        text=str(e).lower()
+        if "429" in text or "too many requests" in text or "timed out" in text or "timeout" in text:
+            time.sleep(1.0)
+            return fn(*args,**kwargs)
+        raise
+
+def broadcast_users(send_one, user_ids=None):
+    """Fan out to many users concurrently while respecting Telegram's limits."""
+    ids=list(user_ids if user_ids is not None else users.keys())
+    sent=0; failed=0
+    if not ids:
+        return 0,0
+    with ThreadPoolExecutor(max_workers=min(BROADCAST_WORKERS,len(ids))) as pool:
+        futures=[pool.submit(_broadcast_call,send_one,uid) for uid in ids]
+        for fut in futures:
+            try:
+                fut.result(); sent+=1
+            except Exception:
+                failed+=1
+    return sent,failed
+
+def send_action(chat_id, action):
+    try:
+        bot.send_chat_action(chat_id, action)
+    except Exception:
+        pass
+
+def start_action_heartbeat(chat_id, action, stop_event):
+    """Telegram chat actions expire quickly; refresh them while work is running."""
+    def worker():
+        while not stop_event.is_set():
+            send_action(chat_id, action)
+            stop_event.wait(4)
+    t=threading.Thread(target=worker,daemon=True); t.start(); return t
+
+def _send_action_for_file(chat_id, path):
+    """Show Telegram's native upload action immediately before each upload."""
+    if _is_video_file(path):
+        send_action(chat_id, "upload_video")
+    elif _is_audio_file(path):
+        send_action(chat_id, "upload_audio")
+    elif _is_image_file(path):
+        send_action(chat_id, "upload_photo")
+    else:
+        send_action(chat_id, "upload_document")
+
+def is_premium(uid):
+    data = users.get(str(uid), {})
+    until = data.get("premium_until")
+    if not until:
+        return False
+    try:
+        if isinstance(until, datetime):
+            dt = until
+        else:
+            dt = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+def premium_until_text(uid):
+    until = users.get(str(uid), {}).get("premium_until")
+    if not until:
+        return "Not active"
+    try:
+        dt = until if isinstance(until, datetime) else datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return local_datetime_text(uid, dt)
+    except Exception:
+        return str(until)
+
+def youtube_is_short(link, info=None):
+    """Return True for YouTube Shorts URLs or metadata identified as a short."""
+    try:
+        low = (link or "").lower()
+        if re.search(r"(?:youtube\.com/(?:shorts|shorts/)|youtube\.com/shorts/)", low):
+            return True
+        if info:
+            url = str(info.get("webpage_url") or info.get("original_url") or "").lower()
+            if "/shorts/" in url:
+                return True
+            if info.get("ie_key", "").lower() == "youtube" and info.get("channel_is_verified") is not None:
+                # Do not infer a Short only from duration; many normal videos are <60s.
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _quality_format(uid, quality=None):
+    if (is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)) and quality in PREMIUM_QUALITY_FORMATS:
+        return PREMIUM_QUALITY_FORMATS[quality]
+    return FREE_QUALITY_FORMAT
+
+
+def _youtube_extractor_args():
+    """Build optional yt-dlp YouTube extractor arguments from environment variables."""
+    args = {}
+    if YOUTUBE_PLAYER_CLIENT or YOUTUBE_PO_TOKEN:
+        client = YOUTUBE_PLAYER_CLIENT or "mweb"
+        yt_args = {"player_client": [client]}
+        if YOUTUBE_PO_TOKEN:
+            yt_args["po_token"] = [f"{client}.player+{YOUTUBE_PO_TOKEN}"]
+        args["youtube"] = yt_args
+    return args
+
+
+def _youtube_duration_filter(max_duration):
+    """Reject YouTube entries above the configured duration without a second metadata request."""
+    def _filter(info, *, incomplete=False):
+        if incomplete:
+            return None
+        duration = info.get("duration")
+        if duration and duration > max_duration:
+            return f"YouTube video is too long. Maximum is {max_duration // 60} minutes."
+        return None
+    return _filter
+
+
+def _instagram_opts(base_opts):
+    """Options that make Instagram extraction more resilient to current API changes."""
+    opts = dict(base_opts)
+    # Current yt-dlp Instagram extractor uses the web app ID by default and has a
+    # GraphQL logged-out fallback. Keeping the explicit web app ID avoids old
+    # installations accidentally selecting an unsupported app ID.
+    opts["extractor_args"] = {"instagram": {"app_id": ["web"]}}
+    opts["noplaylist"] = True
+    return opts
+
+
+def _is_retryable_instagram_error(exc):
+    text = str(exc).lower()
+    markers = (
+        "http error 404", "video info extraction failed", "no csrf token",
+        "requested content is not available", "rate-limit", "login required",
+        "unable to extract", "instagram api is not granting access",
+    )
+    return any(x in text for x in markers)
+
+
+def _youtube_ffmpeg_available():
+    return bool(_ffmpeg_bin())
+
+def _youtube_direct_formats(quality):
+    target=int(quality or 720)
+    # Combined/progressive media avoids a second stream + FFmpeg merge and is much
+    # faster to deliver. If unavailable, yt-dlp falls back to the best split pair.
+    if _ffmpeg_bin():
+        return [f"best[height<={target}]/best", f"bestvideo[height<={target}]+bestaudio/best[height<={target}]/best"]
+    return [f"best[height<={target}]/best"]
+
+def _pinterest_direct_media(link, tmp_dir):
+    """Robust Pinterest fallback for public Pins.
+
+    Pinterest changes page markup frequently, so do not rely only on one OG meta
+    tag. We collect playable video/image URLs from OG/Twitter tags, JSON-LD and
+    common pinimg CDN fields, then download the best video when available or the
+    best image otherwise.
+    """
+    headers={
+        "User-Agent":"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36",
+        "Accept":"text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language":"en-US,en;q=0.9",
+    }
+    r=requests.get(link,headers=headers,timeout=30,allow_redirects=True)
+    r.raise_for_status()
+    html_text=r.text or ""
+    candidates=[]; seen=set()
+
+    def add(u,kind,score=0):
+        if not u: return
+        u=html.unescape(str(u)).replace("\\/","/")
+        try: u=urllib.parse.unquote(u)
+        except Exception: pass
+        u=u.replace("\u002F","/").replace("\u003A",":").replace("\u0026","&")
+        if not re.match(r"^https?://",u,re.I): return
+        # Pinterest CDN URLs are useful; ignore unrelated external resources.
+        host=(urllib.parse.urlparse(u).netloc or "").lower()
+        if "pinimg.com" not in host and "pinterest.com" not in host and "pinterestusercontent.com" not in host:
+            if kind in {"video","image"}: return
+        key=(u,kind)
+        if key not in seen:
+            seen.add(key); candidates.append((u,kind,score))
+
+    # Meta tags, accepting either property/name before or after content.
+    for tag in re.findall(r"<meta\b[^>]*>",html_text,re.I):
+        pm=re.search(r"(?:property|name)=[\"']([^\"']+)[\"']",tag,re.I)
+        cm=re.search(r"content=[\"']([^\"']+)[\"']",tag,re.I)
+        if not pm or not cm: continue
+        prop=pm.group(1).lower(); val=cm.group(1)
+        if "og:video" in prop or "twitter:player:stream" in prop: add(val,"video",100)
+        elif prop in {"og:image","twitter:image"}: add(val,"image",80)
+
+    # JSON/script URLs used by current Pinterest page payloads.
+    video_patterns=[
+        r'"url"\s*:\s*"(https?:\\/\\/[^"\s]+(?:mp4|m3u8)[^"\s]*)"',
+        r'"contentUrl"\s*:\s*"(https?:\\/\\/[^"\s]+)"',
+        r'"video_url"\s*:\s*"(https?:\\/\\/[^"\s]+)"',
+        r'"url"\s*:\s*"(https?:[^"\s]+pinimg\.com[^"\s]+)"',
+    ]
+    for pat in video_patterns:
+        for mm in re.finditer(pat,html_text,re.I): add(mm.group(1),"video",90)
+
+    # Generic pinimg image fields. Larger originals score higher than thumbnails.
+    for mm in re.finditer(r"https?:\\/\\/[^\"'\s<>]+pinimg\.com[^\"'\s<>]+",html_text,re.I):
+        u=mm.group(0)
+        add(u,"video" if re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)',u,re.I) else "image",60)
+
+    # De-duplicate by URL and prefer video candidates.
+    videos=sorted([x for x in candidates if x[1]=="video"],key=lambda x:x[2],reverse=True)
+    images=sorted([x for x in candidates if x[1]=="image"],key=lambda x:x[2],reverse=True)
+    ordered=videos[:5] if videos else images[:5]
+
+    saved=[]
+    for idx,(u,kind,_) in enumerate(ordered):
+        try:
+            rr=requests.get(u,headers={"User-Agent":headers["User-Agent"],"Referer":"https://www.pinterest.com/"},stream=True,timeout=50)
+            rr.raise_for_status()
+            ctype=(rr.headers.get("content-type") or "").lower()
+            if "mpegurl" in ctype or u.lower().split("?",1)[0].endswith(".m3u8"):
+                # yt-dlp handles HLS better than requests.
+                continue
+            isvideo=kind=="video" or "video/" in ctype or u.lower().split("?",1)[0].endswith(".mp4")
+            ext=".mp4" if isvideo else (".webp" if "webp" in ctype else ".jpg")
+            path=os.path.join(tmp_dir,f"pinterest_{idx}{ext}")
+            total=0
+            with open(path,"wb") as f:
+                for chunk in rr.iter_content(1024*512):
+                    if not chunk: continue
+                    total += len(chunk)
+                    if total > 4*1024*1024*1024: raise RuntimeError("Pinterest media is too large")
+                    f.write(chunk)
+            if os.path.getsize(path)>1000: saved.append(path)
+        except Exception as e:
+            print("Pinterest metadata media download failed:",repr(e))
+    return saved
+
+def _resolve_pinterest_link(link):
+    """Resolve Pinterest short links before extraction; yt-dlp is much more reliable on the final pin URL."""
+    try:
+        text=(link or "").strip()
+        parsed=urllib.parse.urlparse(text if "://" in text else "https://"+text)
+        host=(parsed.netloc or "").lower().split(":",1)[0]
+        if host in {"pin.it","www.pin.it"}:
+            r=requests.get(text,headers={"User-Agent":"Mozilla/5.0"},allow_redirects=True,timeout=15)
+            if r.url and detect_platform(r.url)=="pinterest":
+                return r.url
+    except Exception as e:
+        print("Pinterest short-link resolve failed:",repr(e))
+    return link
+
+
+def _run_ytdlp_download(link, tmp_dir, platform, fmt, base_opts, max_duration, uid=None, quality=None):
+    """yt-dlp fallback downloader used after the configured API providers."""
+    common=dict(base_opts); common["outtmpl"]=os.path.join(tmp_dir,"%(id)s.%(ext)s"); common["merge_output_format"]="mp4"
+    common.pop("max_filesize",None); common["overwrites"]=False; common["continuedl"]=True; common["ignoreerrors"]=False; common["noplaylist"]=(False if platform=="tiktok" else True)
+    common["retries"]=10; common["fragment_retries"]=10; common["extractor_retries"]=5; common["sleep_interval_requests"]=0
+    attempts=[]
+    if platform=="youtube":
+        # Keep the first path fast. Only try one alternate client after a real
+        # extraction failure instead of walking a long 8-client ladder.
+        for client in (None,"mweb"):
+            for yfmt in _youtube_direct_formats(quality):
+                o=dict(common); o["format"]=yfmt; o["match_filter"]=_youtube_duration_filter(max_duration)
+                if client:
+                    o["extractor_args"]={"youtube":{"player_client":[client]}}
+                else:
+                    extra_args=_youtube_extractor_args()
+                    if extra_args: o["extractor_args"]=extra_args
+                attempts.append(o)
+    else:
+        # Different extractors expose different media shapes. Try a small,
+        # deliberate format ladder so image posts, audio-only services and
+        # separate video/audio streams all have a working fallback.
+        if platform == "soundcloud":
+            format_ladder = ["bestaudio/best", "best"]
+        elif platform == "twitch":
+            format_ladder = ["best", "bestvideo*+bestaudio/best"]
+        elif platform == "pinterest":
+            # Pinterest may expose either a video stream, a combined stream, or an image pin.
+            format_ladder = ["bestvideo*+bestaudio/best", "best", "bestvideo*/best", "bestimage/best"]
+        else:
+            format_ladder = [fmt, "best", "bestvideo*+bestaudio/best", "bestvideo*/best"]
+        for chosen in format_ladder:
+            o=dict(common); o["format"]=chosen
+            if platform=="instagram": o=_instagram_opts(o)
+            attempts.append(o)
+            if platform=="instagram" and o.get("cookiefile"):
+                public_opts=dict(o); public_opts.pop("cookiefile",None); attempts.append(public_opts)
+    last_error=None
+    for idx,opts in enumerate(attempts):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl: return ydl.extract_info(link,download=True)
+        except Exception as exc:
+            last_error=exc; print(f"yt-dlp attempt {idx+1}/{len(attempts)} failed [{platform}]:",repr(exc))
+            # Instagram gets an additional public-session retry. Other
+            # extractors continue through the format ladder instead of failing
+            # after the first unavailable format.
+            if platform=="instagram" and idx+1 < len(attempts):
+                continue
+    raise last_error or RuntimeError("yt-dlp download failed")
+
+def download_media(chat_id, link, message_id, quality=None):
+    platform=detect_platform(link)
+    if platform=="unknown":
+        supported=", ".join(premium_platform_names())
+        text=f"❌ Unsupported or invalid link.\n\n🌐 Supported Premium/Trial platforms ({len(premium_platform_names())}): {html.escape(supported)}"
+        try:
+            if message_id: bot.edit_message_text(text,chat_id,message_id,parse_mode="HTML")
+            else: bot.send_message(chat_id,text,parse_mode="HTML")
+        except Exception: pass
+        return
+    uid=str(chat_id)
+    quick=is_quick_access(uid)
+    trial=_is_trial_active(uid)
+    premium=is_premium(uid)
+    priority=quick or premium or trial
+    max_seconds=_download_limit_seconds(uid)
+    rapid_data_prefetched=None
+    if platform=="youtube" and not priority and not youtube_is_short(link) and not youtube_full_free_enabled():
+        # Check the exact duration first. If it exceeds the Free limit, stop
+        # here and show Premium instead of allowing the generic downloader
+        # failure message to appear. RapidAPI is preferred for this probe.
+        duration_check,rapid_data_prefetched=_youtube_duration_fast(link)
+        if duration_check and duration_check > YOUTUBE_FREE_MAX_MINUTES*60:
+            msg=premium_gate_message(uid,"youtube",duration_check)
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("💎 OPEN PREMIUM",callback_data="premium_menu"))
+            try:
+                if message_id: bot.edit_message_text(msg,chat_id,message_id,parse_mode="HTML",reply_markup=kb)
+                else: bot.send_message(chat_id,msg,parse_mode="HTML",reply_markup=kb)
+            except Exception as e: print("Premium duration gate send failed:",repr(e))
+            return
+        max_seconds=YOUTUBE_FREE_MAX_MINUTES*60
+    quality=quality or (users.get(uid,{}).get("premium_quality") if priority else "720") or ("1080" if quick else "720")
+    tmp=os.path.join("downloads",uuid.uuid4().hex); os.makedirs(tmp,exist_ok=True)
+    # Do not send/edit a visible "Preparing..." message. Telegram's native
+    # upload action is shown immediately and is refreshed until the real media
+    # is sent. This keeps the chat clean and makes fast providers feel instant.
+    if message_id:
+        try: bot.delete_message(chat_id,message_id)
+        except Exception: pass
+    action_stop=threading.Event()
+    action_thread=start_action_heartbeat(chat_id,"upload_video",action_stop)
+    try:
+        media=[]
+        provider="yt-dlp"
+        if platform == "pinterest":
+            link = _resolve_pinterest_link(link)
+        # YouTube: use RapidAPI as the primary resolver when configured. This avoids
+        # waiting for yt-dlp's YouTube extractor and bypasses the common
+        # "Sign in to confirm you're not a bot" search/download failure. yt-dlp
+        # remains a fallback when RapidAPI is unavailable or returns no media.
+        if not media and platform == "youtube" and RAPIDAPI_YT_KEY:
+            try:
+                vid=_extract_youtube_video_id(link)
+                if not vid: raise RuntimeError("Could not extract YouTube video ID.")
+                rapid_data=rapid_data_prefetched or _rapidapi_youtube_details(vid)
+                rapid_duration=_rapid_duration(rapid_data)
+                if rapid_duration and max_seconds and rapid_duration>max_seconds:
+                    raise RuntimeError("YouTube video is too long for the current access tier.")
+                rv,ra=_rapid_choose_pair(rapid_data,quality)
+                max_bytes=max(0,int(_download_max_mb(uid,platform="youtube",link=link) or 0))*1024*1024
+                video_path=os.path.join(tmp,"rapid_video")
+                _rapid_download_file(rv["url"],video_path,max_bytes=max_bytes)
+                final_video=video_path
+                if ra and _ffmpeg_bin():
+                    audio_path=os.path.join(tmp,"rapid_audio")
+                    _rapid_download_file(ra["url"],audio_path,max_bytes=max_bytes)
+                    merged=os.path.join(tmp,"rapid_merged.mp4")
+                    ff=_ffmpeg_bin()
+                    cmd=[ff,"-y","-i",video_path,"-i",audio_path,"-c:v","copy","-c:a","aac","-movflags","+faststart",merged]
+                    proc=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=180)
+                    if proc.returncode==0 and os.path.isfile(merged): final_video=merged
+                    else: print("RapidAPI YouTube merge failed; using video-only file.")
+                # Give the file a Telegram-friendly extension.
+                named=os.path.join(tmp,f"youtube_{vid}.mp4")
+                if final_video!=named:
+                    try: os.replace(final_video,named); final_video=named
+                    except Exception: pass
+                if os.path.isfile(final_video):
+                    media=[final_video]; provider="rapidapi-youtube"
+            except Exception as e:
+                print("RapidAPI YouTube primary failed; falling back:",repr(e))
+        # Fast paid/universal resolver. Only runs when the owner configured a key.
+        if not media and platform in SAVEAPI_SUPPORTED_PLATFORMS and _saveapi_enabled():
+            try:
+                media=_saveapi_download(link,tmp,uid=uid,platform=platform,prefer="video"); provider="saveapi"
+            except Exception as e:
+                print(f"SaveAPI {platform} fallback:",repr(e))
+        if not media and platform=="instagram" and _instagram_api_enabled():
+            try:
+                media=_instagram_api_download(link,tmp); provider="rapidapi-instagram"
+            except Exception as e:
+                print("RapidAPI Instagram fallback:",repr(e))
+        # Pinterest direct page fallback: many pins expose the playable video or
+        # image in OpenGraph metadata even when yt-dlp cannot parse the page.
+        if not media and platform == "pinterest":
+            try:
+                media = _pinterest_direct_media(link, tmp)
+                if media:
+                    provider = "pinterest-og"
+            except Exception as e:
+                print("Pinterest direct metadata fallback:", repr(e))
+        # Cobalt is also useful for Pinterest: current Cobalt builds explicitly
+        # support Pinterest photos, GIFs and videos. Keep it as a fallback so
+        # Pinterest gets another extractor instead of stopping at yt-dlp.
+        if not media and _cobalt_enabled():
+            try:
+                cobalt_mb=_download_max_mb(uid,platform=platform,link=link)
+                media=_cobalt_process(link,tmp,quality=quality,max_mb=cobalt_mb); provider="cobalt"
+            except Exception as e: print(f"Cobalt {platform} fallback:",repr(e))
+        if not media:
+            cookie_args=_ytdlp_cookie_args() if platform=="youtube" else {}
+            opts={
+                "quiet":True,"no_warnings":True,"noplaylist":True,
+                "retries":2 if quick else 2,"fragment_retries":3 if quick else 3,"extractor_retries":2,
+                "socket_timeout":12 if quick else 18,
+                "http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36"},
+                "concurrent_fragment_downloads":48 if is_quick_access(uid) else (32 if premium or _is_trial_active(uid) else 20),
+                "http_chunk_size": 24 * 1024 * 1024 if is_quick_access(uid) else (16 * 1024 * 1024 if premium or _is_trial_active(uid) else 12 * 1024 * 1024),
+                "buffersize": 16 * 1024 * 1024 if is_quick_access(uid) else (8 * 1024 * 1024 if premium or _is_trial_active(uid) else 6 * 1024 * 1024),
+                "ratelimit": None,
+                **cookie_args
+            }
+            ffmpeg=_ffmpeg_bin()
+            if ffmpeg:
+                opts["ffmpeg_location"]=os.path.dirname(ffmpeg) if os.path.dirname(ffmpeg) else ffmpeg
+            fmt=_quality_format(uid,quality)
+            if platform in {"tiktok","instagram","facebook","pinterest","snapchat","twitter"}:
+                fmt="bestvideo*+bestaudio/best"
+            info=_run_ytdlp_download(link,tmp,platform,fmt,opts,max_seconds,uid=uid,quality=quality)
+            media=[p for p in _collect_downloaded_files(tmp) if _is_image_file(p) or _is_video_file(p) or _is_audio_file(p)]
+        # Pinterest often exposes image pins separately from video pins. If the
+        # first extractor pass produced nothing, retry with Pinterest's native
+        # best-image/best-video ladder before reporting failure.
+        if not media and platform == "pinterest":
+            try:
+                pin_opts=dict(opts)
+                pin_opts["format"]="bestimage/bestvideo*+bestaudio/bestvideo*/best"
+                pin_opts["outtmpl"]=os.path.join(tmp,"%(id)s.%(ext)s")
+                info=_run_ytdlp_download(link,tmp,platform,pin_opts["format"],pin_opts,max_seconds,uid=uid,quality=quality)
+                media=[p for p in _collect_downloaded_files(tmp) if _is_image_file(p) or _is_video_file(p) or _is_audio_file(p)]
+            except Exception as e:
+                print("Pinterest second-pass failed:",repr(e))
+        if not media: raise RuntimeError("No downloadable media was produced.")
+        if platform == "pinterest":
+            pin_videos=[p for p in media if _is_video_file(p)]
+            pin_images=[p for p in media if _is_image_file(p)]
+            if pin_videos:
+                media=pin_videos[:5]
+            elif pin_images:
+                media=pin_images[:1]
+        # Best-effort metadata for MUSIC. API providers do not always expose
+        # title/artist in the file name, so keep useful yt-dlp metadata when it
+        # is already available without another network round-trip.
+        source_title=""
+        source_artist=""
+        try:
+            if isinstance(locals().get("info"),dict):
+                source_title=_music_title_from_info(info)
+                source_artist=_music_artist_from_info(info)
+        except Exception: pass
+        sent=0
+        for path in media[:50 if platform=="tiktok" else 20]:
+            # A managed Video Downloader never returns standalone audio files.
+            if _is_audio_file(path) and str((_ACTIVE_MANAGED_META.get() or {}).get("bot_type") or "video") == "video":
+                continue
+            # Stop the resolving/typing action before upload, then show the exact
+            # native Telegram upload action for the file being sent.
+            action_stop.set()
+            upload_stop=threading.Event()
+            upload_action="upload_video" if _is_video_file(path) else ("upload_audio" if _is_audio_file(path) else ("upload_photo" if _is_image_file(path) else "upload_document"))
+            start_action_heartbeat(chat_id,upload_action,upload_stop)
+            markup=None
+            if _is_video_file(path):
+                managed_meta=_ACTIVE_MANAGED_META.get() or {}
+                bid=str(managed_meta.get("bot_id") or "")
+                if bid:
+                    token=uuid.uuid4().hex[:18]
+                    managed_video_music_pending.setdefault(bid,{})[token]={"uid":uid,"link":link,"local_source":path,"cache_dir":tmp,"source_title":source_title,"source_artist":source_artist,"created":time.time()}
+                    markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MUSIC",callback_data=f"mmusic:{bid}:{token}")]])
+                else:
+                    token=uuid.uuid4().hex[:18]
+                    music_pending[token]={"uid":uid,"link":link,"local_source":path,"cache_dir":tmp,"source_title":source_title,"source_artist":source_artist,"created":time.time()}
+                    music_cache_dirs.add(tmp)
+                    markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MUSIC",callback_data=f"music:{token}")]])
+            try:
+                _safe_send_file(chat_id,path,DOWNLOAD_CAPTION,reply_markup=markup,platform=platform,link=link); sent+=1
+                if _is_video_file(path):
+                    managed_meta=_ACTIVE_MANAGED_META.get() or {}
+                    managed_bot=_ACTIVE_BOT.get()
+                    powered=_active_powered_text() if managed_meta.get("bot_id") else ""
+                    if powered and managed_bot is not None:
+                        try:
+                            # Powered-by is ONLY for managed/small bots. The main downloader
+                            # must never append it. Send from the managed bot itself.
+                            managed_bot.send_message(chat_id, powered)
+                        except Exception as e: print("Managed powered-by send failed:",repr(e))
+            finally:
+                upload_stop.set()
+            # Never fall back to a visible typing/preparing action between files.
+            # Each next file starts its own native upload action above.
+        if message_id:
+            try: bot.delete_message(chat_id,message_id)
+            except Exception: pass
+        videos_data["total"]=videos_data.get("total",0)+sent; videos_data.setdefault("platforms",{}).setdefault(platform,0); videos_data["platforms"][platform]+=sent; videos_data.setdefault("users",{}).setdefault(uid,0); videos_data["users"][uid]+=sent; save_videos(); log_activity(uid,"download",{"platform":platform,"count":sent,"provider":provider})
+    except Exception as e:
+        print(f"Download error [{platform}] {link}: {e!r}")
+        err_text=str(e)
+        if platform=="youtube" and not priority and "too long" in err_text.lower():
+            msg=premium_gate_message(uid,"youtube",YOUTUBE_FREE_MAX_MINUTES*60+1)
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("💎 OPEN PREMIUM",callback_data="premium_menu"))
+            try:
+                if message_id: bot.edit_message_text(msg,chat_id,message_id,parse_mode="HTML",reply_markup=kb)
+                else: bot.send_message(chat_id,msg,parse_mode="HTML",reply_markup=kb)
+            except Exception: pass
+            return
+        msg="❌ Download failed. Please try again."
+        try:
+            if message_id: bot.edit_message_text(msg,chat_id,message_id)
+            else: bot.send_message(chat_id,msg)
+        except Exception:
+            try: bot.send_message(chat_id,msg)
+            except Exception: pass
+    finally:
+        action_stop.set()
+        managed_active_cache = any(
+            str(x.get("cache_dir")) == str(tmp)
+            for rows in managed_video_music_pending.values()
+            for x in rows.values()
+        )
+        active_cache = any(str(x.get("cache_dir")) == str(tmp) for x in music_pending.values()) or managed_active_cache
+        if not active_cache:
+            shutil.rmtree(tmp,ignore_errors=True)
+        else:
+            music_cache_dirs.add(tmp)
+
+@bot.message_handler(func=lambda m: m.text == "📡 RAPIDAPI STATUS")
+def rapidapi_status_handler(m):
+    if not is_admin(m.from_user.id): return
+    if not RAPIDAPI_YT_KEY:
+        bot.send_message(m.chat.id,"❌ RAPIDAPI_YT_KEY is not configured.")
+        return
+    try:
+        _rapidapi_youtube_details("dQw4w9WgXcQ")
+        bot.send_message(m.chat.id,"✅ RapidAPI YouTube is responding.\n🔄 If RapidAPI fails during a download, the bot will automatically try yt-dlp.")
+    except Exception as e:
+        bot.send_message(m.chat.id,f"❌ RapidAPI failed: {str(e)[:700]}")
+
+@bot.message_handler(func=lambda m: m.text in {"🟢 Open add group","🟢 Add Group REQUIRED"})
+def admin_open_add_group(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("add_group_enabled", True)
+    bot.send_message(m.chat.id,
+        "🟢 <b>ADD GROUP REQUIRED FOR SONG SEARCH</b>\n\n"
+        "Users who search songs must add this bot to a group and make it an administrator before the 10-song picker is shown. "
+        "They can use Telegram's <b>Select Chat</b> picker to choose their group and make this bot an administrator.",
+        parse_mode="HTML", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text in {"🔴 Close add group","🔴 Add Group OPTIONAL"})
+def admin_close_add_group(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("add_group_enabled", False)
+    bot.send_message(m.chat.id,
+        "🔴 <b>ADD GROUP OPTIONAL</b>\n\n"
+        "Users can search songs normally. No group connection is required.",
+        parse_mode="HTML", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🟢 Open add channel")
+def admin_open_add_channel(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("add_channel_enabled", True)
+    bot.send_message(m.chat.id,
+        "🟢 <b>ADD CHANNEL OPEN</b>\n\n"
+        "Users will now see <b>➕ Add Channel</b> under the /start welcome message and on MP3 files. "
+        "They can use Telegram's <b>Select Chat</b> picker to choose their channel and make this bot an administrator.",
+        parse_mode="HTML", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔴 Close add channel")
+def admin_close_add_channel(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("add_channel_enabled", False)
+    bot.send_message(m.chat.id,
+        "🔴 <b>ADD CHANNEL CLOSED</b>\n\n"
+        "New MP3s and the /start welcome message will no longer show the Add Channel button. MP3 remains normal.",
+        parse_mode="HTML", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🟢 Open mp3 Cover")
+def admin_open_mp3_cover(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("mp3_cover_enabled",True)
+    bot.send_message(m.chat.id,"🟢 <b>MP3 COVER OPEN</b>\n\nMP3 conversion may now use the source video thumbnail when available. If a genuine music/artist cover is available, that can be used as well.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔴 Close mp3 Cover")
+def admin_close_mp3_cover(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("mp3_cover_enabled",False)
+    bot.send_message(m.chat.id,"🔴 <b>MP3 COVER CLOSED</b>\n\nThe source video thumbnail will not be used. The MP3 will use genuine music/artist artwork only when available.",parse_mode="HTML",reply_markup=admin_menu())
+
+# ================= SONG SEARCH =================
+def _song_search_is_open():
+    return bool(get_setting("song_search_enabled", True))
+
+def _song_search_closed_message():
+    return str(get_setting("song_search_closed_message", "This is Not available Now.") or "This is Not available Now.")
+
+def _song_duration(seconds):
+    try:
+        if isinstance(seconds,str):
+            parsed=_parse_duration_value(seconds)
+            seconds=parsed if parsed else int(float(seconds or 0))
+        seconds=max(0,int(seconds or 0))
+    except Exception:
+        seconds=0
+    return f"{seconds//60}:{seconds%60:02d}"
+
+def _song_norm(value):
+    """Normalize music text for tolerant matching (case, punctuation, accents)."""
+    import unicodedata
+    text=_music_clean_text(value).lower()
+    text=unicodedata.normalize("NFKD", text)
+    text="".join(ch for ch in text if not unicodedata.combining(ch))
+    text=re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _song_similarity(query, title, artist, album=""):
+    """High-recall music ranking with typo/fuzzy support."""
+    from difflib import SequenceMatcher
+    q=_song_norm(query); t=_song_norm(title); a=_song_norm(artist); al=_song_norm(album)
+    if not q: return 0
+    score=0
+    if q==a: score+=12000
+    if q==t: score+=11000
+    if q in a: score+=8500
+    if q in t: score+=8000
+    if q in al: score+=1000
+    for field,weight in ((a,800),(t,650),(al,120)):
+        for w in [x for x in q.split() if len(x)>=2]:
+            if re.search(rf"(?<!\w){re.escape(w)}(?!\w)",field): score+=weight
+    # Typo tolerance: BAN4BAND -> BAND4BAND, small spelling mistakes, etc.
+    for field,weight in ((a,5200),(t,4700)):
+        if field:
+            ratio=SequenceMatcher(None,q,field).ratio()
+            if ratio>=0.72: score += int(ratio*weight)
+            for token in field.split():
+                tr=SequenceMatcher(None,q,token).ratio()
+                if tr>=0.78: score += int(tr*1800)
+    return score
+
+def _song_is_relevant(query,title,artist,album=""):
+    """Return True for exact/near title or artist matches, including small typos."""
+    from difflib import SequenceMatcher
+    q=_song_norm(query); t=_song_norm(title); a=_song_norm(artist); al=_song_norm(album)
+    if not q: return False
+    if q in t or q in a or q in al: return True
+    words=[w for w in q.split() if len(w)>=2]
+    if words:
+        for field in (t,a):
+            if all(re.search(rf"(?<!\w){re.escape(w)}(?!\w)",field) for w in words): return True
+    # Fuzzy whole-field and token matching catches common typos without allowing
+    # unrelated single-word collisions such as Central/Cee.
+    for field in (t,a):
+        if not field: continue
+        if SequenceMatcher(None,q,field).ratio()>=0.72: return True
+        fwords=field.split()
+        if words and all(max((SequenceMatcher(None,w,fw).ratio() for fw in fwords),default=0)>=0.78 for w in words):
+            return True
+    return False
+
+def _jamendo_song_search(query, limit=100):
+    """Search/download songs from Jamendo only.
+
+    Artist-first matching is deliberately strict: if the query exactly matches a
+    Jamendo artist name (for example ``Central Cee``), only tracks belonging to
+    that artist are returned.  Otherwise the normal Jamendo track search is used
+    and results are filtered by title/artist relevance.  Only tracks for which
+    Jamendo explicitly returns ``audiodownload_allowed=true`` are offered.
+    """
+    query=_music_clean_text(query)
+    if not query or not JAMENDO_CLIENT_ID:
+        if not JAMENDO_CLIENT_ID:
+            print("Jamendo search skipped: JAMENDO_CLIENT_ID is missing")
+        return []
+
+    limit=max(1,min(100,int(limit)))
+    timeout=min(max(5,int(JAMENDO_TIMEOUT)),10)
+    base={
+        "client_id":JAMENDO_CLIENT_ID,
+        "format":"json",
+        "imagesize":600,
+        "album_imagesize":600,
+        "audiodlformat":"mp32",
+    }
+
+    def api(path, params):
+        try:
+            q=dict(base); q.update(params)
+            r=requests.get("https://api.jamendo.com/v3.0/"+path,params=q,timeout=timeout,headers={"User-Agent":"Downloadvedioytibot/1.0"})
+            r.raise_for_status()
+            body=r.json() or {}
+            if (body.get("headers") or {}).get("status") not in (None,"success"):
+                print("Jamendo API error:",body.get("headers")); return []
+            return body.get("results") or []
+        except Exception as e:
+            print("Jamendo API request failed:",path,repr(e)); return []
+
+    qnorm=_song_norm(query)
+
+    # 1) Exact artist lookup.  This prevents a query such as "Central Cee"
+    # from becoming a broad keyword search for tracks containing only "Central"
+    # or only "Cee".
+    artists=api("artists/",{
+        "name":query,
+        "limit":10,
+    })
+    exact_artists=[]
+    for a in artists:
+        if not isinstance(a,dict): continue
+        aid=str(a.get("id") or "")
+        aname=_music_clean_text(a.get("name"))
+        if aid and aname and _song_norm(aname)==qnorm:
+            exact_artists.append((aid,aname))
+
+    raw=[]
+    if exact_artists:
+        # Fetch tracks directly from the matched artist(s). Jamendo's
+        # artists/tracks endpoint gives us the artist-owned tracks, so unrelated
+        # keyword collisions cannot leak into the result list.
+        for aid,aname in exact_artists[:3]:
+            raw.extend(api("artists/tracks/",{
+                "id":aid,
+                "limit":min(200,max(20,limit*4)),
+                "track_type":"single albumtrack",
+                "order":"track_name",
+            }))
+    else:
+        # 2) No exact artist: use Jamendo's track search and then apply strict
+        # relevance filtering below. This supports exact/near song-title queries.
+        modes=[{"namesearch":query},{"search":query},{"artist_name":query}]
+        words=[w for w in query.split() if len(w)>=2]
+        if words:
+            longest=max(words,key=len)
+            if longest.casefold()!=query.casefold(): modes.append({"search":longest})
+        seen_raw=set()
+        for mode in modes:
+            for item in api("tracks/",{
+                **mode,
+                "limit":min(100,max(20,limit*5)),
+                "order":"relevance",
+                "track_type":"single albumtrack",
+            }):
+                if not isinstance(item,dict): continue
+                iid=str(item.get("id") or "")
+                if iid and iid not in seen_raw:
+                    seen_raw.add(iid); raw.append(item)
+
+    rows=[]; seen=set()
+    for item in raw:
+        if not isinstance(item,dict): continue
+        iid=str(item.get("id") or "")
+        title=_music_clean_text(item.get("name"))
+        artist=_music_clean_text(item.get("artist_name") or item.get("artist")) or "Unknown artist"
+        album=_music_clean_text(item.get("album_name"))
+        download=item.get("audiodownload") or ""
+        allowed=bool(item.get("audiodownload_allowed"))
+        if not iid or iid in seen or not title or not allowed or not download:
+            continue
+
+        if exact_artists:
+            # Artist endpoint should already guarantee this, but keep an explicit
+            # normalized check as a safety barrier against malformed API data.
+            if _song_norm(artist) not in {_song_norm(a[1]) for a in exact_artists}:
+                continue
+        elif not _song_is_relevant(query,title,artist,album):
+            continue
+
+        seen.add(iid)
+        try: duration=int(float(item.get("duration") or 0))
+        except Exception: duration=0
+        cover=item.get("album_image") or item.get("image")
+        score=_song_similarity(query,title,artist,album)
+        # Exact artist searches should prioritize useful/recently ordered tracks,
+        # while title searches still rank by title/artist relevance.
+        rows.append({
+            "id":iid,"title":title,"artist":artist,"duration":duration,"album":album,
+            "cover":cover,"download":download,"download_allowed":allowed,
+            "license":item.get("license_ccurl") or "","source":"jamendo",
+            "_score":score,
+        })
+
+    rows.sort(key=lambda x:(x.get("_score",0),-int(x.get("duration",0))),reverse=True)
+    for x in rows: x.pop("_score",None)
+    return rows[:limit]
+
+def _song_query_variants(query, max_variants=1):
+    """Return only the user's query. Search Song must not call a third-party
+    correction/search API; YouTube Music itself is the search source."""
+    query=_music_clean_text(query)
+    return [query] if query else []
+
+def _youtube_song_is_music(title, artist, duration=0, item=None):
+    """Strictly keep music-like YouTube Music results and reject news/talk content.
+
+    The search itself is sent to YouTube Music's dedicated *Songs* section, so
+    normal YouTube news/videos should not enter the result set. This second
+    filter is deliberately conservative because YouTube Music metadata can be
+    incomplete for older tracks.
+    """
+    title=_song_norm(title)
+    artist=_song_norm(artist)
+    if not title:
+        return False
+    try:
+        dur=int(float(duration or 0))
+    except Exception:
+        dur=0
+    if dur and dur > 25*60:
+        return False
+    bad=(
+        "news", "live", "breaking", "press conference", "full speech", "speech",
+        "interview", "debate", "podcast", "documentary", "newshour", "cnn",
+        "wion", "bbc", "fox news", "al jazeera", "reuters", "n18", "drm news",
+        "walkout", "general assembly", "iran war", "ukraine war", "seven day",
+    )
+    combined=f"{title} {artist}"
+    if any(term in combined for term in bad):
+        return False
+    # Music-oriented metadata is a useful positive signal, but is not required:
+    # older/independent tracks often have only a clean title + artist.
+    positive=(
+        "official music", "official audio", "music video", "lyrics", "lyric video",
+        "audio", "song", "remix", "acoustic", "instrumental", "cover", "soundtrack",
+        "topic", "records", "music", "ost", "original soundtrack",
+    )
+    if any(term in title for term in positive) or artist.endswith(" topic"):
+        return True
+    # A result coming from the dedicated YouTube Music Songs section is already
+    # a song candidate. Keep ordinary-length clean results unless they look like
+    # an obvious news/talk result above.
+    return True
+
+def _song_parse_artists(title, channel=""):
+    raw_title=_music_clean_text(title); raw_channel=_music_clean_text(channel); artists=[]
+    def add(value):
+        value=_music_clean_text(value)
+        if not value: return
+        value=re.sub(r"\s+"," ",value).strip(" -–—|,")
+        parts=re.split(r"\s+(?:ft\.?|feat\.?|featuring)\s+|\s*[&]\s*|\s+\bx\b\s+|\s*,\s*",value,flags=re.I)
+        for part in parts:
+            part=_music_clean_text(part).strip(" -–—")
+            part=re.sub(r"^@","",part)
+            if part and not any(_song_norm(part)==_song_norm(a) for a in artists): artists.append(part)
+    m=re.match(r"^(.{1,120}?)\s[-–—]\s+(.+)$",raw_title)
+    if m and len(m.group(1).split())<=12:
+        add(m.group(1))
+        fm=re.search(r"\b(?:ft\.?|feat\.?|featuring)\s+(.+?)(?:\)|\]|$)",m.group(2),flags=re.I)
+        if fm: add(fm.group(1))
+    else:
+        fm=re.search(r"\b(?:ft\.?|feat\.?|featuring)\s+(.+?)(?:\)|\]|$)",raw_title,flags=re.I)
+        if fm: add(fm.group(1))
+    if raw_channel and _song_norm(raw_channel) not in {"youtube","unknown","unknown artist"}:
+        if not artists: add(raw_channel)
+        elif _song_norm(raw_channel) not in {_song_norm(a) for a in artists}: add(raw_channel)
+    return " & ".join(artists)
+
+def _parse_duration_value(value):
+    try:
+        if value is None: return 0
+        if isinstance(value,(int,float)): return max(0,int(value))
+        text=str(value).strip()
+        m=re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})",text)
+        if m: return int(m.group(1) or 0)*3600+int(m.group(2))*60+int(m.group(3))
+        m=re.fullmatch(r"(\d+)\s*min(?:ute)?s?\s*(?:(\d+)\s*sec(?:ond)?s?)?",text,re.I)
+        if m: return int(m.group(1))*60+int(m.group(2) or 0)
+    except Exception: pass
+    return 0
+
+def _yt_text_runs(obj):
+    out=[]
+    if not isinstance(obj,dict): return out
+    runs=((obj.get("text") or {}).get("runs") or [])
+    if isinstance(runs,list):
+        for r in runs:
+            if isinstance(r,dict) and r.get("text"):
+                out.append(_music_clean_text(r.get("text")))
+    return [x for x in out if x]
+
+def _youtube_music_initial_data(html_text):
+    """Extract ytInitialData without depending on a third-party music API."""
+    if not html_text: return None
+    # YouTube currently embeds one of these assignments in the HTML.
+    for marker in ("var ytInitialData = ", "ytInitialData = "):
+        pos=html_text.find(marker)
+        if pos<0: continue
+        pos += len(marker)
+        while pos < len(html_text) and html_text[pos].isspace(): pos += 1
+        if pos>=len(html_text) or html_text[pos] != "{": continue
+        depth=0; in_str=False; esc=False
+        for i in range(pos,len(html_text)):
+            ch=html_text[i]
+            if in_str:
+                if esc: esc=False
+                elif ch=="\\": esc=True
+                elif ch=='"': in_str=False
+                continue
+            if ch=='"': in_str=True; continue
+            if ch=='{': depth+=1
+            elif ch=='}':
+                depth-=1
+                if depth==0:
+                    try: return json.loads(html_text[pos:i+1])
+                    except Exception: break
+    # Fallback: JSON may be assigned through ytInitialPlayerResponse-style script.
+    m=re.search(r'ytInitialData\s*=\s*(\{.*?\});',html_text,re.S)
+    if m:
+        try: return json.loads(m.group(1))
+        except Exception: pass
+    return None
+
+def _youtube_music_walk(obj):
+    """Yield musicResponsiveListItemRenderer objects from arbitrary YouTube JSON."""
+    stack=[obj]
+    while stack:
+        cur=stack.pop()
+        if isinstance(cur,dict):
+            r=cur.get("musicResponsiveListItemRenderer")
+            if isinstance(r,dict): yield r
+            stack.extend(cur.values())
+        elif isinstance(cur,list):
+            stack.extend(cur)
+
+def _youtube_music_artist_names(renderer, title=""):
+    names=[]
+    def add(v):
+        v=_music_clean_text(v).strip(" -–—|,•")
+        if not v: return
+        if _song_norm(v) in {"youtube","unknown","unknown artist"}: return
+        if not any(_song_norm(v)==_song_norm(x) for x in names): names.append(v)
+    # The artist is normally a browseEndpoint with MUSIC_PAGE_TYPE_ARTIST.
+    for col in renderer.get("flexColumns") or []:
+        rr=col.get("musicResponsiveListItemFlexColumnRenderer") if isinstance(col,dict) else None
+        if not isinstance(rr,dict): continue
+        text=rr.get("text") or {}
+        for run in text.get("runs") or []:
+            if not isinstance(run,dict): continue
+            ep=((run.get("navigationEndpoint") or {}).get("browseEndpoint") or {})
+            cfg=((ep.get("browseEndpointContextSupportedConfigs") or {}).get("browseEndpointContextMusicConfig") or {})
+            if cfg.get("pageType")=="MUSIC_PAGE_TYPE_ARTIST":
+                add(run.get("text"))
+        # Some older layouts don't mark the browse endpoint as artist. In that
+        # case the second column often contains the artist text.
+        if not names:
+            vals=_yt_text_runs(text)
+            if vals:
+                candidate=" & ".join([v for v in vals if _song_norm(v) not in {"song","album"}])
+                if candidate and _song_norm(candidate)!=_song_norm(title):
+                    add(candidate)
+    # Finally parse artist names embedded in common title formats.
+    parsed=_song_parse_artists(title," & ".join(names))
+    if parsed:
+        for n in parsed.split(" & "): add(n)
+    return " & ".join(names)
+
+def _youtube_music_http_search(query, limit=30):
+    """Fast direct YouTube Music Songs search.
+
+    It reads the public YouTube Music search page. This avoids per-video metadata
+    requests, so title/artist/duration arrive in one response. It is not a
+    third-party song API.
+    """
+    query=_music_clean_text(query)
+    if not query: return []
+    try:
+        q=urllib.parse.quote_plus(query)
+        # Songs shelf filter used by YouTube Music. The HTML contains duration in
+        # fixedColumns and artist links in the responsive list renderer.
+        url=f"https://music.youtube.com/search?q={q}&sp=EgWKAQIIAWoKEAoQAxAEEAkQBQ=="
+        r=http_session.get(url,timeout=4,headers={
+            "User-Agent":"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36",
+            "Accept-Language":"en-US,en;q=0.9",
+        })
+        r.raise_for_status()
+        data=_youtube_music_initial_data(r.text)
+        if not data: return []
+        rows=[]; seen=set()
+        for renderer in _youtube_music_walk(data):
+            video_id=str(((renderer.get("playlistItemData") or {}).get("videoId") or "")).strip()
+            if not video_id:
+                # Some layouts expose it only under the play/watch endpoint.
+                for col in renderer.get("flexColumns") or []:
+                    rr=col.get("musicResponsiveListItemFlexColumnRenderer") if isinstance(col,dict) else None
+                    if not isinstance(rr,dict): continue
+                    for run in ((rr.get("text") or {}).get("runs") or []):
+                        ep=((run.get("navigationEndpoint") or {}).get("watchEndpoint") or {}) if isinstance(run,dict) else {}
+                        if ep.get("videoId"):
+                            video_id=str(ep.get("videoId")); break
+                    if video_id: break
+            if not video_id or video_id in seen: continue
+            flex=renderer.get("flexColumns") or []
+            title=""
+            if flex:
+                rr=flex[0].get("musicResponsiveListItemFlexColumnRenderer") if isinstance(flex[0],dict) else None
+                vals=_yt_text_runs(rr.get("text") or {}) if isinstance(rr,dict) else []
+                if vals: title=vals[0]
+            title=_music_clean_text(title)
+            if not title: continue
+            duration_text=""
+            fixed=renderer.get("fixedColumns") or []
+            if fixed:
+                rr=fixed[0].get("musicResponsiveListItemFixedColumnRenderer") if isinstance(fixed[0],dict) else None
+                vals=_yt_text_runs(rr.get("text") or {}) if isinstance(rr,dict) else []
+                if vals: duration_text=vals[0]
+            duration=_parse_duration_value(duration_text)
+            artist=_youtube_music_artist_names(renderer,title)
+            # If the artist is still unavailable, parse title format. Never use
+            # the old visible 'Unknown artist' placeholder.
+            if not artist:
+                artist=_song_parse_artists(title,"")
+            album=""
+            if len(flex)>=2:
+                rr=flex[1].get("musicResponsiveListItemFlexColumnRenderer") if isinstance(flex[1],dict) else None
+                vals=_yt_text_runs(rr.get("text") or {}) if isinstance(rr,dict) else []
+                if vals and not artist and len(vals)>0: artist=vals[0]
+                elif vals and len(vals)>1: album=vals[-1]
+            webpage=f"https://www.youtube.com/watch?v={video_id}"
+            if duration <= 0:
+                # A result without a real duration is not useful in Search Song;
+                # do not display the old 0:00 placeholder.
+                continue
+            if not _youtube_song_is_music(title,artist,duration,renderer): continue
+            if not _song_is_relevant(query,title,artist,album):
+                # Dedicated Songs shelf is authoritative, but for a query such as
+                # an artist name require the query to occur as a whole phrase in
+                # title/artist rather than matching a single word.
+                qn=_song_norm(query)
+                if qn not in _song_norm(title) and qn not in _song_norm(artist):
+                    continue
+            score=_song_similarity(query,title,artist,album)
+            qn=_song_norm(query)
+            if qn==_song_norm(artist): score+=12000
+            elif qn and qn in _song_norm(artist): score+=6000
+            if qn==_song_norm(title): score+=5000
+            rows.append({"id":video_id,"title":title,"artist":artist,"channel":artist,"duration":duration,
+                         "album":album,"cover":"","download":webpage,"download_allowed":True,
+                         "license":"","source":"youtube","webpage_url":webpage,"_score":score})
+            seen.add(video_id)
+            if len(rows)>=max(10,int(limit)): break
+        rows.sort(key=lambda x:x.get("_score",0),reverse=True)
+        for x in rows: x.pop("_score",None)
+        return rows[:max(1,int(limit))]
+    except Exception as e:
+        print("YouTube Music HTTP search failed:",repr(e))
+        return []
+
+def _youtube_music_ytmsearch(query, limit=30):
+    """Fast yt-dlp YouTube Music Songs search fallback.
+
+    ytmsearch uses yt-dlp's native YouTube Music Songs section. The extractor
+    exposes title/duration and usually artist/channel metadata without a second
+    per-video request. This is used only when the direct Music HTML response is
+    incomplete or returns fewer than 10 usable songs.
+    """
+    want=max(10,min(30,int(limit)))
+    try:
+        opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
+              "playlistend":want,"socket_timeout":5,"retries":1,
+              "fragment_retries":1,"extractor_retries":1,"cachedir":False}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(f"ytmsearch{want}:{query}",download=False) or {}
+        out=[]; seen=set()
+        for item in info.get("entries") or []:
+            if not isinstance(item,dict): continue
+            vid=str(item.get("id") or "").strip()
+            if not vid or vid in seen: continue
+            title=_music_clean_text(item.get("title") or item.get("track") or item.get("fulltitle"))
+            artist=_music_clean_text(item.get("artist") or item.get("artists") or item.get("channel") or item.get("uploader") or item.get("creator"))
+            artist=_song_parse_artists(title,artist) or artist
+            duration=_parse_duration_value(item.get("duration")) or _parse_duration_value(item.get("duration_string"))
+            album=_music_clean_text(item.get("album") or "")
+            if not title or duration<=0: continue
+            if not _youtube_song_is_music(title,artist,duration,item): continue
+            if not _song_is_relevant(query,title,artist,album): continue
+            score=_song_similarity(query,title,artist,album)
+            qn=_song_norm(query)
+            if qn==_song_norm(artist): score+=12000
+            elif qn and qn in _song_norm(artist): score+=6000
+            if qn==_song_norm(title): score+=5000
+            webpage=f"https://www.youtube.com/watch?v={vid}"
+            out.append({"id":vid,"title":title,"artist":artist,"duration":duration,
+                        "album":album,"cover":item.get("thumbnail") or _youtube_artwork_url(vid),
+                        "download":webpage,"download_allowed":True,"license":"",
+                        "source":"youtube","webpage_url":webpage,"_score":score})
+            seen.add(vid)
+        out.sort(key=lambda x:x.get("_score",0),reverse=True)
+        for x in out: x.pop("_score",None)
+        return out[:want]
+    except Exception as e:
+        print("YouTube Music ytmsearch fallback failed:",repr(e))
+        return []
+
+def _youtube_song_search(query, limit=30):
+    """High-recall music search: direct Music HTML -> native ytmsearch -> YouTube music-filter fallback."""
+    want=max(10,min(30,int(limit)))
+    rows=_youtube_music_http_search(query,want)
+    # The first path is the fastest. If it cannot produce a full page, use the
+    # native ytmsearch Songs section rather than accepting random normal videos.
+    if len(rows)>=want:
+        return rows[:want]
+    ytm=_youtube_music_ytmsearch(query,want)
+    merged=[]; seen=set()
+    for x in rows+ytm:
+        vid=str(x.get("id") or "")
+        if not vid or vid in seen: continue
+        seen.add(vid); merged.append(x)
+    if len(merged)>=want:
+        return merged[:want]
+    # Last-resort public YouTube search. Apply the strict music filter so news,
+    # speeches and ordinary non-music videos are not presented as songs.
+    try:
+        opts={"quiet":True,"no_warnings":True,"extract_flat":"in_playlist",
+              "playlistend":max(30,want),"socket_timeout":5,"retries":1,
+              "fragment_retries":1,"extractor_retries":1,"cachedir":False}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info=ydl.extract_info(f"ytsearch{max(30,want)}:{query} official song music",download=False) or {}
+        candidates=[]
+        for item in info.get("entries") or []:
+            if not isinstance(item,dict): continue
+            vid=str(item.get("id") or "")
+            if not vid or vid in seen: continue
+            title=_music_clean_text(item.get("title") or item.get("track") or item.get("fulltitle"))
+            channel=_music_clean_text(item.get("artist") or item.get("channel") or item.get("uploader") or item.get("creator"))
+            artist=_song_parse_artists(title,channel) or channel
+            duration=_parse_duration_value(item.get("duration")) or _parse_duration_value(item.get("duration_string"))
+            album=_music_clean_text(item.get("album") or "")
+            if not title or duration<=0 or not _youtube_song_is_music(title,artist,duration,item): continue
+            if not _song_is_relevant(query,title,artist,album): continue
+            score=_song_similarity(query,title,artist,album)
+            qn=_song_norm(query)
+            if qn==_song_norm(artist): score+=12000
+            elif qn and qn in _song_norm(artist): score+=6000
+            candidates.append({"id":vid,"title":title,"artist":artist,"duration":duration,
+                               "album":album,"cover":item.get("thumbnail") or _youtube_artwork_url(vid),
+                               "download":item.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}",
+                               "download_allowed":True,"license":"","source":"youtube",
+                               "webpage_url":item.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}","_score":score})
+        candidates.sort(key=lambda x:x.get("_score",0),reverse=True)
+        for x in candidates:
+            x.pop("_score",None); merged.append(x); seen.add(str(x.get("id")))
+            if len(merged)>=want: break
+    except Exception as e:
+        print("YouTube song public fallback failed:",repr(e))
+    return merged[:want]
+
+def _rapidapi_youtube_song_search(query, limit=30):
+    """Search YouTube music through the configured RapidAPI YouTube Media Downloader.
+
+    This is the primary Search Song engine. It avoids Jamendo and avoids yt-dlp's
+    search extractor, which can be blocked by YouTube anti-bot checks. The API's
+    /v2/search/videos endpoint returns searchable YouTube video metadata; we keep
+    only music-like results, require a real duration, and rank exact artist/title
+    matches first.
+    """
+    if not RAPIDAPI_YT_KEY:
+        print("RapidAPI song search skipped: RAPIDAPI_YT_KEY is missing")
+        return []
+    query=_music_clean_text(query)
+    if not query: return []
+    want=max(10,min(30,int(limit)))
+    headers={
+        "x-rapidapi-key":RAPIDAPI_YT_KEY,
+        "x-rapidapi-host":RAPIDAPI_YT_HOST,
+        "Accept":"application/json",
+        "User-Agent":"Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36",
+    }
+    params={"keyword":query,"lang":"en-US","sortBy":"relevance","duration":"all"}
+    try:
+        r=requests.get(RAPIDAPI_YT_SEARCH_URL,params=params,headers=headers,timeout=min(8,max(3,int(RAPIDAPI_TIMEOUT))))
+        if r.status_code in (401,403):
+            print("RapidAPI song search authentication/subscription failed:",r.text[:300]); return []
+        if r.status_code==429:
+            print("RapidAPI song search rate limited"); return []
+        r.raise_for_status()
+        body=r.json() or {}
+    except Exception as e:
+        print("RapidAPI song search failed:",repr(e)); return []
+
+    qn=_song_norm(query)
+    rows=[]; seen=set()
+
+    def get_id(d):
+        for k in ("videoId","videoID","id"):
+            v=d.get(k)
+            if isinstance(v,dict): v=v.get("videoId") or v.get("id")
+            if isinstance(v,str) and re.fullmatch(r"[A-Za-z0-9_-]{11}",v): return v
+        for k in ("url","link","webpageUrl","webpage_url"):
+            v=d.get(k)
+            if isinstance(v,str):
+                vid=_extract_youtube_video_id(v)
+                if vid: return vid
+        return ""
+
+    def text_value(d, keys):
+        for k in keys:
+            v=d.get(k)
+            if isinstance(v,str) and v.strip(): return _music_clean_text(v)
+            if isinstance(v,dict):
+                for kk in ("text","name","title","label"):
+                    vv=v.get(kk)
+                    if isinstance(vv,str) and vv.strip(): return _music_clean_text(vv)
+        return ""
+
+    def duration_value(d):
+        keys=("duration","durationSeconds","duration_seconds","lengthSeconds","length_seconds","length","durationText","duration_text","durationString","duration_string","lengthText","length_text","lengthString","length_string")
+        def walk(v,depth=0):
+            if depth>4 or v is None: return 0
+            x=_parse_duration_value(v)
+            if x>0: return x
+            if isinstance(v,(int,float)) and 0<v<172800: return int(v)
+            if isinstance(v,dict):
+                for k in ("simpleText","text","label","runs","value","seconds"):
+                    if k in v:
+                        z=walk(v.get(k),depth+1)
+                        if z>0: return z
+            if isinstance(v,list):
+                for z0 in v:
+                    z=walk(z0,depth+1)
+                    if z>0: return z
+            return 0
+        for k in keys:
+            x=walk(d.get(k))
+            if x>0: return x
+        # Last resort: inspect nested metadata dictionaries from RapidAPI.
+        def scan(obj,depth=0):
+            if depth>3: return 0
+            if isinstance(obj,dict):
+                for k,v in obj.items():
+                    if any(mark in str(k).lower() for mark in ("duration","length")):
+                        z=walk(v,depth+1)
+                        if z>0: return z
+                    z=scan(v,depth+1)
+                    if z>0: return z
+            elif isinstance(obj,list):
+                for v in obj:
+                    z=scan(v,depth+1)
+                    if z>0: return z
+            return 0
+        return scan(d)
+
+    def visit(obj):
+        if isinstance(obj,dict):
+            vid=get_id(obj)
+            if vid and vid not in seen:
+                title=text_value(obj,("title","name","videoTitle","track"))
+                channel=text_value(obj,("channelTitle","channelName","channel","uploader","author","owner","artist","creator"))
+                artist=text_value(obj,("artist","artists","artistName"))
+                # Channel/title are fallback metadata only. Never display Unknown artist.
+                if not artist: artist=_song_parse_artists(title,channel) or channel
+                duration=duration_value(obj)
+                if title and duration>0 and _youtube_song_is_music(title,artist,duration,obj):
+                    # Strong relevance rules: exact phrase in artist/title wins; otherwise
+                    # require all meaningful query words, preventing Central-only/Cee-only noise.
+                    if not _song_is_relevant(query,title,artist,"") and qn not in _song_norm(title) and qn not in _song_norm(artist):
+                        return
+                    score=_song_similarity(query,title,artist,"")
+                    if qn==_song_norm(artist): score+=20000
+                    elif qn and qn in _song_norm(artist): score+=10000
+                    if qn==_song_norm(title): score+=8000
+                    # Official music-video/audio titles are useful but do not outrank
+                    # an exact artist/title match merely because they contain a keyword.
+                    low=_song_norm(title)
+                    if any(x in low for x in ("official music","official audio","music video","audio")): score+=500
+                    webpage=f"https://www.youtube.com/watch?v={vid}"
+                    cover=text_value(obj,("thumbnail","thumbnailUrl","thumbnailUrlHigh","thumbnailUrlMedium")) or _youtube_artwork_url(vid)
+                    rows.append({"id":vid,"title":title,"artist":artist,"channel":channel,"duration":duration,
+                                 "album":"","cover":cover,
+                                 "download":webpage,"download_allowed":True,"license":"",
+                                 "source":"youtube","webpage_url":webpage,"_score":score})
+                    seen.add(vid)
+            for v in obj.values(): visit(v)
+        elif isinstance(obj,list):
+            for v in obj: visit(v)
+
+    visit(body)
+    rows.sort(key=lambda x:x.get("_score",0),reverse=True)
+    for x in rows: x.pop("_score",None)
+    return rows[:want]
+
+
+def _song_search_all(query, limit=30):
+    """High-recall YouTube music search with parallel fast providers.
+
+    RapidAPI remains the preferred provider for modern/current songs, while the
+    YouTube Music HTML and yt-dlp Music search paths run as fallbacks in parallel
+    so a slow provider does not hold the whole Search Song flow hostage.
+    """
+    want=max(10,min(30,int(limit))); query=_music_clean_text(query)
+    if not query: return []
+    jobs=[]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        if RAPIDAPI_YT_KEY:
+            jobs.append(pool.submit(_rapidapi_youtube_song_search,query,want))
+        jobs.append(pool.submit(_youtube_music_http_search,query,want))
+        jobs.append(pool.submit(_youtube_music_ytmsearch,query,want))
+        results=[]
+        for fut in jobs:
+            try: results.extend(fut.result(timeout=9) or [])
+            except Exception as e: print("Parallel song provider failed:",repr(e))
+    merged=[]; seen=set()
+    for x in results:
+        if not isinstance(x,dict): continue
+        key=str(x.get("id") or x.get("download") or "")
+        if not key or key in seen: continue
+        title=_music_clean_text(x.get("title")); dur=_parse_duration_value(x.get("duration"))
+        if not title or dur<=0 or not _youtube_song_is_music(title,x.get("artist") or "",dur,x): continue
+        # Keep fuzzy relevance, but for multi-word artist searches require the
+        # complete query phrase/artist or a close typo match rather than Central/Cee alone.
+        if not _song_is_relevant(query,title,x.get("artist") or "",x.get("album") or ""):
+            continue
+        x=dict(x); x["title"]=title; x["duration"]=dur; x["download_allowed"]=True; x.setdefault("source","youtube")
+        x["_score"]=_song_similarity(query,title,x.get("artist") or "",x.get("album") or "")
+        qn=_song_norm(query); an=_song_norm(x.get("artist") or ""); tn=_song_norm(title)
+        if qn==an: x["_score"]+=20000
+        elif qn and qn in an: x["_score"]+=10000
+        if qn==tn: x["_score"]+=12000
+        seen.add(key); merged.append(x)
+    # If the query exactly names an artist and we have artist-labelled rows,
+    # keep only that artist (including collaborations). This prevents a search
+    # such as "Central Cee" from returning videos merely mentioning Central/Cee.
+    qn=_song_norm(query)
+    qwords=qn.split()
+    if len(qwords)>=2:
+        artist_rows=[x for x in merged if qn==_song_norm(x.get("artist") or "") or qn in _song_norm(x.get("artist") or "")]
+        if artist_rows:
+            merged=artist_rows
+
+    # If the parallel paths returned too few results, make one broader public
+    # YouTube search as a last resort. This is deliberately after the fast paths.
+    if len(merged)<want:
+        try:
+            extra=_youtube_song_search(query,want)
+            for x in extra:
+                key=str(x.get("id") or x.get("download") or "")
+                if not key or key in seen: continue
+                if _parse_duration_value(x.get("duration"))<=0: continue
+                if not _song_is_relevant(query,x.get("title",""),x.get("artist",""),x.get("album","")): continue
+                x=dict(x); x["_score"]=_song_similarity(query,x.get("title",""),x.get("artist",""),x.get("album","")); seen.add(key); merged.append(x)
+                if len(merged)>=want: break
+        except Exception as e: print("Last-resort song search failed:",repr(e))
+    if len(qwords)>=2:
+        artist_rows=[x for x in merged if qn==_song_norm(x.get("artist") or "") or qn in _song_norm(x.get("artist") or "")]
+        if artist_rows: merged=artist_rows
+    merged.sort(key=lambda x:x.get("_score",0),reverse=True)
+    for x in merged: x.pop("_score",None)
+    return merged[:want]
+
+def _main_bot_username():
+    global _MAIN_BOT_USERNAME_CACHE
+    value=str(_MAIN_BOT_USERNAME_CACHE or "").strip().lstrip("@")
+    if value: return value
+    try:
+        me=bot.get_me(); value=str(getattr(me,"username","") or "").strip().lstrip("@")
+        if value: _MAIN_BOT_USERNAME_CACHE=value; return value
+    except Exception as e: print("Main bot get_me error:",repr(e))
+    return "bot"
+
+def _song_audio_metadata(song):
+    """Return clean Telegram audio metadata: title only in title, artist in performer."""
+    song=song or {}
+    raw_title=_music_clean_text(song.get("audio_title") or song.get("title") or "")
+    raw_artist=_music_clean_text(song.get("audio_artist") or song.get("artist") or song.get("artist_name") or "")
+    if not raw_artist or _song_norm(raw_artist) in {"unknown","unknown artist","youtube","youtube music"}:
+        raw_artist=_music_clean_text(song.get("channel") or song.get("channel_name") or song.get("uploader") or song.get("creator") or "")
+    # Common YouTube music format: ARTIST - TITLE (Music Video).
+    m=re.match(r"^(.{1,140}?)\s+[-–—]\s+(.+)$",raw_title)
+    if m:
+        left=_music_clean_text(m.group(1)); right=_music_clean_text(m.group(2))
+        artist_parts=[_music_clean_text(x).strip(" -–—") for x in re.split(r"\s+(?:x|&|ft\.?|feat\.?|featuring)\s+",left,flags=re.I) if _music_clean_text(x).strip(" -–—")]
+        parsed_left=" & ".join(artist_parts)
+        if parsed_left:
+            if not raw_artist or _song_norm(raw_artist) in {"youtube","unknown","unknown artist"}: raw_artist=parsed_left
+            raw_title=right
+    # Clean presentation suffixes from the actual Telegram title.
+    raw_title=re.sub(r"\s*(?:\[|\()\s*(?:official\s+)?(?:music\s+video|official\s+video|official\s+audio|audio|lyrics?|lyric\s+video|visualizer|video)\s*(?:\]|\))", "", raw_title, flags=re.I)
+    raw_title=re.sub(r"\s+", " ", raw_title).strip(" -–—[]()")
+    # Featured artist belongs in performer, not in the song title.
+    fm=re.search(r"\b(?:ft\.?|feat\.?|featuring)\s+(.+)$",raw_title,flags=re.I)
+    if fm:
+        featured=_music_clean_text(fm.group(1)).strip(" -–—[]()")
+        if featured:
+            raw_title=_music_clean_text(raw_title[:fm.start()]).strip(" -–—[]()")
+            existing=[x.strip() for x in re.split(r"\s*&\s*",raw_artist) if x.strip()]
+            if _song_norm(featured) not in {_song_norm(x) for x in existing}: raw_artist=(raw_artist+" & " if raw_artist else "")+featured
+    if _song_norm(raw_artist) in {"unknown","unknown artist","youtube","youtube music"}: raw_artist=""
+    if not raw_artist:
+        parsed=_song_parse_artists(raw_title, "")
+        if parsed: raw_artist=parsed
+    return raw_title or _music_clean_text(song.get("title")) or "Unknown title", raw_artist or "Unknown artist"
+
+def _default_song_caption(song):
+    title,artist=_song_audio_metadata(song)
+    return f"🎤 <b>{html.escape(artist)}</b>\n🎵 <b>{html.escape(title)}</b>\n\n@{html.escape(_main_bot_username())}"
+
+def _song_caption(song):
+    return f"Downloaded Via\n@{html.escape(_main_bot_username())}"
+
+def _song_auto_search_should_handle(m):
+    if not m or not getattr(m,"text",None): return False
+    text=str(m.text).strip()
+    # Auto search is ON by default whenever the song system is open. The admin
+    # OFF button stores False and therefore disables it explicitly.
+    if not text or text.startswith("/") or not _song_search_is_open() or not bool(get_setting("song_auto_search_enabled",True)): return False
+    # A URL is always a download request, never a song-search query. This also
+    # handles prose around a link, e.g. "Look at this video... 👀https://pin.it/...".
+    if extract_url(text): return False
+    # Never interpret text belonging to an active withdrawal/verification/payment flow as a song.
+    u=users.get(str(m.from_user.id),{})
+    if u.get("withdraw_flow") or u.get("temp_addr") or u.get("pending_conversion") or u.get("pending_ref"):
+        return False
+    excluded={
+        "💰 BALANCE","💸 WITHDRAWAL","👥 REFERRAL","🆔 GET ID","💎 PREMIUM","👤 Profile",
+        "☎️ CUSTOMER","🤖CUSTOMER AI","🔎 Search Song","👑 ADMIN PANEL","❌ CANCEL","📜 HISTORY",
+        "USDT-BEP20","USDT-TRC20","USDT-ERC20","CANCEL","Cancel","❌ Cancel","🔙 BACK",
+        "⬅️ BACK","🏠 MAIN MENU","💳 CONFIRM","✅ CONFIRM","🔐 VERIFY ACCOUNT","💎 OPEN PREMIUM",
+        "🎵 MUSIC","📤 Share","➕ Add Group","➕ Add Channel"
+    }
+    try: excluded.update(str(x) for x in _ACTIONS.keys() if x)
+    except Exception: pass
+    excluded.update({
+        "USDT-BEP20","USDT-TRC20","USDT-ERC20","TRX","BEP20","ERC20",
+        "❌ CANCEL","❌ Cancel","CANCEL","Cancel","BACK","⬅️ BACK","🔙 BACK",
+        "NEXT","PREVIOUS","➡️ NEXT","⬅️ PREVIOUS","⏮️ BACK","⏭️ NEXT"
+    })
+    try:
+        for d in MAIN_LABELS.values(): excluded.update(str(x) for x in d.values() if x)
+    except Exception: pass
+    return text not in excluded
+
+def _record_song_download(uid, song, file_bytes=None):
+    """Store aggregate stats and a small per-user event record."""
+    now=datetime.now(timezone.utc)
+    try:
+        song_stats_col.update_one(
+            {"_id":str(song.get("id"))},
+            {"$setOnInsert":{"title":song.get("title"),"artist":song.get("artist"),"album":song.get("album"),"source":song.get("source","jamendo")},
+             "$inc":{"downloads":1}, "$set":{"last_download":now}}, upsert=True)
+        activity_col.insert_one({"user_id":str(uid),"action":"song_download",
+            "details":{"song_id":str(song.get("id")),"title":song.get("title"),"artist":song.get("artist"),"source":song.get("source","jamendo")},"time":now})
+    except Exception as e: print("Song stats error:",repr(e))
+
+def _song_stats_text():
+    try:
+        total=int(song_stats_col.aggregate([{"$group":{"_id":None,"n":{"$sum":"$downloads"}}}]).next().get("n",0)) if song_stats_col.count_documents({}) else 0
+        unique=int(song_stats_col.count_documents({}))
+        top=list(song_stats_col.find().sort("downloads",-1).limit(10))
+        lines=["🎵 <b>SONG STATISTICS</b>","",f"⬇️ Total full-track downloads: <b>{total}</b>",f"🎼 Different tracks downloaded: <b>{unique}</b>",""]
+        if top:
+            lines.append("🏆 <b>TOP SONGS</b>")
+            for i,x in enumerate(top,1): lines.append(f"{i}. {html.escape(str(x.get('title','Unknown')))} — {html.escape(str(x.get('artist','Unknown artist')))}: <b>{int(x.get('downloads',0))}</b>")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Could not load song statistics: {html.escape(str(e)[:300])}"
+
+def _top_song_searchers_text(limit=100):
+    try:
+        pipeline=[{"$match":{"action":"song_download"}},{"$group":{"_id":"$user_id","downloads":{"$sum":1}}},{"$sort":{"downloads":-1,"_id":1}},{"$limit":int(limit)}]
+        rows=list(activity_col.aggregate(pipeline))
+        lines=["🏆 <b>TOP SONG SEARCHERS</b>","",f"Top <b>{len(rows)}</b> users by completed song downloads.",""]
+        if not rows:
+            lines.append("No song downloads recorded yet."); return "\n".join(lines)
+        for i,row in enumerate(rows,1):
+            uid=str(row.get("_id") or ""); u=users.get(uid,{}) or {}; username=str(u.get("username") or "").strip()
+            label=f"@{username}" if username else str(u.get("first_name") or "User")
+            lines.append(f"<b>{i}.</b> {html.escape(label)} — ID: <code>{html.escape(uid)}</code> — 🎵 <b>{int(row.get('downloads',0))}</b>")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Could not load top song searchers: {html.escape(str(e)[:300])}"
+
+def _user_has_connected_group(uid):
+    uid=str(uid)
+    for d in _destinations():
+        if str(d.get("type")) not in {"group","supergroup"}: continue
+        if str(d.get("added_by") or "") == uid:
+            return True
+    return False
+
+def _song_group_gate_markup():
+    kb=InlineKeyboardMarkup()
+    url=_bot_destination_url("group")
+    if url:
+        kb.add(InlineKeyboardButton("➕ Add Group",url=url))
+    else:
+        kb.add(InlineKeyboardButton("➕ Add Group",callback_data="songaddgroup"))
+    return kb
+
+def _song_group_gate_text(query):
+    q=html.escape(str(query or ""))
+    return (
+        f"🔍 <b>{q}</b>\n\n"
+        "👥 <b>Group access is required</b>\n\n"
+        "You can only use Search Song after you add this bot to a group and make it an <b>administrator</b>.\n\n"
+        "Tap <b>➕ Add Group</b>, choose your group, and give the bot admin access. "
+        "Your search is already saved — after the group is connected, your songs will appear automatically."
+    )
+
+def _song_maybe_require_group(chat_id, uid, token, query):
+    if not bool(get_setting("add_group_enabled", True)):
+        return False
+    if _user_has_connected_group(uid):
+        return False
+    song_group_gate_pending[str(uid)]={"token":token,"query":query,"created":time.time()}
+    bot.send_message(chat_id,_song_group_gate_text(query),parse_mode="HTML",reply_markup=_song_group_gate_markup())
+    return True
+
+def _cleanup_song_search():
+    now=time.time()
+    for token,data in list(song_search_pending.items()):
+        if now-data.get("created",now)>SONG_SEARCH_TTL:
+            song_search_pending.pop(token,None)
+
+def _song_results_markup(token, page, total):
+    # Match the requested clean layout: 1-5 on the first row, 6-10 on the
+    # second row, then navigation.
+    kb=InlineKeyboardMarkup(row_width=5)
+    start=page*SONG_SEARCH_PAGE_SIZE
+    end=min(start+SONG_SEARCH_PAGE_SIZE,total)
+    data=song_search_pending.get(token,{})
+    rows=data.get("results",[])
+    buttons=[]
+    for i in range(start,end):
+        x=rows[i]
+        label=f"{i+1}"
+        buttons.append(InlineKeyboardButton(label,callback_data=f"songpick:{token}:{i}"))
+    for i in range(0,len(buttons),5):
+        kb.row(*buttons[i:i+5])
+    last_page=max(0,(total-1)//SONG_SEARCH_PAGE_SIZE)
+    nav=[
+        InlineKeyboardButton("⬅️",callback_data=f"songpage:{token}:{max(0,page-1)}"),
+        InlineKeyboardButton("❌",callback_data=f"songcancel:{token}"),
+        InlineKeyboardButton("➡️",callback_data=f"songpage:{token}:{min(last_page,page+1)}"),
+    ]
+    kb.row(*nav)
+    return kb
+
+def _send_song_results(chat_id, token, page=0, edit_message=None):
+    data=song_search_pending.get(token)
+    if not data: return
+    rows=data.get("results",[]); total=len(rows)
+    start=page*SONG_SEARCH_PAGE_SIZE; end=min(start+SONG_SEARCH_PAGE_SIZE,total)
+    query=html.escape(data.get("query","") or "")
+    lines=[f"🔍 <b>{query}</b>",""]
+    visible=0
+    for i in range(start,end):
+        x=rows[i]
+        title=_music_clean_text(x.get("title")) or ""
+        artist=_music_clean_text(x.get("artist")) or ""
+        duration_seconds=_parse_duration_value(x.get("duration"))
+        if not title: continue
+        if duration_seconds<=0:
+            # Never show 0:00. The search engine filters these out, but a provider
+            # can omit duration in one result; skip it rather than displaying fake time.
+            continue
+        # Search list intentionally shows the song title and duration only.
+        # Collaboration artists remain in the original title when YouTube supplies them.
+        lines.append(f"<b>{i+1}.</b> {html.escape(title)} {_song_duration(duration_seconds)}")
+        visible+=1
+    if not visible:
+        lines.append("❌ No complete music results were found. Try another title or artist.")
+    text="\n".join(lines)
+    kb=_song_results_markup(token,page,total) if total else InlineKeyboardMarkup().add(InlineKeyboardButton("❌",callback_data=f"songcancel:{token}"))
+    if edit_message:
+        try:
+            bot.edit_message_text(text,edit_message.chat.id,edit_message.message_id,parse_mode="HTML",reply_markup=kb)
+            return
+        except Exception as e:
+            print("Song results edit failed:",repr(e))
+    bot.send_message(chat_id,text,parse_mode="HTML",reply_markup=kb)
+
+@bot.message_handler(func=lambda m: m.text == "🔎 Search Song")
+def search_song_button(m):
+    if bot_locked_guard(m) or banned_guard(m): return
+    if not _song_search_is_open():
+        bot.send_message(m.chat.id,_song_search_closed_message(),reply_markup=localized_user_menu(str(m.from_user.id)))
+        return
+    msg=bot.send_message(m.chat.id,"🔎 <b>Search Song</b>\n\nWrite the song name, part of the name, or an artist name:",parse_mode="HTML")
+    bot.register_next_step_handler(msg,search_song_query_step)
+
+def search_song_query_step(m):
+    uid=str(m.from_user.id)
+    if not _song_search_is_open():
+        bot.send_message(m.chat.id,_song_search_closed_message()); return
+    query=_music_clean_text(m.text)
+    direct_url=extract_url(query)
+    if direct_url and detect_platform(direct_url) != "unknown":
+        handle_links(m)
+        return
+    if not query:
+        msg=bot.send_message(m.chat.id,"❌ Please enter a song or artist name.")
+        bot.register_next_step_handler(msg,search_song_query_step); return
+    def _job():
+        try:
+            rows=_song_search_all(query,30)
+            _cleanup_song_search()
+            token=uuid.uuid4().hex[:16]
+            song_search_pending[token]={"uid":uid,"query":query,"results":rows,"created":time.time()}
+            if not rows:
+                bot.send_message(m.chat.id,"❌ No songs found. Try another title or artist.",reply_markup=localized_user_menu(uid)); return
+            try:
+                if _song_maybe_require_group(m.chat.id,uid,token,query): return
+            except Exception as e:
+                print("Song group gate error:",repr(e))
+            _send_song_results(m.chat.id,token,0)
+        except Exception as e:
+            print("Manual song search error:",repr(e))
+            try: bot.send_message(m.chat.id,"❌ Song search failed. Please try another title or artist.")
+            except Exception: pass
+    download_executor_for(uid).submit(_job)
+
+@bot.message_handler(func=_song_auto_search_should_handle)
+def auto_song_search_handler(m):
+    if bot_locked_guard(m) or banned_guard(m): return
+    query=_music_clean_text(m.text)
+    if not query or len(query)<2: return
+    def _song_job():
+        try:
+            rows=_song_search_all(query,30)
+            _cleanup_song_search(); token=uuid.uuid4().hex[:16]
+            song_search_pending[token]={"uid":str(m.from_user.id),"query":query,"results":rows,"created":time.time()}
+            if not rows:
+                bot.send_message(m.chat.id,"❌ No songs found. Try another title or artist.",reply_markup=localized_user_menu(str(m.from_user.id)))
+                return
+            try:
+                if _song_maybe_require_group(m.chat.id,str(m.from_user.id),token,query):
+                    return
+            except Exception as e:
+                print("Auto song group gate error:",repr(e))
+            _send_song_results(m.chat.id,token,0)
+        except Exception as e:
+            print("Auto song search error:",repr(e))
+            try: bot.send_message(m.chat.id,"❌ Song search failed. Please try again.")
+            except Exception: pass
+    ThreadPoolExecutor(max_workers=1).submit(_song_job)
+
+@bot.callback_query_handler(func=lambda c: c.data == "songaddgroup")
+def song_add_group_inline(call):
+    uid=str(call.from_user.id)
+    if not bool(get_setting("add_group_enabled",True)):
+        bot.answer_callback_query(call.id,"Add Group is currently optional.",show_alert=True); return
+    pending=song_group_gate_pending.get(uid)
+    if not pending:
+        bot.answer_callback_query(call.id,"Search session expired. Please search again.",show_alert=True); return
+    bot.answer_callback_query(call.id)
+    try:
+        prompt,kb=_destination_request_keyboard(uid,"group")
+        bot.send_message(uid,prompt,reply_markup=kb,parse_mode="HTML")
+    except Exception as e:
+        print("Song Add Group picker error:",repr(e))
+        bot.send_message(uid,"❌ Could not open the group picker. Please try again.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("songpage:"))
+def song_page_callback(call):
+    parts=call.data.split(":")
+    if len(parts)!=3: return
+    token=parts[1]
+    try: page=int(parts[2])
+    except Exception: return
+    _cleanup_song_search(); data=song_search_pending.get(token)
+    if not data or str(data.get("uid"))!=str(call.from_user.id):
+        bot.answer_callback_query(call.id,"❌ Search session expired.",show_alert=True); return
+    bot.answer_callback_query(call.id)
+    # Navigation must edit the existing result message; never send a second
+    # message just because the user pressed Next/Back.
+    _send_song_results(call.message.chat.id,token,page,edit_message=call.message)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("songpick:"))
+def song_pick_callback(call):
+    parts=call.data.split(":")
+    if len(parts)!=3: return
+    token=parts[1]
+    try: idx=int(parts[2])
+    except Exception: return
+    _cleanup_song_search(); data=song_search_pending.get(token)
+    if not data or str(data.get("uid"))!=str(call.from_user.id):
+        bot.answer_callback_query(call.id,"❌ Search session expired.",show_alert=True); return
+    rows=data.get("results",[])
+    if idx<0 or idx>=len(rows):
+        bot.answer_callback_query(call.id,"❌ Song no longer available.",show_alert=True); return
+    x=rows[idx]
+    if not x.get("download_allowed") or not x.get("download"):
+        bot.answer_callback_query(call.id,"❌ Full download is not allowed for this track.",show_alert=True); return
+    if str(x.get("source")) == "youtube":
+        song_uid=str(call.from_user.id); song_url=str(x.get("download") or "")
+        song_priority=is_admin(song_uid) or is_quick_access(song_uid) or is_premium(song_uid) or _is_trial_active(song_uid)
+        if premium_required_for_platform("youtube",song_uid,song_url) and not song_priority and not users.get(song_uid,{}).get("youtube_30m",False):
+            bot.answer_callback_query(call.id,"💎 Premium/Trial is required for full YouTube songs.",show_alert=True)
+            return
+    bot.answer_callback_query(call.id,"⬇️ Downloading full song...")
+    status=bot.send_message(call.message.chat.id,"⏳ Downloading the full track...")
+    if str(x.get("source")) == "youtube":
+        def _download_youtube_song_job(chat_id,status_id,song,uid):
+            tmp=None
+            try:
+                vid=str(song.get("id") or _extract_youtube_video_id(song.get("download") or "") or "")
+                rapid=None
+                if RAPIDAPI_YT_KEY and vid:
+                    try:
+                        rapid=_rapidapi_youtube_details(vid)
+                        formats=_rapid_formats(rapid)
+                        audios=[z for z in formats if z.get("audio") and not z.get("video")]
+                        videos=[z for z in formats if z.get("video")]
+                        source_url=(audios[0].get("url") if audios else (videos[0].get("url") if videos else None))
+                        if source_url:
+                            tmp=os.path.join("downloads","song_"+uuid.uuid4().hex); os.makedirs(tmp,exist_ok=True)
+                            raw=os.path.join(tmp,"source_media")
+                            _rapid_download_file(source_url,raw,max_bytes=0)
+                            out=os.path.join(tmp,_music_safe_filename(song.get("title") or "song",song.get("artist") or "")+".mp3")
+                            _ffmpeg_convert_to_mp3(raw,out,bitrate="192k",timeout=300)
+                            if os.path.isfile(out):
+                                audio_title,audio_artist=_song_audio_metadata(song)
+                                catalog=_music_deezer_lookup(audio_title,audio_artist) or _music_itunes_lookup(audio_title,audio_artist)
+                                if catalog.get("title"): audio_title=_music_clean_text(catalog.get("title"))
+                                if catalog.get("artist"): audio_artist=_music_clean_text(catalog.get("artist"))
+                                if catalog.get("album") and not song.get("album"): song={**song,"album":catalog.get("album")}
+                                cover_path=_best_song_cover(song,audio_title,audio_artist,tmp,vid)
+                                _embed_music_metadata(out,audio_title,audio_artist,cover_path=cover_path,album=song.get("album"))
+                                bot.edit_message_text("🎵 <b>Sending music...</b>",chat_id,status_id,parse_mode="HTML")
+                                with open(out,"rb") as fh:
+                                    kwargs={"title":audio_title,"performer":audio_artist,"duration":int(song.get("duration") or 0),"caption":_song_caption(song),"parse_mode":"HTML"}
+                                    if cover_path and os.path.isfile(cover_path): kwargs["thumb"]=cover_path
+                                    try:
+                                        bot.send_audio(chat_id,fh,**kwargs)
+                                    except Exception:
+                                        kwargs.pop("thumb",None); fh.seek(0); bot.send_audio(chat_id,fh,**kwargs)
+                                _record_song_download(uid,{**song,"audio_title":audio_title,"audio_artist":audio_artist})
+                                return
+                    except Exception as e:
+                        print("RapidAPI song audio failed; falling back to yt-dlp:",repr(e))
+                convert_link_to_mp3(chat_id,song.get("download"),status_id,source_title=str(song.get("title") or ""),source_artist=str(song.get("artist") or ""))
+            except Exception as e:
+                print("YouTube song job failed:",repr(e))
+                try: bot.edit_message_text("❌ Music download failed. Please try again.",chat_id,status_id)
+                except Exception: pass
+            finally:
+                if tmp: shutil.rmtree(tmp,ignore_errors=True)
+        download_executor_for(call.from_user.id).submit(_download_youtube_song_job,call.message.chat.id,status.message_id,x,str(call.from_user.id))
+    else:
+        # Kept only for backward-compatible saved sessions. New searches are YouTube-first.
+        download_executor_for(call.from_user.id).submit(_download_jamendo_song,call.message.chat.id,status.message_id,x,str(call.from_user.id))
+
+def _download_jamendo_song(chat_id,status_id,song,uid):
+    tmp=None
+    try:
+        title,artist=_song_audio_metadata(song); url=song.get("download")
+        if not url or not song.get("download_allowed"): raise RuntimeError("Track is not downloadable")
+        bot.edit_message_text("⏳ <b>Downloading music...</b>",chat_id,status_id,parse_mode="HTML")
+        r=requests.get(url,headers={"User-Agent":"Downloadvedioytibot/1.0"},timeout=60,stream=True); r.raise_for_status()
+        tmp=os.path.join("downloads","jamendo_"+uuid.uuid4().hex); os.makedirs(tmp,exist_ok=True); path=os.path.join(tmp,_music_safe_filename(title,artist))
+        with open(path,"wb") as f:
+            for chunk in r.iter_content(1024*256):
+                if chunk: f.write(chunk)
+        cover=_music_download_image(song["cover"],tmp,"cover.jpg") if song.get("cover") else None
+        _embed_music_metadata(path,title,artist,cover_path=cover,album=song.get("album"))
+        bot.edit_message_text("🎵 <b>Sending music...</b>",chat_id,status_id,parse_mode="HTML")
+        kwargs={"caption":_song_caption(song),"parse_mode":"HTML","title":title,"performer":artist,"duration":int(song.get("duration") or 0)}
+        upload_stop=threading.Event(); start_action_heartbeat(chat_id,"upload_audio",upload_stop)
+        try:
+            with open(path,"rb") as audio:
+                if cover and os.path.isfile(cover): kwargs["thumb"]=cover
+                try: bot.send_audio(chat_id,audio,**kwargs)
+                except Exception:
+                    kwargs.pop("thumb",None); audio.seek(0); bot.send_audio(chat_id,audio,**kwargs)
+        finally:
+            upload_stop.set()
+        _record_song_download(uid,song)
+        try: bot.delete_message(chat_id,status_id)
+        except Exception: pass
+    except Exception as e:
+        print("Jamendo download error:",repr(e))
+        try: bot.edit_message_text("❌ Music could not be sent. Please try another track.",chat_id,status_id)
+        except Exception: pass
+    finally:
+        if tmp: shutil.rmtree(tmp,ignore_errors=True)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("songcancel:"))
+def song_cancel_callback(call):
+    token=call.data.split(":",1)[1]
+    data=song_search_pending.get(token,{})
+    if data and str(data.get("uid"))!=str(call.from_user.id):
+        bot.answer_callback_query(call.id,"❌ This search belongs to another user.",show_alert=True); return
+    song_search_pending.pop(token,None)
+    bot.answer_callback_query(call.id,"Search closed")
+    try: bot.delete_message(call.message.chat.id,call.message.message_id)
+    except Exception: pass
+
+# ================= MUSIC / MP3 CONVERTER =================
+def _music_clean_text(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if not value:
+        return ""
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _music_is_original_label(value):
+    value = _music_clean_text(value).lower()
+    if not value:
+        return False
+    return value in {
+        "original", "original sound", "original audio", "original music",
+        "original sound -", "original audio -", "original sound by"
+    } or value.startswith("original sound") or value.startswith("original audio")
+
+
+def _music_source_account_names(info):
+    """Names that belong to the account/video uploader, not necessarily the music artist."""
+    info = info or {}
+    names = set()
+    for key in ("uploader", "uploader_id", "creator", "creator_id", "channel", "channel_id"):
+        value = info.get(key)
+        if isinstance(value, str):
+            value = _music_clean_text(value)
+            if value:
+                names.add(value.casefold().lstrip("@"))
+    return names
+
+
+def _music_artist_from_info(info):
+    """Return explicit music-artist metadata without mistaking a lone uploader for the artist."""
+    info = info or {}
+    account_names = _music_source_account_names(info)
+    candidates = []
+
+    for key in ("artist", "track_artist", "album_artist"):
+        value = _music_clean_text(info.get(key))
+        if value and not _music_is_original_label(value):
+            candidates.append(value)
+
+    artists = info.get("artists")
+    if isinstance(artists, list):
+        names = []
+        for item in artists:
+            if isinstance(item, dict):
+                value = _music_clean_text(item.get("name") or item.get("artist") or item.get("title"))
+            else:
+                value = _music_clean_text(item)
+            if value and not _music_is_original_label(value):
+                names.append(value)
+        if names:
+            candidates.append(", ".join(names))
+
+    for value in candidates:
+        cleaned = _music_normalize_artist_names(value)
+        if not cleaned:
+            continue
+        pieces = [p.strip() for p in cleaned.split(",") if p.strip()]
+        # If the source explicitly identifies multiple music artists, trust that
+        # structured collaboration even when one of them is also the uploader.
+        if len(pieces) > 1:
+            return ", ".join(pieces)
+        # A single name equal to the video account is not enough proof that it is
+        # the music artist. Recognition/streaming metadata can confirm it later.
+        if pieces[0].casefold().lstrip("@") not in account_names:
+            return pieces[0]
+    return ""
+
+def _music_normalize_artist_names(value):
+    value = _music_clean_text(value)
+    if not value:
+        return ""
+    value = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+", ", ", value, flags=re.I)
+    value = re.sub(r"\s+[&+]\s+", ", ", value)
+    parts = [p.strip() for p in re.split(r"\s*[,;|/]\s*", value) if p.strip()]
+    # Remove duplicate names while preserving the official order.
+    seen = set(); out = []
+    for p in parts:
+        key = p.casefold()
+        if key not in seen:
+            seen.add(key); out.append(p)
+    return ", ".join(out)
+
+def _music_title_from_info(info):
+    info = info or {}
+    for key in ("track", "song", "track_name", "title", "fulltitle"):
+        value = _music_clean_text(info.get(key))
+        if value and not _music_is_original_label(value):
+            return value
+    return ""
+
+
+def _music_download_image(url, tmp_dir, filename="cover.jpg"):
+    url = _music_clean_text(url)
+    if not url or not re.match(r"^https?://", url, re.I):
+        return None
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        data = r.content
+        if len(data) < 1000:
+            return None
+        raw = os.path.join(tmp_dir, "raw_" + filename)
+        with open(raw, "wb") as f:
+            f.write(data)
+        try:
+            from PIL import Image
+            img = Image.open(raw).convert("RGB")
+            out = os.path.join(tmp_dir, filename)
+            img.thumbnail((640, 640))
+            img.save(out, "JPEG", quality=92, optimize=True)
+            return out
+        except Exception:
+            return raw
+    except Exception as e:
+        print("Music artwork download failed:", repr(e))
+        return None
+
+
+def _music_musicbrainz_recording_lookup(recording_id):
+    """Resolve an exact MusicBrainz recording returned by AcoustID.
+
+    This is intentionally ID-based rather than title-search-based, so the artist
+    and artwork belong to the fingerprinted recording instead of the uploader.
+    """
+    recording_id = _music_clean_text(recording_id)
+    if not recording_id:
+        return {}
+    try:
+        r = requests.get(
+            f"https://musicbrainz.org/ws/2/recording/{urllib.parse.quote(recording_id, safe='')}",
+            params={"fmt": "json", "inc": "artists+releases"},
+            headers={"User-Agent": "Downloadvedioytibot/1.0 (music metadata)"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        item = r.json() or {}
+
+        title = _music_clean_text(item.get("title"))
+        artists = []
+        for credit in item.get("artist-credit") or []:
+            if isinstance(credit, dict) and isinstance(credit.get("artist"), dict):
+                name = _music_clean_text(credit["artist"].get("name"))
+                if name:
+                    artists.append(name)
+
+        album = ""
+        artwork_candidates = []
+        releases = item.get("releases") or []
+        for release in releases:
+            if not isinstance(release, dict):
+                continue
+            release_title = _music_clean_text(release.get("title"))
+            if release_title and not album:
+                album = release_title
+            release_id = _music_clean_text(release.get("id"))
+            if release_id:
+                # Cover Art Archive is the real release artwork, not a video frame.
+                artwork_candidates.append(
+                    f"https://coverartarchive.org/release/{release_id}/front-500"
+                )
+
+        return {
+            "title": title,
+            "artist": ", ".join(dict.fromkeys(artists)),
+            "album": album,
+            "artwork_candidates": artwork_candidates,
+            "recording_id": recording_id,
+        }
+    except Exception as e:
+        print("Exact MusicBrainz recording lookup failed:", repr(e))
+        return {}
+
+
+def _music_recognize_acoustid(mp3_path):
+    """Identify a full audio file with AcoustID/Chromaprint.
+
+    AcoustID itself supplies the fingerprint match and MusicBrainz IDs.
+    MusicBrainz + Cover Art Archive are then used for exact artist/title/album
+    metadata and genuine release artwork.
+    """
+    if not ACOUSTID_API_KEY or not mp3_path or not os.path.isfile(mp3_path):
+        return {}
+
+    try:
+        import acoustid
+
+        # AcoustID is designed around full audio files.  pyacoustid uses
+        # Chromaprint/fpcalc and limits fingerprint generation to 120 seconds.
+        duration, fingerprint = acoustid.fingerprint_file(mp3_path, maxlength=120)
+
+        response = requests.post(
+            "https://api.acoustid.org/v2/lookup",
+            data={
+                "client": ACOUSTID_API_KEY,
+                "duration": int(round(duration)),
+                "fingerprint": fingerprint,
+                "meta": "recordings+releasegroups+compress",
+                "format": "json",
+            },
+            timeout=ACOUSTID_TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json() if response.content else {}
+        if not isinstance(body, dict) or body.get("status") != "ok":
+            return {}
+
+        results = body.get("results") or []
+        if not results:
+            return {}
+
+        # Prefer the strongest match that actually has a MusicBrainz recording.
+        candidates = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            score = float(result.get("score") or 0)
+            for rec in result.get("recordings") or []:
+                if isinstance(rec, dict) and rec.get("id"):
+                    candidates.append((score, rec))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        for score, rec in candidates:
+            if score < 0.50:
+                continue
+            meta = _music_musicbrainz_recording_lookup(rec.get("id"))
+            if not meta.get("title"):
+                continue
+            return {
+                "title": meta.get("title"),
+                "artist": meta.get("artist"),
+                "album": meta.get("album"),
+                "artwork": (meta.get("artwork_candidates") or [None])[0],
+                "artwork_candidates": meta.get("artwork_candidates") or [],
+                "recording_id": meta.get("recording_id"),
+                "score": score,
+                "source": "acoustid",
+            }
+
+        return {}
+    except Exception as e:
+        # Do not break MP3 conversion if fingerprinting is unavailable.
+        print("AcoustID recognition skipped:", repr(e))
+        return {}
+
+
+def _music_recognize_audd(mp3_path):
+    """Optional audio fingerprinting. Returns title/artist/album/artwork when recognized."""
+    if not AUDD_API_TOKEN or not mp3_path or not os.path.isfile(mp3_path):
+        return {}
+    try:
+        with open(mp3_path, "rb") as audio:
+            r = requests.post(
+                "https://api.audd.io/",
+                data={"api_token": AUDD_API_TOKEN, "return": "apple_music,spotify"},
+                files={"file": (os.path.basename(mp3_path), audio, "audio/mpeg")},
+                timeout=45,
+            )
+        body = r.json() if r.content else {}
+        result = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(result, dict):
+            return {}
+        apple = result.get("apple_music") if isinstance(result.get("apple_music"), dict) else {}
+        artwork = None
+        for source in (apple, result):
+            if not isinstance(source, dict):
+                continue
+            for key in ("artwork", "artworkUrl100", "artworkUrl600", "cover", "cover_url"):
+                candidate = source.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    artwork = candidate.strip()
+                    break
+            if artwork:
+                break
+        artist = _music_clean_text(result.get("artist") or result.get("artist_name"))
+        title = _music_clean_text(result.get("title") or result.get("track"))
+        album = _music_clean_text(result.get("album"))
+        return {"title": title, "artist": artist, "album": album, "artwork": artwork}
+    except Exception as e:
+        print("Audio recognition skipped:", repr(e))
+        return {}
+
+
+def _music_musicbrainz_lookup(title, artist=""):
+    """Use MusicBrainz as a second independent source for real song credits."""
+    title = _music_clean_text(title)
+    artist = _music_clean_text(artist)
+    if not title or _music_is_original_label(title):
+        return {}
+    try:
+        params = {"query": f'recording:"{title}"', "fmt": "json", "limit": 10}
+        if artist and artist.lower() != "unknown artist":
+            params["query"] = f'recording:"{title}" AND artist:"{artist}"'
+        r = requests.get(
+            "https://musicbrainz.org/ws/2/recording",
+            params=params,
+            headers={"User-Agent": "Downloadvedioytibot/1.0 (music metadata)"},
+            timeout=12,
+        )
+        r.raise_for_status()
+        recordings = r.json().get("recordings") or []
+        if not recordings:
+            return {}
+
+        q = title.casefold()
+        wanted_artists = {x.casefold() for x in _music_normalize_artist_names(artist).split(",") if x.strip()}
+        best = None; best_score = -1
+        for item in recordings:
+            name = _music_clean_text(item.get("title"))
+            if not name:
+                continue
+            score = 0
+            nq = name.casefold()
+            if nq == q:
+                score += 20
+            elif q in nq or nq in q:
+                score += 10
+            credits = []
+            for ac in item.get("artist-credit") or []:
+                if isinstance(ac, dict) and isinstance(ac.get("artist"), dict):
+                    nm = _music_clean_text(ac["artist"].get("name"))
+                    if nm:
+                        credits.append(nm)
+            if wanted_artists and any(a in wanted_artists for a in {x.casefold() for x in credits}):
+                score += 10
+            if credits:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best = (item, credits)
+        if not best or best_score < 10:
+            return {}
+        item, credits = best
+        result = {
+            "title": _music_clean_text(item.get("title")),
+            "artist": ", ".join(credits),
+            "album": "",
+            "artwork": None,
+        }
+        releases = item.get("releases") or []
+        if releases and isinstance(releases[0], dict):
+            release_id = releases[0].get("id")
+            result["album"] = _music_clean_text(releases[0].get("title"))
+            if release_id:
+                # Cover Art Archive's front endpoint returns the actual release artwork.
+                result["artwork"] = f"https://coverartarchive.org/release/{release_id}/front-500"
+        return result
+    except Exception as e:
+        print("MusicBrainz lookup failed:", repr(e))
+        return {}
+
+
+def _music_deezer_lookup(title, artist=""):
+    """Use Deezer's public search API for song title, artist and genuine album art."""
+    title = _music_clean_text(title)
+    artist = _music_clean_text(artist)
+    if not title or _music_is_original_label(title):
+        return {}
+    queries = []
+    if artist and artist.lower() != "unknown artist":
+        queries.append(f'artist:"{artist}" track:"{title}"')
+        queries.append(f"{artist} {title}")
+    queries.append(title)
+    for query in queries:
+        try:
+            r = requests.get(
+                "https://api.deezer.com/search",
+                params={"q": query, "limit": 10},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
+            )
+            r.raise_for_status()
+            rows = (r.json() or {}).get("data") or []
+            if not rows:
+                continue
+            q = title.casefold()
+            a = artist.casefold()
+            def score(item):
+                st = _music_clean_text(item.get("title")).casefold()
+                sa = _music_clean_text((item.get("artist") or {}).get("name")).casefold()
+                score = 0
+                if st == q: score += 20
+                elif q in st or st in q: score += 10
+                if a and a != "unknown artist" and (a == sa or a in sa): score += 10
+                if item.get("album", {}).get("cover_xl") or item.get("album", {}).get("cover_big"): score += 2
+                return score
+            best = max(rows, key=score)
+            if score(best) < 10:
+                continue
+            return {
+                "title": _music_clean_text(best.get("title")),
+                "artist": _music_clean_text((best.get("artist") or {}).get("name")),
+                "album": _music_clean_text((best.get("album") or {}).get("title")),
+                "artwork": (best.get("album") or {}).get("cover_xl") or (best.get("album") or {}).get("cover_big"),
+            }
+        except Exception as e:
+            print("Deezer music lookup failed:", repr(e))
+    return {}
+
+
+def _music_itunes_lookup(title, artist=""):
+    """Find the closest real song in iTunes metadata without using video thumbnails."""
+    title = _music_clean_text(title)
+    artist = _music_clean_text(artist)
+    if not title or _music_is_original_label(title):
+        return {}
+    terms = []
+    if artist and artist.lower() != "unknown artist":
+        terms.append(f"{artist} {title}")
+    terms.append(title)
+    for term in terms:
+        try:
+            r = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": term, "media": "music", "entity": "song", "limit": 10, "country": "US"},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+            )
+            r.raise_for_status()
+            results = r.json().get("results") or []
+            if not results:
+                continue
+            q = title.lower()
+            a = artist.lower()
+            def score(item):
+                st = _music_clean_text(item.get("trackName")).lower()
+                sa = _music_clean_text(item.get("artistName")).lower()
+                score = 0
+                if st == q: score += 12
+                elif q in st or st in q: score += 7
+                if a and a != "unknown artist" and (sa == a or a in sa): score += 10
+                if item.get("artworkUrl100"): score += 2
+                return score
+            best = max(results, key=score)
+            st = _music_clean_text(best.get("trackName"))
+            sa = _music_clean_text(best.get("artistName"))
+            artwork = best.get("artworkUrl600") or best.get("artworkUrl100")
+            if artwork:
+                artwork = artwork.replace("100x100bb", "600x600bb")
+            # Only accept a lookup when title has a meaningful match. This prevents
+            # an unrelated song from becoming the cover/artist for an Original Sound.
+            if score(best) < 7:
+                continue
+            return {"title": st, "artist": sa, "album": _music_clean_text(best.get("collectionName")), "artwork": artwork}
+        except Exception as e:
+            print("iTunes music lookup failed:", repr(e))
+    return {}
+
+
+def _embed_music_metadata(mp3_path, title, artist, cover_path=None, album=None):
+    """Embed title/artist/album/cover when Mutagen is installed; Telegram still gets thumb separately."""
+    try:
+        from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, ID3NoHeaderError
+        try:
+            tags = ID3(mp3_path)
+        except ID3NoHeaderError:
+            tags = ID3()
+        tags.delall("TIT2"); tags.delall("TPE1"); tags.delall("TALB"); tags.delall("APIC")
+        if title: tags.add(TIT2(encoding=3, text=str(title)))
+        if artist: tags.add(TPE1(encoding=3, text=str(artist)))
+        if album: tags.add(TALB(encoding=3, text=str(album)))
+        if cover_path and os.path.isfile(cover_path):
+            with open(cover_path, "rb") as f:
+                tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=f.read()))
+        tags.save(mp3_path)
+    except Exception as e:
+        print("MP3 metadata embedding skipped:", repr(e))
+
+
+def _download_music_cover(info, tmp_dir, title=None, artist=None, recognized=None):
+    """Return the configured MP3 cover. Open mode may use source thumbnail;
+    closed mode uses genuine music/artist artwork only."""
+    info = info or {}
+    recognized = recognized or {}
+    artwork_candidates = []
+    if get_setting("mp3_cover_enabled", MP3_COVER_DEFAULT):
+        thumb = info.get("thumbnail")
+        if isinstance(thumb, str) and thumb.strip():
+            artwork_candidates.append(thumb.strip())
+        for t in info.get("thumbnails") or []:
+            if isinstance(t, dict) and isinstance(t.get("url"), str) and t.get("url").strip():
+                artwork_candidates.append(t["url"].strip())
+
+    # AcoustID -> exact MusicBrainz release artwork has highest priority.
+    for value in recognized.get("artwork_candidates") or []:
+        if isinstance(value, str) and value.strip():
+            artwork_candidates.append(value.strip())
+
+    # Other recognition artwork sources.
+    for key in ("artwork", "artwork_url", "cover", "cover_url"):
+        value = recognized.get(key)
+        if isinstance(value, str) and value.strip():
+            artwork_candidates.append(value.strip())
+
+    # Some extractors provide explicit album artwork fields. These are acceptable;
+    # generic `thumbnail`/`thumbnails` are intentionally excluded because they are video frames.
+    for key in ("album_art", "album_artwork", "album_cover", "cover_url", "artwork_url", "artwork"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            artwork_candidates.append(value.strip())
+
+    for idx, url in enumerate(dict.fromkeys(artwork_candidates)):
+        cover = _music_download_image(url, tmp_dir, f"music_cover_{idx}.jpg")
+        if cover:
+            return cover
+
+    # If the song is identifiable, fetch its real album artwork from iTunes.
+    lookup = _music_itunes_lookup(title or _music_title_from_info(info), artist or _music_artist_from_info(info))
+    if lookup.get("artwork"):
+        cover = _music_download_image(lookup["artwork"], tmp_dir, "itunes_music_cover.jpg")
+        if cover:
+            return cover
+    return None
+
+
+def _cleanup_music_pending():
+    now = time.time()
+    for token, data in list(music_pending.items()):
+        if now - data.get("created", now) > MUSIC_PENDING_TTL:
+            music_pending.pop(token, None)
+    # Remove cached download directories only after no active MUSIC button points
+    # at them. This makes MUSIC conversion independent of a second provider fetch.
+    active_dirs={str(x.get("cache_dir")) for x in music_pending.values() if x.get("cache_dir")}
+    for cache_dir in list(music_cache_dirs):
+        if cache_dir not in active_dirs:
+            try: shutil.rmtree(cache_dir,ignore_errors=True)
+            except Exception: pass
+            music_cache_dirs.discard(cache_dir)
+
+def _release_music_cache(cache_dir):
+    if not cache_dir: return
+    active_dirs={str(x.get("cache_dir")) for x in music_pending.values() if x.get("cache_dir")}
+    if str(cache_dir) in active_dirs: return
+    try: shutil.rmtree(str(cache_dir),ignore_errors=True)
+    except Exception: pass
+    music_cache_dirs.discard(str(cache_dir))
+
+def _music_safe_filename(title, artist):
+    """Create a music filename without leaking provider names such as SaveApi_0."""
+    title = _music_clean_text(title)
+    artist = _music_clean_text(artist)
+    if not title or _music_is_provider_placeholder(title) or _music_is_original_label(title):
+        # Unknown song: use a plain numeric filename, 12–20 digits, as requested.
+        return str(random.randint(10**11, 10**20 - 1)) + ".mp3"
+    name = title if (not artist or _music_is_provider_placeholder(artist) or _music_is_original_label(artist)) else f"{title} - {artist}"
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip(" .")
+    return (name[:180] or str(random.randint(10**11,10**20-1))) + ".mp3"
+
+def _music_is_provider_placeholder(value):
+    value=_music_clean_text(value).lower()
+    if not value:
+        return True
+    patterns=(
+        r'^saveapi(?:[_ -]?\d+)?$', r'^saveapi[_ -]\d+$',
+        r'^cobalt(?:[_ -]?\d+)?$', r'^download(?:[_ -]?\d+)?$',
+        r'^video(?:[_ -]?\d+)?$', r'^audio(?:[_ -]?\d+)?$',
+        r'^media(?:[_ -]?\d+)?$', r'^unknown(?:[_ -]?(?:title|track|song))?$',
+    )
+    return any(re.fullmatch(p,value,re.I) for p in patterns)
+
+
+def _send_mp3_file(chat_id, path, title, artist, cover_path=None, caption=None, reply_markup=None):
+    """Send a genuine MP3 with safe artwork fallback. Never fail only because a thumb is bad."""
+    kwargs={"caption":caption or DOWNLOAD_CAPTION,"title":title,"performer":artist,"reply_markup":reply_markup,"parse_mode":"HTML"}
+    with open(path,"rb") as audio:
+        if cover_path and os.path.isfile(cover_path):
+            try:
+                with open(cover_path,"rb") as thumb:
+                    bot.send_audio(chat_id,audio,thumb=thumb,**kwargs)
+                    return
+            except Exception as thumb_error:
+                print("MP3 thumb send failed; retrying without thumb:",repr(thumb_error))
+                audio.seek(0)
+        try:
+            bot.send_audio(chat_id,audio,**kwargs)
+            return
+        except Exception as audio_error:
+            print("send_audio failed:",repr(audio_error))
+            audio.seek(0)
+            # Final safe fallback: Telegram can still deliver the exact MP3 file.
+            bot.send_document(chat_id,audio,caption=caption or DOWNLOAD_CAPTION,reply_markup=reply_markup,parse_mode="HTML")
+
+def convert_link_to_mp3(chat_id, link, status_message_id, local_source=None, local_cache_dir=None, source_title="", source_artist="", pending_token=None):
+    uid=str(chat_id)
+    music_platform=detect_platform(link)
+    music_priority=is_admin(uid) or is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)
+    # MUSIC is an action on a video that has already been delivered to the user.
+    # It must not re-apply the normal YouTube duration/premium gate.
+    quick=is_quick_access(uid)
+    priority=is_priority_user(uid)
+    tmp_dir = os.path.join("downloads", "music_" + uuid.uuid4().hex)
+    os.makedirs(tmp_dir, exist_ok=True)
+    cookie_args = _ytdlp_cookie_args() if music_platform=="youtube" else {}
+    opts = {
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "retries": 10 if quick else (7 if priority else 3),
+        "fragment_retries": 10 if quick else (7 if priority else 3),
+        "extractor_retries": 6 if priority else 3,
+        "socket_timeout": 25 if quick else 30,
+        "http_headers": {"User-Agent": "Mozilla/5.0 Chrome/131 Safari/537.36"},
+        "concurrent_fragment_downloads": 24 if quick else (12 if priority else 2),
+        "http_chunk_size": 16 * 1024 * 1024 if quick else (8 * 1024 * 1024 if priority else 2 * 1024 * 1024),
+        "buffersize": 4 * 1024 * 1024 if quick else (2 * 1024 * 1024 if priority else 1024 * 1024),
+        "ratelimit": None,
+        "format": "bestaudio/best", "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        "prefer_ffmpeg": True, "overwrites": True, **cookie_args
+    }
+    ffmpeg=_ffmpeg_bin()
+    if ffmpeg:
+        opts["ffmpeg_location"]=os.path.dirname(ffmpeg) if os.path.dirname(ffmpeg) else ffmpeg
+    action_stop=threading.Event()
+    start_action_heartbeat(chat_id,"upload_audio",action_stop)
+    try:
+        if status_message_id:
+            try: bot.delete_message(chat_id, status_message_id)
+            except Exception: pass
+        rapid_mp3=None
+        direct_source=None
+        source_platform=detect_platform(link)
+        # Highest priority: convert the exact video that was already downloaded.
+        # Never re-download it from SaveAPI/RapidAPI/yt-dlp.
+        if local_source and os.path.isfile(local_source):
+            rapid_mp3=os.path.join(tmp_dir,"local_video.mp3")
+            _ffmpeg_convert_to_mp3(local_source,rapid_mp3,bitrate="192k",timeout=600)
+            info={}
+            if source_title: info["title"]=source_title
+            if source_artist: info["artist"]=source_artist
+            prepared=None
+        elif source_platform == "pinterest":
+            try:
+                pin_files=_pinterest_direct_media(_resolve_pinterest_link(link),tmp_dir)
+                pin_video=next((p for p in pin_files if _is_video_file(p)),None)
+                if pin_video and _ffmpeg_bin():
+                    direct_source=pin_video
+                    rapid_mp3=os.path.join(tmp_dir,"pinterest_direct.mp3")
+                    _ffmpeg_convert_to_mp3(pin_video,rapid_mp3,bitrate="192k",timeout=180)
+            except Exception as e:
+                print("Pinterest direct MP3 fallback:",repr(e))
+            if not rapid_mp3 and _cobalt_enabled():
+                try:
+                    cpaths=_cobalt_process(_resolve_pinterest_link(link),tmp_dir,quality="720",mode="audio",max_mb=_download_max_mb(chat_id,platform="pinterest",link=link))
+                    rapid_mp3=next((p for p in cpaths if _is_audio_file(p)),None)
+                except Exception as e:
+                    print("Pinterest Cobalt MP3 fallback:",repr(e))
+        # Universal fast-provider MP3 path. This is only used when there is no
+        # already-downloaded local source. That keeps MUSIC deterministic and fast.
+        if not rapid_mp3 and source_platform in SAVEAPI_SUPPORTED_PLATFORMS and _saveapi_enabled():
+            try:
+                files=_saveapi_download(link,tmp_dir,uid=chat_id,platform=source_platform,prefer="audio")
+                audio=next((p for p in files if _is_audio_file(p)),None)
+                video=next((p for p in files if _is_video_file(p)),None)
+                if audio:
+                    # SaveAPI may return M4A/AAC/Opus even when the requested
+                    # media type is audio. Always normalize it to a real MP3.
+                    if os.path.splitext(audio)[1].lower() == ".mp3":
+                        rapid_mp3=audio
+                    else:
+                        rapid_mp3=os.path.join(tmp_dir,"saveapi_music.mp3")
+                        _ffmpeg_convert_to_mp3(audio,rapid_mp3,bitrate="192k",timeout=300)
+                elif video:
+                    rapid_mp3=os.path.join(tmp_dir,"saveapi_music.mp3")
+                    _ffmpeg_convert_to_mp3(video,rapid_mp3,bitrate="192k",timeout=300)
+            except Exception as e:
+                print(f"SaveAPI MP3 fallback [{source_platform}]:",repr(e))
+        if not rapid_mp3 and source_platform not in {"youtube","pinterest"} and _cobalt_enabled():
+            try:
+                files=_cobalt_process(link,tmp_dir,quality="720",mode="audio",max_mb=_download_max_mb(chat_id,platform=source_platform,link=link))
+                audio=next((p for p in files if _is_audio_file(p)),None)
+                if audio:
+                    if os.path.splitext(audio)[1].lower() == ".mp3":
+                        rapid_mp3=audio
+                    else:
+                        rapid_mp3=os.path.join(tmp_dir,"cobalt_music.mp3")
+                        _ffmpeg_convert_to_mp3(audio,rapid_mp3,bitrate="192k",timeout=300)
+            except Exception as e:
+                print(f"Cobalt MP3 fallback [{source_platform}]:",repr(e))
+        if rapid_mp3 and os.path.isfile(rapid_mp3):
+            if 'info' not in locals() or not isinstance(info,dict): info={}
+            if 'prepared' not in locals(): prepared=None
+        else:
+            extract_link=_resolve_pinterest_link(link) if detect_platform(link)=="pinterest" else link
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(extract_link, download=True)
+                prepared = ydl.prepare_filename(info) if info else None
+        if rapid_mp3 and os.path.isfile(rapid_mp3):
+            mp3_files=[rapid_mp3]
+        else:
+            mp3_files = [p for p in _collect_downloaded_files(tmp_dir) if _is_audio_file(p)]
+        if not mp3_files and prepared:
+            candidate = os.path.splitext(prepared)[0] + ".mp3"
+            if os.path.isfile(candidate):
+                mp3_files = [candidate]
+        if not mp3_files:
+            raise RuntimeError("MP3 file was not created. Make sure FFmpeg is installed.")
+        path = mp3_files[0]
+        # MUSIC is a conversion of an already delivered file, so do not apply the
+        # normal video/download MB gate a second time. Telegram itself still enforces
+        # its own upload limit when send_audio/send_document is called.
+
+        info = info or {}
+        if not info and not local_source:
+            try:
+                meta_opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"socket_timeout":12,"http_headers":{"User-Agent":"Mozilla/5.0 Chrome/131 Safari/537.36"}}
+                if music_platform=="youtube": meta_opts.update(_ytdlp_cookie_args())
+                with yt_dlp.YoutubeDL(meta_opts) as meta_ydl:
+                    info=meta_ydl.extract_info(link,download=False) or {}
+            except Exception as meta_error:
+                print("MP3 metadata-only lookup skipped:",repr(meta_error))
+                info={}
+        source_title = _music_clean_text(source_title) or _music_title_from_info(info)
+        source_artist = _music_clean_text(source_artist) or _music_artist_from_info(info)
+        if not source_title:
+            raw_title = _music_clean_text(info.get("title") or info.get("fulltitle"))
+            if raw_title and not _music_is_original_label(raw_title) and not _music_is_provider_placeholder(raw_title):
+                source_title = raw_title
+
+        # Search Song already provides trusted title/artist metadata. Do not run
+        # AcoustID/Audd/catalog lookups again: those network calls made MP3
+        # conversion unnecessarily slow. Recognition remains available for raw
+        # MUSIC conversions where metadata was not supplied.
+        if source_title or source_artist:
+            recognized = {}
+        else:
+            recognized = _music_recognize_acoustid(path)
+            if not recognized and AUDD_API_TOKEN:
+                recognized = _music_recognize_audd(path)
+
+        recognized_title = _music_clean_text(recognized.get("title"))
+        recognized_artist = _music_clean_text(recognized.get("artist"))
+        recognized_album = _music_clean_text(recognized.get("album"))
+
+        # Never use uploader/channel as an artist. If recognition/catalog metadata
+        # cannot establish a real artist, the required fallback is "Unknown artist".
+        title = recognized_title or source_title or "Unknown title"
+        artist = recognized_artist or ""
+        album = recognized_album
+
+        # If AcoustID found no exact recording, try independent music catalogs only
+        # when we have a meaningful song title. These lookups must never use the
+        # source video's thumbnail as artwork.
+        catalog_meta = {}
+        if (not (source_title or source_artist)) and (not recognized_title or not recognized_artist) and title and not _music_is_provider_placeholder(title):
+            for lookup_fn in (_music_musicbrainz_lookup, _music_deezer_lookup, _music_itunes_lookup):
+                try:
+                    catalog_meta = lookup_fn(title, "")
+                except Exception:
+                    catalog_meta = {}
+                if catalog_meta.get("title") and catalog_meta.get("artist"):
+                    break
+
+            if catalog_meta:
+                title = catalog_meta.get("title") or title
+                if not artist:
+                    artist = catalog_meta.get("artist") or artist
+                album = album or catalog_meta.get("album") or ""
+
+        if not artist or _music_is_original_label(artist):
+            artist = "Unknown artist"
+
+        recognized_for_cover = dict(recognized)
+        if recognized_for_cover.get("artwork_candidates"):
+            recognized_for_cover["artwork_candidates"] = list(recognized_for_cover["artwork_candidates"])
+        if not recognized_for_cover.get("artwork") and catalog_meta.get("artwork"):
+            recognized_for_cover["artwork"] = catalog_meta.get("artwork")
+
+        cover_path = None
+        # Search-result MP3s prioritize speed. Avoid another remote artwork lookup;
+        # Telegram will still display the title/performer metadata.
+        if not (source_title or source_artist) and (not local_source or get_setting("mp3_cover_enabled", MP3_COVER_DEFAULT)):
+            cover_path = _download_music_cover(
+                info, tmp_dir, title=title, artist=artist, recognized=recognized_for_cover
+            )
+
+        # Embed the same real artwork into the MP3 when possible. No source video frame is used.
+        _embed_music_metadata(path, title, artist, cover_path=cover_path, album=album)
+
+        # Give the uploaded MP3 a real music filename, not the source video ID.
+        final_path = os.path.join(tmp_dir, _music_safe_filename(title, artist))
+        if os.path.abspath(final_path) != os.path.abspath(path):
+            try:
+                os.replace(path, final_path)
+                path = final_path
+            except Exception as rename_error:
+                print("MP3 filename rename skipped:", repr(rename_error))
+
+        caption = DOWNLOAD_CAPTION
+        music_markup = music_destination_markup()
+        action_stop.set()
+        upload_stop=threading.Event()
+        start_action_heartbeat(chat_id,"upload_audio",upload_stop)
+        try:
+            _send_mp3_file(chat_id,path,title,artist,cover_path=cover_path,caption=caption,reply_markup=music_markup)
+        finally:
+            upload_stop.set()
+        if status_message_id:
+            try: bot.delete_message(chat_id, status_message_id)
+            except Exception: pass
+    except Exception as e:
+        print(f"MP3 conversion error: {repr(e)}")
+        friendly = "❌ Music download failed. Please try again."
+        if (not local_source) and ("Sign in to confirm" in str(e) or "not a bot" in str(e)):
+            friendly = "❌ YouTube music is not available right now. Please try again."
+        try:
+            bot.edit_message_text(friendly, chat_id, status_message_id)
+        except Exception:
+            pass
+    finally:
+        try: action_stop.set()
+        except Exception: pass
+        if pending_token:
+            music_pending.pop(str(pending_token), None)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if local_cache_dir:
+            _release_music_cache(local_cache_dir)
+
+def _user_destination_rows(uid, dtype=None):
+    # The old version showed a custom list and required an admin to pre-register
+    # destinations. Users now choose their own chat directly from Telegram's
+    # native "Select Chat" picker.
+    rows=[]
+    for d in _destinations():
+        if dtype:
+            actual=str(d.get("type"))
+            if dtype == "group" and actual not in {"group","supergroup"}:
+                continue
+            if dtype == "channel" and actual != "channel":
+                continue
+        rows.append(d)
+    return rows
+
+def _new_destination_request_id():
+    # Telegram requires a signed 32-bit request_id. Keep it positive and unique
+    # among our currently pending requests.
+    while True:
+        rid=random.randint(1, 2_000_000_000)
+        if rid not in DESTINATION_REQUESTS:
+            return rid
+
+def _destination_admin_rights(dtype):
+    """Rights needed by this bot for connected destinations.
+
+    Telegram only lets the bot promote another administrator when it itself has
+    can_promote_members. Pinning the bot's onboarding message requires
+    can_pin_messages in groups/supergroups.
+    """
+    if dtype == "channel":
+        return ChatAdministratorRights(
+            is_anonymous=False,
+            can_manage_chat=True,
+            can_post_messages=True,
+            can_edit_messages=True,
+            can_delete_messages=True,
+            can_change_info=True,
+        )
+    return ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=True,
+        can_restrict_members=True,
+        can_invite_users=True,
+        can_pin_messages=True,
+        can_promote_members=True,
+        can_change_info=True,
+    )
+
+def _destination_request_keyboard(uid, dtype):
+    request_id=_new_destination_request_id()
+    DESTINATION_REQUESTS[request_id]={"user_id":str(uid),"type":str(dtype),"created":time.time()}
+    rights=_destination_admin_rights(dtype)
+    if dtype == "channel":
+        req=KeyboardButtonRequestChat(
+            request_id=request_id,
+            chat_is_channel=True,
+            user_administrator_rights=rights,
+            bot_administrator_rights=rights,
+            bot_is_member=False,
+            request_title=True,
+            request_username=True,
+            request_photo=False,
+        )
+        label="➕ Add Channel"
+        prompt="📢 <b>Select a channel</b>\n\nTap the <b>➕ Add Channel</b> button below to open Telegram’s native Select Chat list."
+    else:
+        req=KeyboardButtonRequestChat(
+            request_id=request_id,
+            chat_is_channel=False,
+            user_administrator_rights=rights,
+            bot_administrator_rights=rights,
+            bot_is_member=False,
+            request_title=True,
+            request_username=True,
+            request_photo=False,
+        )
+        label="➕ Add Group"
+        prompt="👥 <b>Select a group</b>\n\nTap the <b>➕ Add Group</b> button below to open Telegram’s native Select Chat list."
+    kb=ReplyKeyboardMarkup(resize_keyboard=True,one_time_keyboard=True,row_width=1)
+    kb.add(KeyboardButton(label,request_chat=req))
+    kb.add(KeyboardButton("❌ Cancel"))
+    return prompt,kb
+
+def _destination_picker(uid, dtype):
+    # Kept for compatibility with older callers. The actual picker is Telegram's
+    # native Select Chat screen, not an admin-managed list.
+    prompt,kb=_destination_request_keyboard(uid,dtype)
+    return kb, []
+
+def _destination_feature_open(dtype):
+    return bool(get_setting("add_group_enabled" if dtype == "group" else "add_channel_enabled", True))
+
+def _destination_feature_status_text():
+    g=_destination_feature_open("group")
+    c=_destination_feature_open("channel")
+    return f"👥 Add Group: <b>{'REQUIRED' if g else 'OPTIONAL'}</b>\n📢 Add Channel: <b>{'OPEN' if c else 'CLOSED'}</b>"
+
+@bot.message_handler(func=lambda m: m.text == "❌ Cancel")
+def destination_cancel_button(message):
+    # Cancel the native Select Chat keyboard and immediately restore the user's menu.
+    uid=str(message.from_user.id)
+    song_group_gate_pending.pop(uid,None)
+    for rid,data in list(DESTINATION_REQUESTS.items()):
+        if str(data.get("user_id"))==uid:
+            DESTINATION_REQUESTS.pop(rid,None)
+    try:
+        bot.send_message(message.chat.id,"❌ Cancelled.",reply_markup=ReplyKeyboardRemove())
+        bot.send_message(message.chat.id,"👇 <b>Main Menu</b>",reply_markup=localized_user_menu(uid),parse_mode="HTML")
+    except Exception as e:
+        print("Destination cancel error:",repr(e))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_group:"))
+def add_group_inline(call):
+    if not _destination_feature_open("group"):
+        bot.answer_callback_query(call.id, "🔴 Add Group is currently closed.", show_alert=True)
+        return
+    try:
+        bot.answer_callback_query(call.id)
+        url=_bot_destination_url("group")
+        if url:
+            bot.send_message(call.from_user.id,
+                "👥 <b>Add Group</b>\n\nTap the button below. Telegram will immediately open <b>Select Group</b> and ask you to add this bot as administrator.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("➕ Select Group",url=url)))
+    except Exception as e:
+        print("Add Group picker error:",repr(e))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_channel:"))
+def add_channel_inline(call):
+    if not _destination_feature_open("channel"):
+        bot.answer_callback_query(call.id, "🔴 Add Channel is currently closed.", show_alert=True)
+        return
+    try:
+        bot.answer_callback_query(call.id)
+        url=_bot_destination_url("channel")
+        if url:
+            bot.send_message(call.from_user.id,
+                "📢 <b>Add Channel</b>\n\nTap the button below. Telegram will immediately open <b>Select Channel</b> and ask you to add this bot as administrator.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("➕ Select Channel",url=url)))
+    except Exception as e:
+        print("Add Channel picker error:",repr(e))
+
+@bot.message_handler(content_types=["chat_shared"])
+def destination_chat_shared(message):
+    """Receive Telegram's native chat selection and persist the user's destination."""
+    shared=getattr(message,"chat_shared",None)
+    if not shared:
+        return
+    rid=int(getattr(shared,"request_id",0) or 0)
+    req=DESTINATION_REQUESTS.get(rid)
+    uid=str(message.from_user.id)
+    if not req or str(req.get("user_id")) != uid:
+        bot.send_message(message.chat.id,"❌ This chat-selection request has expired. Tap Add Group/Add Channel again.")
+        return
+    dtype=str(req.get("type"))
+    chat_id=int(shared.chat_id)
+    try:
+        chat=bot.get_chat(chat_id)
+        member=bot.get_chat_member(chat_id,bot.get_me().id)
+        status=str(getattr(member,"status","") or "")
+        if status not in {"administrator","creator"}:
+            bot.send_message(
+                message.chat.id,
+                "❌ <b>Bot admin access was not completed.</b>\n\n"
+                "Please choose the chat again and make this bot an administrator.\n"
+                "The bot needs admin access so it can send messages there later.",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode="HTML"
+            )
+            return
+        ctype=str(getattr(chat,"type","") or "")
+        if dtype=="group" and ctype not in {"group","supergroup"}:
+            bot.send_message(message.chat.id,"❌ Please select a group/supergroup, not a channel.",reply_markup=ReplyKeyboardRemove())
+            return
+        if dtype=="channel" and ctype!="channel":
+            bot.send_message(message.chat.id,"❌ Please select a channel, not a group.",reply_markup=ReplyKeyboardRemove())
+            return
+        _upsert_destination(chat,uid)
+        DESTINATION_REQUESTS.pop(rid,None)
+        name=html.escape(getattr(chat,"title","") or getattr(shared,"title","") or str(chat_id))
+        # If this group was requested as the Search Song requirement, keep the
+        # already-completed search and show its 10-song picker immediately.
+        pending_song=song_group_gate_pending.pop(uid,None) if dtype=="group" else None
+        kind="Group" if dtype=="group" else "Channel"
+        bot.send_message(
+            message.chat.id,
+            f"✅ <b>{kind} connected successfully</b>\n\n"
+            f"📍 {name}\n"
+            "🤖 Bot admin: <b>YES</b>\n"
+            "📨 The bot can now send messages there when this destination is used.",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="HTML"
+        )
+        if pending_song:
+            token=str(pending_song.get("token") or "")
+            pdata=song_search_pending.get(token)
+            if pdata and str(pdata.get("uid"))==uid and pdata.get("results"):
+                _send_song_results(uid,token,0)
+            elif pending_song.get("query"):
+                # The original result set is kept in memory; this fallback is
+                # only for a stale process state and should be rare.
+                bot.send_message(uid,"❌ Your saved search expired. Please search the song again.")
+    except Exception as e:
+        print("Destination chat_shared error:",repr(e))
+        bot.send_message(
+            message.chat.id,
+            "❌ Could not connect this chat. Make sure the bot was added and made administrator, then try again.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("music:"))
+def music_callback_handler(call):
+    token = call.data.split(":", 1)[1]
+    _cleanup_music_pending()
+    data = music_pending.get(token)
+    if not data:
+        bot.answer_callback_query(call.id, "❌ This MUSIC button has expired. Download the video again.", show_alert=True); return
+    if str(call.from_user.id) != str(data.get("uid")):
+        bot.answer_callback_query(call.id, "❌ This button belongs to another user.", show_alert=True); return
+    if data.get("in_progress"):
+        bot.answer_callback_query(call.id, "🎵 MP3 conversion is already running.", show_alert=False)
+        return
+    data["in_progress"] = True
+    try:
+        bot.answer_callback_query(call.id, "🎵 MP3 conversion started...")
+        status = bot.send_message(call.message.chat.id, "🎵 Converting video to MP3...")
+        download_executor_for(call.from_user.id).submit(
+            convert_link_to_mp3,
+            call.message.chat.id,
+            data.get("link") or "",
+            status.message_id,
+            data.get("local_source"),
+            data.get("cache_dir"),
+            data.get("source_title") or "",
+            data.get("source_artist") or "",
+            token,
+        )
+    except Exception as e:
+        print("MUSIC callback error:", e)
+
+@bot.message_handler(func=lambda m: m.text == "🎵 MUSIC")
+def music_menu_button(m):
+    if bot_locked_guard(m) or banned_guard(m): return
+    bot.send_message(m.chat.id, "🎵 Send a supported video link, then tap the 🎵 MUSIC button under the downloaded video to convert that exact video to MP3.")
+
+# ================= LANGUAGE COMMAND =================
+@bot.message_handler(commands=["language", "lang"])
+def language_command(message):
+    uid=str(message.from_user.id)
+    touch_user(uid)
+    lang=lang_of(uid)
+    prompt={
+        "en":"🌍 <b>Select your language</b>\n\nYour language is saved automatically.",
+        "so":"🌍 <b>Dooro luqaddaada</b>\n\nLuqadda aad doorato si otomaatig ah ayaa loo keydinayaa.",
+        "am":"🌍 <b>ቋንቋዎን ይምረጡ</b>\n\nየመረጡት ቋንቋ በራስ-ሰር ይቀመጣል።",
+        "om":"🌍 <b>Afaana kee filadhu</b>\n\nAfaan ati filattu ofumaan ni kuufama.",
+        "ar":"🌍 <b>اختر لغتك</b>\n\nسيتم حفظ اللغة تلقائياً.",
+        "fr":"🌍 <b>Choisissez votre langue</b>\n\nVotre choix sera enregistré automatiquement.",
+        "es":"🌍 <b>Elige tu idioma</b>\n\nTu idioma se guardará automáticamente.",
+        "de":"🌍 <b>Sprache auswählen</b>\n\nDeine Sprache wird automatisch gespeichert.",
+        "pt":"🌍 <b>Escolha seu idioma</b>\n\nSeu idioma será salvo automaticamente.",
+        "tr":"🌍 <b>Dilinizi seçin</b>\n\nSeçtiğiniz dil otomatik olarak kaydedilir.",
+        "hi":"🌍 <b>अपनी भाषा चुनें</b>\n\nआपकी भाषा अपने आप सेव हो जाएगी।",
+        "id":"🌍 <b>Pilih bahasa Anda</b>\n\nBahasa Anda akan disimpan otomatis.",
+        "ja":"🌍 <b>言語を選択</b>\n\n選択した言語は自動的に保存されます。",
+        "ko":"🌍 <b>언어를 선택하세요</b>\n\n선택한 언어는 자동으로 저장됩니다.",
+        "zh":"🌍 <b>选择语言</b>\n\n您选择的语言会自动保存。",
+    }.get(lang,"🌍 <b>Select your language</b>\n\nYour language is saved automatically.")
+    bot.send_message(message.chat.id,prompt,reply_markup=language_kb("change_lang"),parse_mode="HTML")
+
+@bot.my_chat_member_handler()
+def bot_chat_membership_update(update):
+    try:
+        chat=update.chat
+        new_status=str(update.new_chat_member.status)
+        actor_id=str(getattr(getattr(update,"from_user",None),"id","") or "")
+        if new_status in {"member","administrator","creator"}:
+            is_new, intro_sent = _upsert_destination(chat, actor_id)
+            ctype=str(getattr(chat,"type","") or "group")
+            # Send the short introduction only after the bot has admin access.
+            if new_status in {"administrator","creator"} and not intro_sent:
+                if _send_destination_intro(chat.id, ctype):
+                    rows=_destinations()
+                    row=next((x for x in rows if str(x.get("chat_id"))==str(chat.id)),None)
+                    if row:
+                        row["intro_sent"] = True
+                        _save_destinations(rows)
+            # A new group gets one owner/admin confirmation request.
+            if is_new and ctype in {"group","supergroup"} and new_status in {"administrator","creator"}:
+                _request_primary_admin_for_group(chat)
+            # Search Song group gate: the same search is released automatically
+            # when the user who initiated Add Group has successfully added the bot.
+            if ctype in {"group","supergroup"} and actor_id:
+                pending_song=song_group_gate_pending.pop(actor_id,None)
+                if pending_song:
+                    token=str(pending_song.get("token") or "")
+                    pdata=song_search_pending.get(token)
+                    if pdata and str(pdata.get("uid"))==actor_id and pdata.get("results"):
+                        try: bot.send_message(actor_id,"✅ <b>Group verified.</b> Your saved Search Song is ready.",parse_mode="HTML")
+                        except Exception: pass
+                        _send_song_results(actor_id,token,0)
+        elif new_status in {"left","kicked"}:
+            _remove_destination(chat.id)
+    except Exception as e:
+        print("Destination membership update error:",repr(e))
+
+# ================= GROUP / CHANNEL BROADCAST =================
+
+@bot.message_handler(func=lambda m: m.text == "📣 Send all G/CH")
+def admin_send_all_destinations_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    destinations = _destinations()
+    if not destinations:
+        bot.send_message(
+            m.chat.id,
+            "❌ <b>No connected groups/channels yet.</b>\n\n"
+            "Add this bot as an administrator to a group or channel first.",
+            parse_mode="HTML",
+            reply_markup=admin_menu()
+        )
+        return
+    msg = bot.send_message(
+        m.chat.id,
+        "📣 <b>Send all G/CH</b>\n\n"
+        "Send the message you want to broadcast now.\n"
+        "You can send <b>text, photo, video, document, audio, voice</b> or another supported message type.\n\n"
+        f"📍 Connected destinations: <b>{len(destinations)}</b>",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, admin_send_all_destinations_step)
+
+def admin_send_all_destinations_step(m):
+    if not is_admin(m.from_user.id):
+        return
+    destinations = list(_destinations())
+    if not destinations:
+        bot.send_message(m.chat.id, "❌ No connected groups/channels found.", reply_markup=admin_menu())
+        return
+
+    sent = 0
+    failed = 0
+    removed = 0
+    for d in destinations:
+        try:
+            cid = int(d.get("chat_id"))
+            bot.copy_message(cid, m.chat.id, m.message_id)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            err = str(e).lower()
+            # If the bot has left/is no longer allowed to access a destination,
+            # remove it so future broadcasts stay clean.
+            if any(x in err for x in ("chat not found", "bot was kicked", "not enough rights", "forbidden")):
+                try:
+                    _remove_destination(cid)
+                    removed += 1
+                except Exception:
+                    pass
+
+    bot.send_message(
+        m.chat.id,
+        "✅ <b>G/CH broadcast completed</b>\n\n"
+        f"📨 Sent: <b>{sent}</b>\n"
+        f"❌ Failed: <b>{failed}</b>\n"
+        f"🗑 Removed unavailable: <b>{removed}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
+    )
+
+# ================= START HANDLER =================
+
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    if bot_locked_guard(message): return
+    uid=str(message.from_user.id); args=message.text.split()
+    if uid not in users:
+        users[uid]={"username":message.from_user.username or "","first_name":message.from_user.first_name or "there","balance":0.0,"blocked":0.0,"ref":random_ref(),"bot_id":random_botid(),"invited":0,"banned":False,"verified":False,"email_verified":False,"phone_verified":False,"whatsapp_verified":False,"verification_method":None,"balance_locked":False,"balance_activation_code":None,"balance_lock_until":None,"quick_access":False,"youtube_30m":False,"premium_until":None,"premium_warning_sent":False,"trial_used":False,"trial_pending":False,"trial_version_used":None,"trial_pending_version":None,"referral_50_rewarded":False,"referred_by":None,"joined_date":datetime.now().strftime("%Y-%m-%d"),"last_seen_at":datetime.now(timezone.utc).isoformat(),"month":now_month(),"language":None,"customer_ai_language":None,"currency":"USD","balance_asset":"USD","gender":None,"city":None,"pending_ref":args[1] if len(args)>1 else None}
+        save_user(uid)
+    users[uid].setdefault("currency","USD")
+    users[uid].setdefault("balance_asset",users[uid].get("currency","USD"))
+    users[uid].setdefault("blocked",0.0)
+    users[uid].setdefault("first_name", message.from_user.first_name or "there")
+    users[uid]["first_name"] = message.from_user.first_name or users[uid].get("first_name") or "there"
+    users[uid]["username"] = message.from_user.username or users[uid].get("username") or ""
+    users[uid].setdefault("trial_pending",False)
+    users[uid].setdefault("trial_version_used",None)
+    users[uid].setdefault("trial_pending_version",None)
+    users[uid].setdefault("referred_by",None)
+    users[uid].setdefault("email_verified",False)
+    users[uid].setdefault("phone_verified",False)
+    users[uid].setdefault("whatsapp_verified",False)
+    users[uid].setdefault("verification_method",None)
+    users[uid].setdefault("balance_locked",False)
+    users[uid].setdefault("balance_activation_code",None)
+    users[uid].setdefault("balance_lock_until",None)
+    users[uid].setdefault("portfolio",{})
+    touch_user(uid)
+    if not users[uid].get("language"):
+        bot.send_message(message.chat.id,"🌍 <b>Select language</b>\n\nChoose the language you want to use:",reply_markup=language_kb("setlang")); return
+    check_membership(message.from_user.id)
+
+@bot.message_handler(commands=['view'])
+def view_cmd(message):
+    try:
+        bot.send_message(
+            message.chat.id,
+            "🤖 BOT INFO\n\n"
+            "📌 Name: DOWNLOADER BOT\n"
+            "⚡ Features:\n"
+            "• TikTok, Instagram, Facebook, Pinterest, YouTube, Snapchat, X/Twitter support\n"
+            "• Referral system\n"
+            "• Withdrawal system"
+        )
+    except: pass
+
+@bot.message_handler(commands=['balance'])
+def balance_cmd(m):
+    uid = str(m.from_user.id)
+    bal = users.get(uid, {}).get("balance", 0)
+    try:
+        bot.send_message(m.chat.id, f"💰 Your balance: {format_asset(cur_code(uid),bal)}")
+    except: pass
+
+def _referral_share_button(link, text=None):
+    """Create a real Telegram Share button without the bot username prefix.
+
+    switch_inline_query intentionally inserts @BotUsername into the compose box;
+    that is wrong for referral sharing because the recipient can end up receiving
+    an inline query instead of the referral URL. Telegram's share-url endpoint
+    opens the native share chooser with the exact referral URL and message text.
+    """
+    share_url="https://t.me/share/url?" + urllib.parse.urlencode({
+        "url":str(link),
+        "text":str(text or ""),
+    })
+    return InlineKeyboardButton("📤 Share",url=share_url)
+
+@bot.message_handler(commands=['refer'])
+@bot.message_handler(func=lambda m: m.text == "👥 REFERRAL")
+def refer_cmd(m):
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m):
+        return
+    uid = str(m.from_user.id)
+    try:
+        bot_username = bot.get_me().username
+        ref = users[uid]['ref']
+        link = f"https://t.me/{bot_username}?start={ref}"
+        invited = users[uid].get("invited", 0)
+        
+        reward = referral_reward_amount()
+        # Users see only their unique referral link; the internal referral code is hidden.
+        # Share contains only the link, with no advertisement/promo prefix.
+        kb = InlineKeyboardMarkup()
+        share_text="🎁 Join DownloadVedioYTBot and download videos, music and more.\n🔗 Referral link: " + link
+        kb.add(_referral_share_button(link, share_text))
+        kb.add(InlineKeyboardButton("💳 Buy Custom Referral Code", callback_data="buy_ref_menu"))
+        bot.send_message(
+            m.chat.id,
+            f"🔗 <b>Your Referral Link</b>:\n<code>{html.escape(link)}</code>\n\n"
+            f"👥 <b>Invited Users</b>: {invited}\n"
+            f"🎁 <b>You earn ${reward:.2f} per referral!</b>\n\n"
+            "📤 Tap <b>Share</b> to send your referral link to friends.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except: pass
+
+@bot.message_handler(commands=['ping'])
+def ping_cmd(m):
+    start = time.time()
+    try:
+        msg = bot.send_message(m.chat.id, "🏓 Pinging...")
+        end = time.time()
+        speed = round((end - start) * 1000)
+        status = "🟢 Online" if speed < 1000 else "🟡 Slow"
+        bot.edit_message_text(
+            f"🏓 PONG!\n\n"
+            f"⚡ Speed: {speed} ms\n"
+            f"📡 Status: {status}",
+            m.chat.id,
+            msg.message_id,
+            parse_mode="HTML"
+        )
+    except: pass
+
+# ================= VERIFY BOT START =================
+
+@bot2.message_handler(commands=['start'])
+def verify_start(message):
+    args = message.text.split()
+    if len(args) > 1:
+        code = args[1]
+        try:
+            bot2.send_message(
+                message.chat.id,
+                f"🔑 Your Verification Code\n\n"
+                f"{code}\n\n"
+                "Copy this code and send it to the downloader bot."
+            )
+        except: pass
+    else:
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton(
+                "GET",
+                url="https://t.me/Downloadvedioytibot"
+            )
+        )
+        try:
+            bot2.send_message(
+                message.chat.id,
+                "❌ Don't Have Code?\n\nGet code from downloader bot.",
+                reply_markup=kb
+            )
+        except: pass
+
+# ================= CHECK MEMBERSHIP =================
+
+def check_membership(user_id):
+    touch_user(user_id)
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            bot.send_message(
+                user_id,
+                render_start_message(str(user_id)),
+                reply_markup=welcome_destination_markup(),
+                parse_mode="HTML"
+            )
+            bot.send_message(user_id, "👇 <b>Main Menu</b>", reply_markup=localized_user_menu(str(user_id)), parse_mode="HTML")
+        else:
+            send_join_message(user_id)
+    except Exception as e:
+        print("FORCE JOIN CHECK ERROR:", repr(e))
+        send_join_message(user_id)
+
+def send_join_message(user_id):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ JOIN CHANNEL", url="https://t.me/tiktokvediodownload"))
+    kb.add(InlineKeyboardButton("✅ CONFIRM", callback_data="confirm_join"))
+    try:
+        bot.send_message(
+            user_id,
+            "⚠️ You must join our channel to use this bot.",
+            reply_markup=kb
+        )
+    except: pass
+
+def send_multi_join(user_id):
+    kb = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton("➕️ JOIN", url=f"https://t.me/{ch}") for ch in POST_CHANNELS]
+    kb.add(*buttons)
+    kb.add(InlineKeyboardButton("✅ CONFIRM", callback_data="multi_checkjoin"))
+    try:
+        bot.send_message(user_id, "⚠️ Join all channels to continue.", reply_markup=kb)
+    except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "confirm_join")
+def confirm_join(call):
+    user_id = call.from_user.id
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            bot.answer_callback_query(call.id, "✅ Join verified")
+            try:
+                bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+            except: pass
+            # After the user's first successful channel confirmation, show the
+            # same welcome message + main menu used by the normal /start flow.
+            # Do NOT replace this with a bare "Join confirmed" message.
+            # The welcome is part of the onboarding system.
+            try:
+                bot.send_message(
+                    user_id,
+                    render_start_message(str(user_id)),
+                    reply_markup=welcome_destination_markup(),
+                    parse_mode="HTML"
+                )
+                bot.send_message(user_id, "👇 <b>Main Menu</b>", reply_markup=localized_user_menu(str(user_id)), parse_mode="HTML")
+            except Exception as e:
+                print("WELCOME AFTER CONFIRM ERROR:", repr(e))
+            if user_id in pending_links:
+                link = pending_links.pop(user_id, None)
+                if link:
+                    msg = bot.send_message(user_id, "⏳ Processing...")
+                    download_executor_for(user_id).submit(
+                        download_media, user_id, link, msg.message_id,
+                        users.get(str(user_id), {}).get("premium_quality") or ("1080" if is_quick_access(user_id) else None)
+                    )
+        else:
+            bot.answer_callback_query(call.id, "❌ You must join the channel first!", show_alert=True)
+    except:
+        bot.answer_callback_query(call.id, "❌ Please join the channel first!", show_alert=True)
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD NEW ADMIN")
+def admin_add_new_admin_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,
+        "➕ <b>ADD NEW ADMIN</b>\n\nSend the Telegram numeric ID of the user you want to add as a bot admin.",
+        parse_mode="HTML")
+    bot.register_next_step_handler(msg,admin_add_new_admin_step)
+
+def admin_add_new_admin_step(m):
+    if not is_admin(m.from_user.id): return
+    raw=str(m.text or "").strip().replace("@","")
+    if not raw.isdigit():
+        bot.send_message(m.chat.id,"❌ Please send a numeric Telegram ID.",reply_markup=admin_menu()); return
+    new_id=int(raw)
+    ids=get_admin_ids()
+    if new_id not in ids: ids.append(new_id); save_admin_ids(ids)
+    bot.send_message(m.chat.id,f"✅ <b>Admin added</b>\n\nID: <code>{new_id}</code>",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text in ["🟢 Open song in bot", "🟢 OPEN SONG IN BOT"])
+def admin_open_song(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_search_enabled",True)
+    bot.send_message(m.chat.id,"🟢 <b>SONG SEARCH OPENED IN BOT</b>\n\nUsers can now use 🔎 Search Song.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text in ["🔴 Close Song in bot", "🔴 CLOSE SONG IN BOT"])
+def admin_close_song(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_search_enabled",False)
+    set_setting("song_auto_search_enabled",False)
+    _refresh_all_user_menus("🔄 Song search has been closed by admin.")
+    bot.send_message(m.chat.id,"🔴 <b>SONG SEARCH CLOSED IN BOT</b>\n\nThe Search Song button is removed from user menus and automatic song search is OFF.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "✏️ SONG CLOSED MESSAGE")
+def admin_song_closed_message(m):
+    if not is_admin(m.from_user.id): return
+    current=_song_search_closed_message()
+    msg=bot.send_message(m.chat.id,f"✏️ <b>SONG CLOSED MESSAGE</b>\n\nCurrent:\n<code>{html.escape(current)}</code>\n\nSend the new message:",parse_mode="HTML")
+    bot.register_next_step_handler(msg,admin_song_closed_message_step)
+
+def admin_song_closed_message_step(m):
+    if not is_admin(m.from_user.id): return
+    value=_music_clean_text(m.text)
+    if not value:
+        bot.send_message(m.chat.id,"❌ Message cannot be empty."); return
+    set_setting("song_search_closed_message",value)
+    bot.send_message(m.chat.id,f"✅ <b>Song closed message updated.</b>\n\n{html.escape(value)}",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "⚡ AUTO SONG SEARCH ON")
+def admin_auto_song_on(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_auto_search_enabled",True); set_setting("song_search_enabled",True)
+    _refresh_all_user_menus("🔄 Song search is now available.")
+    bot.send_message(m.chat.id,"⚡ <b>AUTO SONG SEARCH ON</b>\n\nAny normal text that is not a button or command can be used to search for a song/artist automatically.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "⛔ AUTO SONG SEARCH OFF")
+def admin_auto_song_off(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_auto_search_enabled",False)
+    # Manual Search Song remains available while the global song system is open.
+    bot.send_message(m.chat.id,"⛔ <b>AUTO SONG SEARCH OFF</b>\n\nNormal text will no longer trigger song search automatically. Users can still use the <b>🔎 Search Song</b> button.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD CAPTION")
+def admin_add_song_caption(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_caption", "")
+    bot.send_message(m.chat.id, "🔒 <b>SONG CAPTION LOCKED</b>\n\nAll MP3/music captions are fixed to:\n<code>Downloaded Via\n@Downloadvedioytibot</code>\n\nArtist, album and title stay in Telegram music metadata, not the visible caption.", parse_mode="HTML", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "📝 DEFAULT CAPTION")
+def admin_default_song_caption(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("song_caption", DOWNLOAD_CAPTION)
+    bot.send_message(m.chat.id, "✅ <b>DEFAULT SONG CAPTION RESTORED</b>\n\nNew MP3/music messages will use the normal bot caption.", parse_mode="HTML", reply_markup=admin_menu())
+
+def _top_songs_text(limit=100):
+    try:
+        rows=list(song_stats_col.find().sort("downloads",-1).limit(int(limit)))
+        lines=["🎵 <b>TOP SONGS</b>","",f"Top <b>{len(rows)}</b> downloaded tracks.",""]
+        if not rows:
+            lines.append("No completed song downloads recorded yet.")
+            return "\n".join(lines)
+        for i,x in enumerate(rows,1):
+            title=html.escape(str(x.get("title") or "Unknown title"))
+            artist=html.escape(str(x.get("artist") or "Unknown artist"))
+            lines.append(f"<b>{i}.</b> {title} — {artist} — 🎵 <b>{int(x.get('downloads',0) or 0)}</b>")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Could not load Top Songs: {html.escape(str(e)[:300])}"
+
+@bot.message_handler(func=lambda m: m.text == "🏆 TOP SONGS")
+def admin_top_songs(m):
+    if not is_admin(m.from_user.id): return
+    bot.send_message(m.chat.id,_top_songs_text(100),parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "📊 SONG STATS")
+def admin_song_stats(m):
+    if not is_admin(m.from_user.id): return
+    bot.send_message(m.chat.id,_song_stats_text(),parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🏆 TOP SONG SEARCHERS")
+def admin_top_song_searchers(m):
+    if not is_admin(m.from_user.id): return
+    bot.send_message(m.chat.id,_top_song_searchers_text(100),parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "👑 ADMIN PANEL")
+def open_admin_panel(m):
+    if not is_admin(m.from_user.id):
+        try:
+            bot.send_message(m.chat.id, "❌ You are not admin")
+        except: pass
+        return
+    try:
+        bot.send_message(m.chat.id, "👑 Admin Panel", reply_markup=admin_menu())
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "💰 BALANCE")
+def balance_handler(m):
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m): return
+    uid=str(m.from_user.id)
+    if balance_is_locked(uid):
+        bot.send_message(m.chat.id,balance_locked_message(uid),reply_markup=localized_user_menu(uid),parse_mode="HTML")
+        return
+
+    code=cur_code(uid)
+    available=available_asset_amount(uid)
+    blocked=blocked_amount(uid)
+    pending=pending_withdrawal_amount(uid)
+    hold=hold_amount_usd(uid)
+    crypto_open=crypto_system_open()
+    portfolio=get_portfolio(uid)
+    crypto_rows=[(usd,c,a) for usd,c,a in portfolio_text(uid) if is_crypto(c) and float(a or 0)>0]
+    current_is_crypto=is_crypto(code) and balance_amount(uid)>1e-12
+    has_crypto=bool(crypto_rows or current_is_crypto)
+
+    # When Crypto is closed (or the user has no crypto), keep Balance clean:
+    # Available / Blocked / Pending are the only account buckets shown.
+    if not crypto_open or not has_crypto:
+        pending_block=(
+            f"⏳ <b>Pending Amount</b>\n"
+            f"   <code>{html.escape(format_asset(code,pending))}</code>\n\n"
+            if pending > 1e-12 else ""
+        )
+        text=(
+            "💰 <b>YOUR BALANCE</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 <b>Available Balance</b>\n"
+            f"   <code>{html.escape(format_asset(code,available))}</code>\n\n"
+            f"🔒 <b>Blocked Amount</b>\n"
+            f"   <code>{html.escape(format_asset(code,blocked))}</code>\n\n"
+            + pending_block +
+            "━━━━━━━━━━━━━━━━━━"
+        )
+        bot.send_message(m.chat.id,text,reply_markup=localized_user_menu(uid),parse_mode="HTML")
+        return
+
+    # Crypto OPEN: show the three cash buckets first, then crypto holdings.
+    total_usd=total_assets_usd(uid)
+    text=(
+        "💰 <b>YOUR BALANCE & ASSETS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 <b>Available Balance</b>\n"
+        f"   <code>{html.escape(format_asset(code,available))}</code>"
+        f"   <i>≈ ${asset_to_usd(code,available):,.2f} USD</i>\n\n"
+        f"🔒 <b>Blocked Amount</b>\n"
+        f"   <code>{html.escape(format_asset(code,blocked))}</code>"
+        f"   <i>≈ ${asset_to_usd(code,blocked):,.2f} USD</i>\n\n"
+        + (
+            f"⏳ <b>Pending Amount</b>\n"
+            f"   <code>{html.escape(format_asset(code,pending))}</code>"
+            f"   <i>≈ ${pending_withdrawal_usd(uid):,.2f} USD</i>\n\n"
+            if pending > 1e-12 else ""
+        ) +
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🪙 <b>CRYPTO / INVESTMENTS</b>\n"
+    )
+    if current_is_crypto:
+        text += f"\n• <b>{code}</b>: {balance_amount(uid):,.8f} ≈ ${balance_usd_value(uid):,.2f}\n"
+    if crypto_rows:
+        for usd,c,a in crypto_rows[:30]:
+            text += f"• <b>{html.escape(c)}</b>: {a:,.8f} ≈ ${usd:,.2f}\n"
+    if not current_is_crypto and not crypto_rows:
+        text += "\n• No crypto holdings\n"
+    text += (
+        "\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Total Asset Value:</b> ${total_usd:,.2f} USD\n"
+    )
+    if hold > 0.0000000001:
+        text += f"⏱️ <b>Conversion Hold:</b> ${hold:,.2f} USD\n"
+
+    kb=InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💼 VIEW CRYPTO PORTFOLIO", callback_data="view_portfolio"))
+    if hold > 0.0000000001:
+        kb.add(InlineKeyboardButton("❓ WHAT IS HOLD?",callback_data="what_hold"))
+    bot.send_message(m.chat.id,text,reply_markup=kb,parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c:c.data=="view_portfolio")
+def view_portfolio_callback(call):
+    uid=str(call.from_user.id); refresh_market_rates(False); rows=portfolio_text(uid)
+    lines=["💼 <b>YOUR CRYPTO / CURRENCY PORTFOLIO</b>",""]
+    current=balance_amount(uid)
+    if current>0: lines.append(f"💰 Current: <b>{format_asset(cur_code(uid),current)}</b> ≈ ${balance_usd_value(uid):,.2f}")
+    for usd,c,a in rows: lines.append(f"• <b>{c}</b>: {a:.12f} ≈ ${usd:,.2f}")
+    lines.append("")
+    lines.append(f"📊 <b>Total value:</b> ${total_assets_usd(uid):,.2f} USD")
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,"\n".join(lines))
+
+@bot.callback_query_handler(func=lambda c:c.data=="what_hold")
+def what_hold_callback(call):
+    uid=str(call.from_user.id); now=datetime.now(timezone.utc); hs=list(conversion_holds_col.find({"user_id":uid,"status":"hold"}).sort("created_at",-1).limit(10))
+    lines=["❓ <b>WHAT MEANS HOLD?</b>","","A hold is a temporary security lock applied to funds after a crypto → USD conversion.","","⏱️ Hold duration: <b>1 hour</b>","💵 Held money cannot be withdrawn while the hold is active.","✅ After 1 hour it automatically becomes Available.","👑 Admin can check the source/history and release it early.",""]
+    if hs:
+        for h in hs:
+            exp=parse_seen_time(h.get("expires_at")); sec=max(0,int((exp-now).total_seconds())) if exp else 0; lines.append(f"• ${float(h.get('usd_amount',0)):,.2f} USD — {sec//60}m {sec%60}s remaining")
+    else: lines.append("No active holds.")
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"\n".join(lines))
+
+
+@bot.message_handler(func=lambda m: m.text == "🆔 GET ID")
+def get_id_handler(m):
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m):
+        return
+    uid = str(m.from_user.id)
+    bot_id = str(users.get(uid, {}).get("bot_id", ""))
+    # Use the raw Bot API for copy_text so this keeps working even when
+    # the installed pyTelegramBotAPI version does not expose CopyTextButton.
+    reply_markup = {"inline_keyboard": [
+        [{"text": "📋 Copy BOT ID", "copy_text": {"text": bot_id}}],
+        [{"text": "📋 Copy Telegram ID", "copy_text": {"text": uid}}]
+    ]}
+    try:
+        telegram_api_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        r = requests.post(telegram_api_url, json={
+            "chat_id": m.chat.id,
+            "text": f"🆔 <b>YOUR IDS</b>\n\n🤖 BOT ID: <code>{bot_id}</code>\n👤 Telegram ID: <code>{uid}</code>\n\nTap a button below to copy the ID.",
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup
+        }, timeout=20)
+        if not r.ok:
+            print("GET ID Telegram API error:", r.text[:500])
+    except Exception as e:
+        print("GET ID error:", e)
+        try:
+            bot.send_message(m.chat.id, f"🆔 BOT ID: <code>{bot_id}</code>\n👤 Telegram ID: <code>{uid}</code>")
+        except Exception:
+            pass
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD CUSTOMER")
+def add_customer_handler(m):
+    if not is_admin(m.from_user.id):
+        return
+    current = str(get_setting("customer_username", "scholes1") or "scholes1").strip().lstrip("@")
+    msg = bot.send_message(m.chat.id, "➕ <b>ADD CUSTOMER</b>\n\n" f"Current Customer: <b>@{html.escape(current)}</b>\n\nSend the new customer username.\nExample: <code>@scholes1</code>")
+    bot.register_next_step_handler(msg, save_customer_username)
+
+def save_customer_username(m):
+    if not is_admin(m.from_user.id):
+        return
+    username=(m.text or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        msg=bot.send_message(m.chat.id,"❌ Invalid Telegram username. Example: <code>@scholes1</code>")
+        bot.register_next_step_handler(msg, save_customer_username)
+        return
+    old=str(get_setting("customer_username", "scholes1") or "scholes1").strip().lstrip("@")
+    set_setting("customer_username", username)
+    bot.send_message(m.chat.id, f"✅ <b>CUSTOMER UPDATED</b>\n\nOld: <code>@{html.escape(old)}</code>\nNew: <code>@{html.escape(username)}</code>")
+
+# Backward-compatible handler for old keyboards.
+@bot.message_handler(func=lambda m: m.text == "☎️ CUSTOMER")
+def customer_handler(m):
+    if is_admin(m.from_user.id):
+        return add_customer_handler(m)
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m): return
+    customer = str(get_setting("customer_username", "scholes1") or "scholes1").strip().lstrip("@")
+    try: bot.send_message(m.chat.id, f"☎️ Customer Support:\n@{html.escape(customer)}")
+    except Exception: pass
+
+# ================= CUSTOMER AI — DEDICATED, ACCOUNT-AWARE SUPPORT BOT =================
+# The Customer AI is a separate BotFather bot. It shares the same MongoDB user
+# database as the main bot, so it can answer using the user's live account data.
+# No reply/inline keyboards are used inside the Customer AI: users operate it
+# with /commands or normal natural-language messages.
+
+AI_SUPPORT_PENDING=set()
+_CUSTOMER_AI_USERNAME_CACHE=None
+
+CUSTOMER_AI_SYSTEM_PROMPT = """
+You are the dedicated Customer AI for this Telegram service. Be accurate,
+helpful, calm and professional. Understand English, Somali, Arabic, French and Spanish. Never invent
+account data, balances, Premium expiry, verification state, withdrawal status,
+crypto prices, bans, or system settings. Use live MongoDB/system data when
+available. The Customer AI knows the complete user-facing system: account,
+profile, balance, blocked/hold, balance lock, Premium/trial, verification,
+Gmail/D7 SMS/WaForge WhatsApp, crypto, fees, deposits, YouTube Premium-only,
+downloads, music/MP3, referral, withdrawal, Force Join, language and support.
+For admins it can also inspect system health and user reports through admin-only
+commands. It must never expose another user's private data to a normal user.
+"""
+
+
+def _support_ticket_code():
+    return "TKT-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + secrets.token_hex(3).upper()
+
+
+def _support_start_keyboard(lang="en"):
+    labels={"en":"📩 Contact admin directly","so":"📩 La xiriir Admin si toos ah","ar":"📩 تواصل مع المسؤول مباشرة","fr":"📩 Contacter l’admin directement","es":"📩 Contactar al administrador"}
+    kb=ReplyKeyboardMarkup(resize_keyboard=True,row_width=1)
+    kb.add(labels.get(lang,labels["en"]))
+    return kb
+
+def _support_button_labels():
+    return {"📩 Contact admin directly","📩 La xiriir Admin si toos ah","📩 تواصل مع المسؤول مباشرة","📩 Contacter l’admin directement","📩 Contactar al administrador"}
+
+def _support_find_open_ticket(uid):
+    try:
+        return SUPPORT_TICKETS_COL.find_one({"user_id":str(uid),"status":{"$in":list(SUPPORT_TICKET_OPEN_STATUSES)}},sort=[("created_at",-1)])
+    except Exception as e:
+        print("Support open-ticket lookup error:",repr(e)); return None
+
+def _support_ticket_user_text(ticket, lang="en"):
+    code=html.escape(str(ticket.get("code","")))
+    status=html.escape(str(ticket.get("status","under_review")).replace("_"," ").title())
+    texts={
+      "en":f"🎫 <b>Your support ticket is still under review.</b>\n\nTicket: <code>{code}</code>\nStatus: <b>{status}</b>\n\nYour complaint is still active. You do not need to submit it again. The admin team will contact you.",
+      "so":f"🎫 <b>Cabashadaada weli waa la eegayaa.</b>\n\nTicket: <code>{code}</code>\nXaalad: <b>{status}</b>\n\nCabashadaadu weli way furan tahay. Mar kale uma baahnid inaad gudbiso. Admin-ka ayaa kula soo xiriiri doona.",
+      "ar":f"🎫 <b>طلبك لا يزال قيد المراجعة.</b>\n\nالتذكرة: <code>{code}</code>\nالحالة: <b>{status}</b>\n\nلا تحتاج إلى إرسال الشكوى مرة أخرى. سيتواصل معك المسؤول.",
+      "fr":f"🎫 <b>Votre ticket est toujours en cours d’examen.</b>\n\nTicket : <code>{code}</code>\nStatut : <b>{status}</b>\n\nVous n’avez pas besoin de renvoyer votre demande. L’administration vous contactera.",
+      "es":f"🎫 <b>Tu ticket sigue en revisión.</b>\n\nTicket: <code>{code}</code>\nEstado: <b>{status}</b>\n\nNo necesitas enviar otra vez la solicitud. El administrador se pondrá en contacto contigo."
+    }
+    return texts.get(lang,texts["en"])
+
+def _support_ticket_text(ticket):
+    return (f"🎫 <b>SUPPORT TICKET {html.escape(ticket['code'])}</b>\n\n"
+            f"👤 Name: <b>{html.escape(ticket.get('name',''))}</b>\n"
+            f"🆔 Telegram ID: <code>{html.escape(str(ticket.get('user_id','')))}</code>\n"
+            f"📱 Phone: <code>{html.escape(ticket.get('phone','Not provided'))}</code>\n"
+            f"📧 Gmail: <code>{html.escape(ticket.get('email','Not provided'))}</code>\n"
+            f"💬 Request / complaint:\n{html.escape(ticket.get('issue',''))}\n\n"
+            f"🌍 Language: <b>{html.escape(ticket.get('language','en'))}</b>\n"
+            f"📌 Status: <b>{html.escape(str(ticket.get('status','under_review')).replace('_',' ').title())}</b>\n"
+            f"⏰ {html.escape(ticket.get('created_at',''))}")
+
+def _support_begin(customer_bot,message):
+    uid=str(message.from_user.id)
+    if uid not in users: return
+    lang=_ai_language(uid) or lang_of(uid) or "en"
+    existing=_support_find_open_ticket(uid)
+    if existing:
+        customer_bot.send_message(message.chat.id,_support_ticket_user_text(existing,lang),parse_mode="HTML",reply_markup=_support_start_keyboard(lang)); return
+    SUPPORT_TICKET_REQUESTS[uid]={"user_id":uid,"name":message.from_user.full_name or users[uid].get("first_name") or "User","username":message.from_user.username or users[uid].get("username") or "","language":lang,"phone":"","email":"","issue":"","created_at":datetime.now(timezone.utc).isoformat()}
+    kb=ReplyKeyboardMarkup(resize_keyboard=True,one_time_keyboard=True,row_width=1)
+    kb.add(KeyboardButton("📱 Share phone number",request_contact=True)); kb.add("⏭️ Skip phone")
+    prompts={"en":"📱 <b>Step 1/3</b>\n\nShare your phone number or tap Skip phone.","so":"📱 <b>Tallaabada 1/3</b>\n\nLa wadaag numberkaaga ama taabo Skip phone.","ar":"📱 <b>الخطوة 1/3</b>\n\nشارك رقم هاتفك أو اضغط تخطي.","fr":"📱 <b>Étape 1/3</b>\n\nPartagez votre numéro ou appuyez sur Ignorer.","es":"📱 <b>Paso 1/3</b>\n\nComparte tu número o pulsa Omitir."}
+    customer_bot.send_message(message.chat.id,prompts.get(lang,prompts["en"]),reply_markup=kb,parse_mode="HTML")
+
+def _support_email_step(customer_bot,message,uid):
+    ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+    if not ticket: return
+    lang=ticket.get("language","en"); kb=ReplyKeyboardMarkup(resize_keyboard=True,one_time_keyboard=True); kb.add("⏭️ Skip Gmail")
+    prompts={"en":"📧 <b>Step 2/3</b>\n\nEnter your Gmail address or tap Skip Gmail.","so":"📧 <b>Tallaabada 2/3</b>\n\nGeli Gmail-kaaga ama taabo Skip Gmail.","ar":"📧 <b>الخطوة 2/3</b>\n\nأدخل Gmail الخاص بك أو اضغط تخطي.","fr":"📧 <b>Étape 2/3</b>\n\nEntrez votre Gmail ou appuyez sur Ignorer.","es":"📧 <b>Paso 2/3</b>\n\nIntroduce tu Gmail o pulsa Omitir."}
+    customer_bot.send_message(message.chat.id,prompts.get(lang,prompts["en"]),reply_markup=kb,parse_mode="HTML")
+
+def _support_issue_step(customer_bot,message,uid):
+    ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+    if not ticket: return
+    lang=ticket.get("language","en")
+    prompts={"en":"💬 <b>Step 3/3</b>\n\nWrite exactly what you need or the problem you are experiencing.","so":"💬 <b>Tallaabada 3/3</b>\n\nQor waxa aad rabto ama dhibaatada aad qabto si faahfaahsan.","ar":"💬 <b>الخطوة 3/3</b>\n\nاكتب ما تحتاجه أو المشكلة التي تواجهها بالتفصيل.","fr":"💬 <b>Étape 3/3</b>\n\nÉcrivez ce dont vous avez besoin ou le problème rencontré.","es":"💬 <b>Paso 3/3</b>\n\nEscribe lo que necesitas o el problema que tienes."}
+    customer_bot.send_message(message.chat.id,prompts.get(lang,prompts["en"]),reply_markup=ReplyKeyboardRemove(),parse_mode="HTML")
+
+def _support_admin_keyboard(ticket_code):
+    kb=InlineKeyboardMarkup(row_width=3)
+    kb.add(InlineKeyboardButton("❌ Reject",callback_data=f"ticket:reject:{ticket_code}"),InlineKeyboardButton("🔧 Fix",callback_data=f"ticket:fix:{ticket_code}"),InlineKeyboardButton("💬 Contact User",callback_data=f"ticket:contact:{ticket_code}"))
+    return kb
+
+def _support_get_ticket(code):
+    try: return SUPPORT_TICKETS_COL.find_one({"code":str(code)})
+    except Exception as e: print("Support ticket fetch error:",repr(e)); return None
+
+def _support_update_status(code,status,admin_id):
+    try:
+        SUPPORT_TICKETS_COL.update_one({"code":str(code)},{"$set":{"status":status,"last_updated_at":datetime.now(timezone.utc).isoformat(),"handled_by":str(admin_id)}})
+        return _support_get_ticket(code)
+    except Exception as e: print("Support ticket update error:",repr(e)); return None
+
+def _support_notify_user(ticket,kind):
+    uid=int(ticket.get("user_id")); lang=ticket.get("language","en"); code=html.escape(str(ticket.get("code")))
+    texts={
+      "fix":{"en":f"✅ <b>Your support ticket has been fixed.</b>\n\nTicket: <code>{code}</code>\nThe reported problem has been marked as resolved. If you still have the problem, contact admin again.","so":f"✅ <b>Cabashadaada waa la xaliyay.</b>\n\nTicket: <code>{code}</code>\nDhibaatadii aad soo gudbisay admin-ku wuxuu u calaamadeeyay inay xallantay. Haddii ay weli jirto, mar kale la xiriir Admin.","ar":f"✅ <b>تم حل طلب الدعم.</b>\n\nالتذكرة: <code>{code}</code>\nتم وضع المشكلة كتم الحل. إذا استمرت، تواصل مع المسؤول مرة أخرى.","fr":f"✅ <b>Votre problème a été résolu.</b>\n\nTicket : <code>{code}</code>\nLe problème a été marqué comme résolu. Contactez à nouveau l’administration s’il persiste.","es":f"✅ <b>Tu problema ha sido solucionado.</b>\n\nTicket: <code>{code}</code>\nEl problema se marcó como resuelto. Contacta de nuevo al administrador si continúa."},
+      "reject":{"en":f"❌ <b>Your support ticket was rejected.</b>\n\nTicket: <code>{code}</code>\nIf you believe this is incorrect, you can submit a new request.","so":f"❌ <b>Cabashadaada waa la diiday.</b>\n\nTicket: <code>{code}</code>\nHaddii aad u malaynayso in khalad jiro, waxaad gudbin kartaa codsi cusub.","ar":f"❌ <b>تم رفض طلب الدعم.</b>\n\nالتذكرة: <code>{code}</code>\nيمكنك إرسال طلب جديد إذا لزم الأمر.","fr":f"❌ <b>Votre ticket a été rejeté.</b>\n\nTicket : <code>{code}</code>\nVous pouvez envoyer une nouvelle demande si nécessaire.","es":f"❌ <b>Tu ticket fue rechazado.</b>\n\nTicket: <code>{code}</code>\nPuedes enviar una nueva solicitud si es necesario."}}
+    try: customer_ai_bot.send_message(uid,texts[kind].get(lang,texts[kind]["en"]),parse_mode="HTML",reply_markup=_support_start_keyboard(lang))
+    except Exception as e: print("Support user notify error:",repr(e))
+
+def _finish_support_ticket(customer_bot,message,uid):
+    ticket=SUPPORT_TICKET_REQUESTS.pop(str(uid),None)
+    if not ticket: return
+    ticket["code"]=_support_ticket_code(); ticket["status"]="under_review"; ticket["last_updated_at"]=datetime.now(timezone.utc).isoformat()
+    try: SUPPORT_TICKETS_COL.insert_one(dict(ticket))
+    except Exception as e: print("Support ticket DB error:",repr(e))
+    text=_support_ticket_text(ticket)
+    for aid in SUPPORT_ADMIN_IDS:
+        try: customer_ai_bot.send_message(int(aid),text,parse_mode="HTML",reply_markup=_support_admin_keyboard(ticket["code"]))
+        except Exception as e: print("Support admin Customer AI notify error:",repr(e))
+        try: bot.send_message(int(aid),text,parse_mode="HTML",reply_markup=_support_admin_keyboard(ticket["code"]))
+        except Exception as e: print("Support admin main-bot notify error:",repr(e))
+    lang=ticket.get("language","en")
+    done={"en":f"✅ <b>Ticket created.</b>\n\nTicket code: <code>{ticket['code']}</code>\nYour request was sent directly to both admins. You will be contacted after review.","so":f"✅ <b>Ticket waa la sameeyay.</b>\n\nTicket code: <code>{ticket['code']}</code>\nCabashadaada labada Admin si toos ah ayaa loogu diray. Kadib dib ayaa lagula soo xiriiri doonaa.","ar":f"✅ <b>تم إنشاء التذكرة.</b>\n\nرمز التذكرة: <code>{ticket['code']}</code>\nتم إرسال طلبك مباشرة إلى المسؤولين.","fr":f"✅ <b>Ticket créé.</b>\n\nCode: <code>{ticket['code']}</code>\nVotre demande a été envoyée directement aux administrateurs.","es":f"✅ <b>Ticket creado.</b>\n\nCódigo: <code>{ticket['code']}</code>\nTu solicitud fue enviada directamente a los administradores."}
+    customer_bot.send_message(message.chat.id,done.get(lang,done["en"]),reply_markup=_support_start_keyboard(lang),parse_mode="HTML")
+
+def _customer_ai_identity():
+    """Always resolve the username from the CURRENT CUSTOMER_AI_BOT_TOKEN.
+    This prevents an old Mongo setting such as @SupdownloaderBot from being shown after the token changes.
+    """
+    global _CUSTOMER_AI_USERNAME_CACHE
+    if not customer_ai_bot or not CUSTOMER_AI_BOT_TOKEN:
+        return ""
+    try:
+        me=customer_ai_bot.get_me()
+        if me and me.username:
+            username=str(me.username).lstrip("@")
+            _CUSTOMER_AI_USERNAME_CACHE=username
+            try: set_setting("customer_ai_username",username)
+            except Exception: pass
+            return username
+    except Exception as e:
+        print("Customer AI get_me error:",e)
+    return _CUSTOMER_AI_USERNAME_CACHE or ""
+
+
+def _ai_language(uid):
+    uid=str(uid)
+    value=users.get(uid,{}).get("customer_ai_language") or users.get(uid,{}).get("language")
+    return value if value in ("en","so","ar","fr","es") else None
+
+
+def _set_ai_language(uid, language):
+    uid=str(uid); language=str(language or "").lower()
+    if uid not in users or language not in LANGUAGES: return False
+    users[uid]["customer_ai_language"]=language
+    users[uid]["language"]=language
+    save_user(uid); return True
+
+
+def _ai_language_keyboard():
+    kb=InlineKeyboardMarkup(row_width=2)
+    for code in ("en","so","ar","fr","es"):
+        kb.add(InlineKeyboardButton(LANGUAGES[code]["name"],callback_data=f"cai_lang:{code}"))
+    return kb
+
+
+def _ai_choose_language_text():
+    return ("🤖 <b>WELCOME TO CUSTOMER SUPPORT</b>\n\n"
+            "Choose one of the 5 languages below. Your choice will be used for future replies.\n\n"
+            "Dooro mid ka mid ah 5-ta luqadood. Luqadda aad doorato ayaa laguugu jawaabi doonaa.\n\n"
+            "You can change it anytime with <code>/language</code>.")
+
+
+def _ai_help_text(lang="en", admin=False):
+    if lang=="ar":
+        return ("🤖 <b>دعم العملاء</b>\n\nاسأل عن الرصيد، Premium، التنزيلات، MUSIC/MP3، السحب، الإحالات، التحقق أو أي مشكلة في الخدمة.\n\n<code>/language</code> — تغيير اللغة\n<code>/help</code> — المساعدة\nيمكنك أيضًا الضغط على <b>Contact admin directly</b> لإرسال تذكرة للمسؤولين.")
+    if lang=="fr":
+        return ("🤖 <b>SUPPORT CLIENT</b>\n\nDemandez de l’aide pour le solde, Premium, téléchargements, MUSIC/MP3, retraits, parrainage, vérification ou problèmes du service.\n\n<code>/language</code> — changer de langue\n<code>/help</code> — aide\nVous pouvez aussi utiliser <b>Contact admin directly</b> pour créer un ticket.")
+    if lang=="es":
+        return ("🤖 <b>SOPORTE AL CLIENTE</b>\n\nPregunta sobre saldo, Premium, descargas, MUSIC/MP3, retiros, referidos, verificación o problemas del servicio.\n\n<code>/language</code> — cambiar idioma\n<code>/help</code> — ayuda\nTambién puedes usar <b>Contact admin directly</b> para crear un ticket.")
+    if lang=="so":
+        base=(
+            "🤖 <b>CUSTOMER AI — CAWIMAAD BUUXDA</b>\n\n"
+            "Waxaad iigu qori kartaa su'aashaada si caadi ah; buttons looma baahna. Waxaan akhriyaa xogta account-kaaga live marka ay jirto.\n\n"
+            "<b>Commands:</b>\n"
+            "/balance — Haraaga iyo lacagta blocked\n"
+            "/profile — Profile, Telegram ID iyo Bot ID\n"
+            "/premium — Premium/Trial iyo expiry\n"
+            "/verification — Xaqiijinta account-ka\n"
+            "/crypto — Crypto access iyo xaaladdaada\n"
+            "/downloads — Download help\n"
+            "/music — Music/MP3 help\n"
+            "/withdrawal — Withdrawal iyo status-kaaga\n"
+            "/referral — Referral-kaaga\n"
+            "/system — Adeegyada aan kaa caawin karo\n"
+            "/language — Beddel 5-ta luqadood\n"
+            "/help — Help-kan\n\n"
+            "Tusaale: <i>“Maxaa balance-kayga loo xiray?”</i>, <i>“Withdrawal-kaygu xaggee marayaa?”</i>, ama <i>“YouTube maxaa Premium looga dhigay?”</i>."
+        )
+        if admin:
+            base += ("\n\n<b>ADMIN COMMANDS:</b>\n"
+                     "/system — Live system dashboard\n"
+                     "/user ID|BOTID|@username — User report\n"
+                     "/users — User statistics\n"
+                     "/balances — Balance statistics\n"
+                     "/withdrawals — Withdrawal statistics\n"
+                     "/banned — Banned users\n"
+                     "/locks — Balance locks\n"
+                     "/admins — Admin list")
+        return base
+    base=(
+        "🤖 <b>CUSTOMER AI — FULL SUPPORT</b>\n\n"
+        "Ask me anything naturally; no buttons are required. I can read your live account data when available.\n\n"
+        "<b>Commands:</b>\n"
+        "/balance — Your balance and blocked amount\n"
+        "/profile — Profile, Telegram ID and Bot ID\n"
+        "/premium — Premium/Trial and expiry\n"
+        "/verification — Account verification\n"
+        "/crypto — Crypto access and your status\n"
+        "/downloads — Download help\n"
+        "/music — Music/MP3 help\n"
+        "/withdrawal — Your withdrawal status\n"
+        "/referral — Referral information\n"
+        "/system — What I can help you with\n"
+        "/language — Change among 5 languages\n"
+        "/help — This help\n\n"
+        "Examples: <i>“Why is my balance closed?”</i>, <i>“Check my withdrawal”</i>, or <i>“Why is YouTube Premium-only?”</i>."
+    )
+    if admin:
+        base += ("\n\n<b>ADMIN COMMANDS:</b>\n"
+                 "/system — Live system dashboard\n"
+                 "/user ID|BOTID|@username — User report\n"
+                 "/users — User statistics\n"
+                 "/balances — Balance statistics\n"
+                 "/withdrawals — Withdrawal statistics\n"
+                 "/banned — Banned users\n"
+                 "/locks — Balance locks\n"
+                 "/admins — Admin list")
+    return base
+
+
+def _ai_user_context(uid):
+    uid=str(uid)
+    u=users.get(uid,{})
+    try:
+        deposited=total_account_deposits_usd(uid)
+        allowed,remaining,minimum=crypto_access_status(uid)
+    except Exception:
+        deposited=0.0; allowed=False; remaining=0.0; minimum=crypto_min_deposit_usd()
+    try:
+        downloads=int(videos_data.get("users",{}).get(uid,0) or 0)
+    except Exception:
+        downloads=0
+    try: verified=user_is_verified(uid) if uid in users else False
+    except Exception: verified=bool(u.get("verified"))
+    try: premium=is_premium(uid)
+    except Exception: premium=False
+    try: locked=balance_is_locked(uid)
+    except Exception: locked=bool(u.get("balance_locked"))
+    return {
+        "uid":uid,"username":u.get("username") or "","name":u.get("first_name") or "User",
+        "bot_id":u.get("bot_id") or "N/A","balance":balance_amount(uid),"asset":cur_code(uid),
+        "balance_usd":balance_usd_value(uid),"blocked":blocked_amount(uid),"pending":pending_withdrawal_amount(uid),"pending_usd":pending_withdrawal_usd(uid),
+        "portfolio_usd":portfolio_usd_value(uid),"total_assets_usd":total_assets_usd(uid),
+        "premium_platforms":premium_platform_names(),"premium_platform_count":len(premium_platform_names()),
+        "verified":verified,"verification_method":u.get("verification_method") or "N/A",
+        "email":u.get("email") or "N/A","phone":u.get("phone") or "N/A", "banned":bool(u.get("banned")),
+        "premium":premium,"premium_until":premium_until_text(uid) if premium else "Not active",
+        "trial_available":trial_available(uid) if uid in users else False,"downloads":downloads,
+        "language":lang_of(uid),"ai_language":_ai_language(uid) or "Not selected",
+        "crypto_open":crypto_system_open(),"crypto_allowed":allowed,"crypto_remaining":remaining,
+        "crypto_minimum":minimum,"deposited":deposited,"balance_locked":locked,
+        "youtube_special":bool(u.get("youtube_30m")),"referrals":int(u.get("invited",0) or 0),
+        "city":u.get("city") or "N/A","gender":u.get("gender") or "N/A",
+    }
+
+
+def _ai_system_context():
+    return {
+        "crypto":"OPEN" if crypto_system_open() else "CLOSED",
+        "crypto_hold":"OPEN" if crypto_hold_open() else "CLOSED",
+        "crypto_min_deposit":crypto_min_deposit_usd(),"crypto_fee_percent":crypto_fee_percent(),
+        "premium":"OPEN" if bool(get_setting("premium_enabled",True)) else "CLOSED",
+        "premium_verification":"REQUIRED" if premium_verification_required() else "NOT REQUIRED",
+        "sms":"OPEN" if bool(get_setting("sms_enabled",False)) else "CLOSED",
+        "whatsapp":"OPEN" if bool(get_setting("whatsapp_verify_enabled",False)) and bool(WAFORGE_API_KEY) else "CLOSED",
+        "verify":"ON" if VERIFY_ENABLED else "OFF",
+        "free_minutes":int(get_setting("free_max_minutes",FREE_MAX_MINUTES_DEFAULT) or FREE_MAX_MINUTES_DEFAULT),
+        "premium_minutes":int(get_setting("premium_max_minutes",PREMIUM_MAX_MINUTES_DEFAULT) or PREMIUM_MAX_MINUTES_DEFAULT),
+        "free_mb":int(get_setting("free_max_mb",49) or 49),"premium_mb":int(get_setting("premium_max_mb",0) or 0),
+        "rapidapi_youtube":bool(RAPIDAPI_YT_KEY),"cobalt":bool(COBALT_API_URL),"d7_sms":bool(D7_TOKEN),
+        "waforge_whatsapp":bool(WAFORGE_API_KEY),"resend_email":bool(RESEND_API_KEY),
+        "force_join":bool(CHANNEL_WINDOW_OPEN),"users":len(users),"admins":len(get_admin_ids()),
+        "downloads":int(videos_data.get("total",0) or 0),
+    }
+
+
+def _ai_find_user(query):
+    q=(query or "").strip().lstrip("@").lower()
+    if not q: return None
+    if q in users: return q
+    found=find_user_by_botid(q)
+    if found: return found
+    for uid,data in users.items():
+        if str(data.get("username","")).lstrip("@").lower()==q: return uid
+    return None
+
+
+def _ai_withdrawals_for(uid):
+    uid=str(uid)
+    return [w for w in withdraws if str(w.get("user"))==uid or str(w.get("user_id"))==uid]
+
+
+def _ai_user_report(uid, admin=False, lang="en"):
+    c=_ai_user_context(uid)
+    username=("@"+c["username"]) if c["username"] else "No username"
+    status="LOCKED" if c["balance_locked"] else "OPEN"
+    verify="Verified" if c["verified"] else "Not verified"
+    premium="ACTIVE" if c["premium"] else "Not active"
+    if lang=="so":
+        lines=["🤖 <b>CUSTOMER AI — XOGTA ACCOUNT-KA</b>","",
+               f"👤 Magac: <b>{html.escape(c['name'])}</b>",f"🔗 Username: <b>{html.escape(username)}</b>",
+               f"🆔 Telegram ID: <code>{c['uid']}</code>",f"🤖 Bot ID: <code>{html.escape(str(c['bot_id']))}</code>",
+               f"🌍 Luqadda AI: <b>{html.escape(str(c['ai_language']))}</b>",f"🔐 Verification: <b>{verify}</b>",
+               f"💎 Premium: <b>{premium}</b>"+(f" ilaa <b>{html.escape(c['premium_until'])}</b>" if c['premium'] else ""),
+               f"💰 Balance: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>",f"💵 USD value: <b>${c['balance_usd']:,.2f}</b>",
+               f"🔒 Blocked: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>",
+               f"💼 Total assets: <b>${c['total_assets_usd']:,.2f}</b>",f"🔐 Balance status: <b>{status}</b>",
+               f"🪙 Crypto access: <b>{'ALLOWED' if c['crypto_allowed'] else 'LOCKED'}</b>",
+               f"💳 Deposited/credited: <b>${c['deposited']:,.2f}</b>",f"📥 Downloads: <b>{c['downloads']}</b>",
+               f"👥 Referrals: <b>{c['referrals']}</b>",f"🚫 Banned: <b>{'YES' if c['banned'] else 'NO'}</b>"]
+        if c["pending"] > 1e-12:
+            lines.insert(11, f"⏳ Pending: <b>{html.escape(format_asset(c['asset'],c['pending']))}</b>")
+        if admin: lines += [f"📧 Email: <code>{html.escape(str(c['email']))}</code>",f"📱 Phone: <code>{html.escape(str(c['phone']))}</code>",f"🏙 City: <b>{html.escape(str(c['city']))}</b>"]
+        return "\n".join(lines)
+    lines=["🤖 <b>CUSTOMER AI — ACCOUNT REPORT</b>","",
+           f"👤 Name: <b>{html.escape(c['name'])}</b>",f"🔗 Username: <b>{html.escape(username)}</b>",
+           f"🆔 Telegram ID: <code>{c['uid']}</code>",f"🤖 Bot ID: <code>{html.escape(str(c['bot_id']))}</code>",
+           f"🌍 AI language: <b>{html.escape(str(c['ai_language']))}</b>",f"🔐 Verification: <b>{verify}</b>",
+           f"💎 Premium: <b>{premium}</b>"+(f" until <b>{html.escape(c['premium_until'])}</b>" if c['premium'] else ""),
+           f"💰 Balance: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>",f"💵 USD value: <b>${c['balance_usd']:,.2f}</b>",
+           f"🔒 Blocked: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>",
+           f"💼 Total assets: <b>${c['total_assets_usd']:,.2f}</b>",f"🔐 Balance status: <b>{status}</b>",
+           f"🪙 Crypto access: <b>{'ALLOWED' if c['crypto_allowed'] else 'LOCKED'}</b>",
+           f"💳 Deposited/credited: <b>${c['deposited']:,.2f}</b>",f"📥 Downloads: <b>{c['downloads']}</b>",
+           f"👥 Referrals: <b>{c['referrals']}</b>",f"🚫 Banned: <b>{'YES' if c['banned'] else 'NO'}</b>"]
+    if c["pending"] > 1e-12:
+        lines.insert(11, f"⏳ Pending: <b>{html.escape(format_asset(c['asset'],c['pending']))}</b>")
+    if admin: lines += [f"📧 Email: <code>{html.escape(str(c['email']))}</code>",f"📱 Phone: <code>{html.escape(str(c['phone']))}</code>",f"🏙 City: <b>{html.escape(str(c['city']))}</b>"]
+    return "\n".join(lines)
+
+
+def _ai_withdrawal_report(uid, lang="en"):
+    rows=_ai_withdrawals_for(uid)
+    if not rows:
+        return "💸 <b>Withdrawal</b>\n\nYou have no withdrawal requests yet." if lang=="en" else "💸 <b>Withdrawal</b>\n\nWeli ma lihid withdrawal request."
+    rows=sorted(rows,key=lambda x:str(x.get("time", "")),reverse=True)[:10]
+    lines=["💸 <b>YOUR WITHDRAWALS</b>",""] if lang=="en" else ["💸 <b>WITHDRAWAL-KAAGA</b>",""]
+    for w in rows:
+        lines.append(f"🧾 <code>{html.escape(str(w.get('id','N/A')))}</code> | {html.escape(str(w.get('status','unknown')).upper())} | {html.escape(str(w.get('asset','USD')))} {float(w.get('amount',0) or 0):,.6f} | ${float(w.get('amount_usd',0) or 0):,.2f}")
+    return "\n".join(lines)
+
+
+def _ai_system_overview(lang="en", admin=False):
+    if admin:
+        sc=_ai_system_context()
+        if lang=="so":
+            return ("👑 <b>ADMIN AI — LIVE SYSTEM DASHBOARD</b>\n\n"
+                    f"👥 Users: <b>{sc['users']}</b>\n👑 Admins: <b>{sc['admins']}</b>\n📥 Downloads: <b>{sc['downloads']}</b>\n"
+                    f"💎 Premium: <b>{sc['premium']}</b>\n🔐 Premium verification: <b>{sc['premium_verification']}</b>\n"
+                    f"🪙 Crypto: <b>{sc['crypto']}</b>\n⏳ Hold: <b>{sc['crypto_hold']}</b>\n💰 Minimum: <b>${sc['crypto_min_deposit']:.2f}</b>\n"
+                    f"💸 Crypto fee: <b>{sc['crypto_fee_percent']:.2f}%</b>\n📲 Verification: <b>{sc['verify']}</b>\n📢 Force Join: <b>{'OPEN' if sc['force_join'] else 'CLOSED'}</b>")
+        return ("👑 <b>ADMIN AI — LIVE SYSTEM DASHBOARD</b>\n\n"
+                f"👥 Users: <b>{sc['users']}</b>\n👑 Admins: <b>{sc['admins']}</b>\n📥 Downloads: <b>{sc['downloads']}</b>\n"
+                f"💎 Premium: <b>{sc['premium']}</b>\n🔐 Premium verification: <b>{sc['premium_verification']}</b>\n"
+                f"🪙 Crypto: <b>{sc['crypto']}</b>\n⏳ Hold: <b>{sc['crypto_hold']}</b>\n💰 Minimum: <b>${sc['crypto_min_deposit']:.2f}</b>\n"
+                f"💸 Crypto fee: <b>{sc['crypto_fee_percent']:.2f}%</b>\n📲 Verification: <b>{sc['verify']}</b>\n📢 Force Join: <b>{'OPEN' if sc['force_join'] else 'CLOSED'}")
+    count=len(premium_platform_names())
+    if lang=="so":
+        return ("🤖 <b>CAWIMAADDA ADEEGGA</b>\n\n"
+                "Waxaan kaa caawin karaa account-kaaga, Balance, Premium/Trial, downloads, Music, Withdrawal, Referral, verification, Crypto iyo khaladaadka adeegga.\n\n"
+                f"💎 Premium/Trial: <b>{count} platforms</b>\n"
+                "Waxaan kuu sharxi karaa waxa aad samaynayso marka dhibaato dhacdo, laakiin ma bixinayo xogta gudaha, maamulka, amniga ama hababka system-ka.")
+    return ("🤖 <b>SERVICE HELP</b>\n\n"
+            "I can help with your account, Balance, Premium/Trial, downloads, Music, Withdrawal, Referral, verification, Crypto and service errors.\n\n"
+            f"💎 Premium/Trial: <b>{count} platforms</b>\n"
+            "I can explain what you should do when something goes wrong, but I do not expose internal system, admin, security or implementation details.")
+
+
+def _ai_localized_fast_answer(uid,q,lang):
+    """Deterministic multilingual support layer; no AI/API is used."""
+    qn=(q or "").lower()
+    c=_ai_user_context(uid)
+    def has(*terms): return any(t in qn for t in terms)
+    if lang=="ar":
+        if has("balance","رصيد","الرصيد","مال","فلوس"): return f"💰 <b>رصيدك</b>\n\nالمتاح: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>\nالمحجوز: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>"
+        if has("premium","بريميوم","vip","تجربة"): return f"💎 <b>PREMIUM / TRIAL</b>\n\nالحالة: <b>{'ACTIVE' if c['premium'] else 'NOT ACTIVE'}</b>\nالانتهاء: <b>{html.escape(c['premium_until'])}</b>\nعدد المنصات: <b>{c['premium_platform_count']}</b>"
+        if has("youtube","يوتيوب","shorts"): return "▶️ <b>YOUTUBE</b>\n\nShorts مجانية. فيديوهات YouTube العادية المجانية حتى 12 دقيقة؛ الأطول يحتاج Premium/Trial."
+        if has("download","تحميل","فيديو","رابط"): return "📥 <b>التنزيل</b>\n\nأرسل رابط الفيديو وسأساعدك في معرفة المنصة والحالة. إذا لم يعمل الرابط، أرسل الخطأ إلى الدعم."
+        if has("music","mp3","أغنية","اغنية"): return "🎵 <b>MUSIC / MP3</b>\n\nيمكنك تحويل الفيديو الذي تم تنزيله إلى MP3 من زر MUSIC."
+        if has("withdraw","سحب","سحب الأموال"): return _ai_withdrawal_report(uid,"ar")
+        if has("referral","إحالة","دعوة"): return f"👥 <b>الإحالات</b>\n\nعدد المدعوين: <b>{c['referrals']}</b>\nالمكافأة الحالية: <b>${referral_reward_amount():.2f}</b>"
+        if has("verify","verification","تحقق","رمز"): return f"🔐 <b>التحقق</b>\n\nحالة حسابك: <b>{'Verified' if c['verified'] else 'Not Verified'}</b>"
+        if has("help","مساعدة","ساعد","ماذا يمكنك"): return _ai_help_text("ar",False)
+    elif lang=="fr":
+        if has("balance","solde","argent"): return f"💰 <b>VOTRE SOLDE</b>\n\nDisponible: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>\nBloqué: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>"
+        if has("premium","vip","essai","trial"): return f"💎 <b>PREMIUM / ESSAI</b>\n\nStatut: <b>{'ACTIVE' if c['premium'] else 'NOT ACTIVE'}</b>\nExpiration: <b>{html.escape(c['premium_until'])}</b>\nPlateformes: <b>{c['premium_platform_count']}</b>"
+        if has("youtube","shorts"): return "▶️ <b>YOUTUBE</b>\n\nLes Shorts sont gratuits. Les vidéos YouTube normales sont gratuites jusqu’à 12 minutes; au-delà, Premium/Trial est requis."
+        if has("download","télécharg","video","lien"): return "📥 <b>TÉLÉCHARGEMENTS</b>\n\nEnvoyez le lien vidéo. Si le téléchargement échoue, envoyez l’erreur au support."
+        if has("music","mp3","chanson"): return "🎵 <b>MUSIC / MP3</b>\n\nUtilisez le bouton MUSIC sous la vidéo téléchargée pour créer le MP3."
+        if has("withdraw","retrait"): return _ai_withdrawal_report(uid,"fr")
+        if has("referral","parrainage","inviter"): return f"👥 <b>PARRAINAGE</b>\n\nInvités: <b>{c['referrals']}</b>\nRécompense: <b>${referral_reward_amount():.2f}</b>"
+        if has("verify","vérification","code"): return f"🔐 <b>VÉRIFICATION</b>\n\nStatut: <b>{'Verified' if c['verified'] else 'Not Verified'}</b>"
+        if has("help","aide","que peux"): return _ai_help_text("fr",False)
+    elif lang=="es":
+        if has("balance","saldo","dinero"): return f"💰 <b>TU SALDO</b>\n\nDisponible: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>\nBloqueado: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>"
+        if has("premium","vip","prueba","trial"): return f"💎 <b>PREMIUM / PRUEBA</b>\n\nEstado: <b>{'ACTIVE' if c['premium'] else 'NOT ACTIVE'}</b>\nVencimiento: <b>{html.escape(c['premium_until'])}</b>\nPlataformas: <b>{c['premium_platform_count']}</b>"
+        if has("youtube","shorts"): return "▶️ <b>YOUTUBE</b>\n\nLos Shorts son gratis. Los vídeos normales de YouTube son gratis hasta 12 minutos; más tiempo requiere Premium/Trial."
+        if has("download","descarga","video","enlace","link"): return "📥 <b>DESCARGAS</b>\n\nEnvía el enlace del vídeo. Si falla, envía el mensaje de error al soporte."
+        if has("music","mp3","canción","cancion"): return "🎵 <b>MUSIC / MP3</b>\n\nUsa el botón MUSIC debajo del vídeo descargado para crear el MP3."
+        if has("withdraw","retiro","retirar"): return _ai_withdrawal_report(uid,"es")
+        if has("referral","referido","invitar"): return f"👥 <b>REFERIDOS</b>\n\nInvitados: <b>{c['referrals']}</b>\nRecompensa: <b>${referral_reward_amount():.2f}</b>"
+        if has("verify","verificación","verificacion","código","codigo"): return f"🔐 <b>VERIFICACIÓN</b>\n\nEstado: <b>{'Verified' if c['verified'] else 'Not Verified'}</b>"
+        if has("help","ayuda","qué puedes","que puedes"): return _ai_help_text("es",False)
+    return None
+
+def _ai_intent_answer(uid, q, admin=False, lang="en"):
+    q=re.sub(r"\s+"," ",(q or "").lower().strip())
+    c=_ai_user_context(uid)
+    if not q: return _ai_help_text(lang,admin)
+    if lang in {"ar","fr","es"}:
+        fast=_ai_localized_fast_answer(uid,q,lang)
+        if fast: return fast
+
+    # Admin/system queries first so an admin asking about the system gets the dashboard.
+    if admin and any(x in q for x in ["system status","system dashboard","dashboard","settings","xaaladda bot","system-ka","system"]):
+        sc=_ai_system_context()
+        if lang=="so":
+            return ("👑 <b>ADMIN AI — LIVE SYSTEM DASHBOARD</b>\n\n"
+                    f"👥 Users: <b>{sc['users']}</b>\n👑 Admins: <b>{sc['admins']}</b>\n📥 Downloads: <b>{sc['downloads']}</b>\n"
+                    f"💎 Premium: <b>{sc['premium']}</b>\n🔐 Premium verification: <b>{sc['premium_verification']}</b>\n"
+                    f"🪙 Crypto: <b>{sc['crypto']}</b>\n⏳ Hold: <b>{sc['crypto_hold']}</b>\n💰 Minimum: <b>${sc['crypto_min_deposit']:.2f}</b>\n"
+                    f"💸 Crypto fee: <b>{sc['crypto_fee_percent']:.2f}%</b>\n📲 SMS: <b>{sc['sms']}</b> | WhatsApp: <b>{sc['whatsapp']}</b> | Verify: <b>{sc['verify']}</b>\n"
+                    f"▶️ RapidAPI YouTube: <b>{'READY' if sc['rapidapi_youtube'] else 'NOT SET'}</b>\n📧 Email API: <b>{'READY' if sc['resend_email'] else 'NOT SET'}</b>\n📢 Force Join: <b>{'OPEN' if sc['force_join'] else 'CLOSED'}</b>")
+        return ("👑 <b>ADMIN AI — LIVE SYSTEM DASHBOARD</b>\n\n"
+                f"👥 Users: <b>{sc['users']}</b>\n👑 Admins: <b>{sc['admins']}</b>\n📥 Downloads: <b>{sc['downloads']}</b>\n"
+                f"💎 Premium: <b>{sc['premium']}</b>\n🔐 Premium verification: <b>{sc['premium_verification']}</b>\n"
+                f"🪙 Crypto: <b>{sc['crypto']}</b>\n⏳ Hold: <b>{sc['crypto_hold']}</b>\n💰 Minimum: <b>${sc['crypto_min_deposit']:.2f}</b>\n"
+                f"💸 Crypto fee: <b>{sc['crypto_fee_percent']:.2f}%</b>\n📲 SMS: <b>{sc['sms']}</b> | WhatsApp: <b>{sc['whatsapp']}</b> | Verify: <b>{sc['verify']}</b>\n"
+                f"▶️ RapidAPI YouTube: <b>{'READY' if sc['rapidapi_youtube'] else 'NOT SET'}</b>\n📧 Email API: <b>{'READY' if sc['resend_email'] else 'NOT SET'}</b>\n📢 Force Join: <b>{'OPEN' if sc['force_join'] else 'CLOSED'}")
+
+    if any(x in q for x in ["balance","haraag","haraaga","my money","how much money","lacag intee"]):
+        if c["balance_locked"]:
+            if lang=="so": return _ai_user_report(uid,False,lang)+"\n\n🔒 Balance-kaagu hadda waa xiran yahay. La xiriir Customer/Admin si dib loogu furo."
+            return _ai_user_report(uid,False,lang)+"\n\n🔒 Your balance is currently closed. Contact Customer/Admin to reactivate it."
+        pending_line=(f"\nPending: <b>{html.escape(format_asset(c['asset'],c['pending']))}</b>" if c["pending"]>1e-12 else "")
+        crypto_visible=crypto_system_open() and (c["portfolio_usd"]>1e-12 or is_crypto(c["asset"]))
+        if lang=="so":
+            base=f"💰 <b>HARAAGAAGA</b>\n\nAvailable: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>\nBlocked: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>{pending_line}"
+            if crypto_visible: base+=f"\nPortfolio: <b>${c['portfolio_usd']:,.2f}</b>\nTotal assets: <b>${c['total_assets_usd']:,.2f}</b>"
+            return base
+        base=f"💰 <b>YOUR BALANCE</b>\n\nAvailable: <b>{html.escape(format_asset(c['asset'],c['balance']))}</b>\nBlocked: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>{pending_line}"
+        if crypto_visible: base+=f"\nPortfolio: <b>${c['portfolio_usd']:,.2f}</b>\nTotal assets: <b>${c['total_assets_usd']:,.2f}</b>"
+        return base
+
+    if any(x in q for x in ["blocked","block","xiran","locked","hold","lacagta la qabtay"]):
+        if lang=="so": return f"🔒 <b>BLOCKED / HOLD</b>\n\nBlocked amount: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>\nBalance status: <b>{'CLOSED' if c['balance_locked'] else 'OPEN'}</b>\n" + (f"\n⏳ Pending withdrawal: <b>{html.escape(format_asset(c['asset'],c['pending']))}</b>" if c['pending']>1e-12 else "") + "\n\nHaddii lacagtu xanniban tahay ama withdrawal-ku sugayo, waxaan kuu sharxi karaa tallaabada xigta."
+        return f"🔒 <b>BLOCKED / HOLD</b>\n\nBlocked amount: <b>{html.escape(format_asset(c['asset'],c['blocked']))}</b>\nBalance status: <b>{'CLOSED' if c['balance_locked'] else 'OPEN'}</b>" + (f"\n\n⏳ Pending withdrawal: <b>{html.escape(format_asset(c['asset'],c['pending']))}</b>" if c['pending']>1e-12 else "") + "\n\nIf funds are blocked or a withdrawal is waiting, I can explain the next step."
+
+    if any(x in q for x in ["premium","vip","trial","tijaabo"]):
+        platforms=", ".join(c["premium_platforms"])
+        if lang=="so": return f"💎 <b>PREMIUM / TRIAL</b>\n\nStatus: <b>{'ACTIVE' if c['premium'] else 'NOT ACTIVE'}</b>\nExpiry: <b>{html.escape(c['premium_until'])}</b>\nTrial available: <b>{'YES' if c['trial_available'] else 'NO'}</b>\n\n🌐 <b>{c['premium_platform_count']} Platforms:</b>\n{html.escape(platforms)}\n\n⚡ Priority downloads\n🎥 Quality sare\n▶️ YouTube access\n🎵 Music/MP3 support."
+        return f"💎 <b>PREMIUM / TRIAL</b>\n\nStatus: <b>{'ACTIVE' if c['premium'] else 'NOT ACTIVE'}</b>\nExpiry: <b>{html.escape(c['premium_until'])}</b>\nTrial available: <b>{'YES' if c['trial_available'] else 'NO'}</b>\n\n🌐 <b>{c['premium_platform_count']} Platforms:</b>\n{html.escape(platforms)}\n\n⚡ Priority downloads\n🎥 Higher quality\n▶️ YouTube access\n🎵 Music/MP3 support."
+
+    if any(x in q for x in ["whatsapp","waforge"]):
+        if lang=="so": return "📱 <b>WHATSAPP VERIFICATION</b>\n\nWaxaan kaa caawin karaa xaaladda verification-ka iyo tallaabada xigta. Fadlan raac verification screen-ka marka lagu weydiiyo. Xogta amniga iyo habka gudaha ee verification-ka lama soo bandhigo."
+        return "📱 <b>WHATSAPP VERIFICATION</b>\n\nI can help you check your verification status and the next step. Follow the verification screen when prompted. Internal security and verification implementation details are not exposed."
+
+    if any(x in q for x in ["sms","d7","phone verification"]):
+        if lang=="so": return "📲 <b>PHONE VERIFICATION</b>\n\nWaxaan kuu sheegi karaa haddii account-kaagu verified yahay iyo waxa aad samayn karto xiga. Habka gudaha ee verification-ka lama soo bandhigo."
+        return "📲 <b>PHONE VERIFICATION</b>\n\nI can tell you whether your account is verified and guide you on the next step. Internal verification implementation details are not exposed."
+
+    if any(x in q for x in ["gmail","email verification","email code"]):
+        if lang=="so": return "📧 <b>EMAIL VERIFICATION</b>\n\nHaddii account-kaagu u baahan yahay verification, raac tilmaamaha verification-ka ee bot-ka. Ha la wadaagin qof kale code ama xogtaada gaarka ah."
+        return "📧 <b>EMAIL VERIFICATION</b>\n\nIf your account requires verification, follow the verification instructions shown by the bot. Never share your verification code or private account information."
+
+    if any(x in q for x in ["verify","verification","otp","code","xaqiijin"]):
+        if lang=="so": return f"🔐 <b>VERIFICATION</b>\n\nXaaladda account-kaaga: <b>{'Verified' if c['verified'] else 'Not Verified'}</b>.\n\nHaddii aan la xaqiijin, raac verification-ka bot-ka. Ha la wadaagin code-kaaga qof kale."
+        return f"🔐 <b>VERIFICATION</b>\n\nYour account status: <b>{'Verified' if c['verified'] else 'Not Verified'}</b>.\n\nIf you are not verified, follow the bot's verification flow. Never share your verification code."
+
+    if any(x in q for x in ["crypto","bitcoin","btc","ethereum","eth","usdt","coin"]):
+        if not c["crypto_open"]:
+            return "🪙 <b>CRYPTO</b>\n\n🔴 Crypto is currently closed by Admin." if lang=="en" else "🪙 <b>CRYPTO</b>\n\n🔴 Crypto hadda Admin ayaa xiray."
+        if lang=="so": return f"🪙 <b>CRYPTO</b>\n\nStatus: <b>OPEN</b>\nDeposited/credited: <b>${c['deposited']:,.2f}</b>\nMinimum: <b>${c['crypto_minimum']:,.2f}</b>\nAccess: <b>{'ALLOWED' if c['crypto_allowed'] else 'LOCKED'}</b>\nRemaining: <b>${c['crypto_remaining']:,.2f}</b>\nFee: <b>{crypto_fee_percent():.2f}%</b>\n\nHaddii aad rabto, waxaan kuu sharxi karaa sida aad Crypto uga isticmaali karto account-kaaga."
+        return f"🪙 <b>CRYPTO</b>\n\nStatus: <b>OPEN</b>\nDeposited/credited: <b>${c['deposited']:,.2f}</b>\nMinimum: <b>${c['crypto_minimum']:,.2f}</b>\nAccess: <b>{'ALLOWED' if c['crypto_allowed'] else 'LOCKED'}</b>\nRemaining: <b>${c['crypto_remaining']:,.2f}</b>\nFee: <b>{crypto_fee_percent():.2f}%</b>\n\nI can explain how to use Crypto from your account."
+
+    if any(x in q for x in ["youtube","yt","shorts"]):
+        full_free = youtube_full_free_enabled()
+        if lang=="so":
+            return ("▶️ <b>YOUTUBE</b>\n\n"
+                    "🆓 YouTube Shorts waa Free.\n"
+                    f"🎬 Full YouTube videos: <b>{'Free hadda waa furan yahay' if full_free else 'Premium/Trial ayaa loo baahan yahay'}</b>.\n"
+                    "Haddii download-ku diido, ii soo dir fariinta qaladka.")
+        return ("▶️ <b>YOUTUBE</b>\n\n"
+                "🆓 YouTube Shorts are Free.\n"
+                f"🎬 Full YouTube videos: <b>{'Free access is currently open' if full_free else 'Premium/Trial is required'}</b>.\n"
+                "If the download fails, send me the error message.")
+
+    extra_platform_terms = {
+        "reddit":"Reddit", "threads":"Threads", "likee":"Likee", "vimeo":"Vimeo",
+        "dailymotion":"Dailymotion", "soundcloud":"SoundCloud", "twitch":"Twitch",
+        "tumblr":"Tumblr", "streamable":"Streamable", "ok.ru":"OK.ru", "okru":"OK.ru"
+    }
+    for term, pname in extra_platform_terms.items():
+        if term in q:
+            if lang=="so":
+                return (f"🌐 <b>{pname}</b>\n\n"
+                        f"💎 {pname} waa Premium/Trial platform.\n"
+                        "🆓 Free account-ku ma download-gareyn karo platform-kan.\n"
+                        "⚡ Premium/Trial wuxuu helayaa priority/high-concurrency download.\n"
+                        "Haddii link-ku diido, ii soo dir link-ga iyo error-ka.")
+            return (f"🌐 <b>{pname}</b>\n\n"
+                    f"💎 {pname} is a Premium/Trial platform.\n"
+                    "🆓 Free accounts cannot download this platform.\n"
+                    "⚡ Premium/Trial gets priority/high-concurrency downloading.\n"
+                    "If the link fails, send me the link and the error.")
+
+    if any(x in q for x in [
+        "download","video","tiktok","instagram","facebook","pinterest","snapchat","twitter","x.com",
+        "reddit","threads","likee","vimeo","dailymotion","soundcloud","twitch","tumblr","streamable","ok.ru","okru"
+    ]):
+        if lang=="so": return ("📥 <b>DOWNLOADS</b>\n\n"
+            "🆓 Free: TikTok, Instagram, Facebook, Pinterest, Snapchat, X/Twitter + YouTube Shorts.\n"
+            "💎 Premium/Trial: dhammaan 17-ka platform: TikTok, Instagram, Facebook, Pinterest, Snapchat, X/Twitter, YouTube, Reddit, Threads, Likee, Vimeo, Dailymotion, SoundCloud, Twitch, Tumblr, Streamable iyo OK.ru.\n"
+            "⚡ Premium/Trial wuxuu leeyahay priority/high-concurrency download si uu uga dheereeyo Free marka server-ka iyo platform-ku oggolaadaan.\n"
+            "Haddii platform ama link gaar ahi shaqayn waayo, ii soo dir link-ga iyo fariinta qaladka; waxaan kuu tilmaami karaa tallaabada saxda ah.")
+        return ("📥 <b>DOWNLOADS</b>\n\n"
+            "🆓 Free: TikTok, Instagram, Facebook, Pinterest, Snapchat, X/Twitter + YouTube Shorts.\n"
+            "💎 Premium/Trial: all 17 platforms: TikTok, Instagram, Facebook, Pinterest, Snapchat, X/Twitter, YouTube, Reddit, Threads, Likee, Vimeo, Dailymotion, SoundCloud, Twitch, Tumblr, Streamable and OK.ru.\n"
+            "⚡ Premium/Trial uses priority/high-concurrency downloading for higher throughput when the server and platform allow it.\n"
+            "If a platform or link fails, send me the link and the exact error so I can guide you to the correct next step.")
+
+    if any(x in q for x in ["music","mp3","song","hees"]):
+        if lang=="so": return "🎵 <b>MUSIC / MP3</b>\n\nWaxaad isticmaali kartaa Music flow-ka bot-ka. Audio extraction + FFmpeg ayaa loo isticmaalaa MP3. Haddii metadata la helo title/artist waa la muujin karaa."
+        return "🎵 <b>MUSIC / MP3</b>\n\nUse the Music flow in the bot. Audio extraction + FFmpeg are used to create MP3. When metadata is available, title/artist can be shown."
+
+    if any(x in q for x in ["withdraw","withdrawal","bixid","bixi","cash out","check withdrawal","withdrawal check"]):
+        return _ai_withdrawal_report(uid,lang)
+
+    if any(x in q for x in ["referral","refer","casuum","invite"]):
+        if lang=="so": return f"👥 <b>REFERRAL</b>\n\nUsers aad casuuntay: <b>{c['referrals']}</b>. Reward-ka hadda: <b>${referral_reward_amount():.2f}</b> haddii system-ku sidaas u configured yahay."
+        return f"👥 <b>REFERRAL</b>\n\nUsers invited: <b>{c['referrals']}</b>. Current reward: <b>${referral_reward_amount():.2f}</b> when configured by the system."
+
+    if any(x in q for x in ["banned","ban","mamnuuc","mamnuucay"]):
+        ban_status = "BANNED" if c.get("banned", False) else "NOT BANNED"
+        if lang=="so": return f"🚫 <b>BAN STATUS</b>\n\nAccount-kaaga: <b>{ban_status}</b>."
+        return f"🚫 <b>BAN STATUS</b>\n\nYour account: <b>{ban_status}</b>."
+
+    if any(x in q for x in ["profile","my id","telegram id","bot id","username"]):
+        return _ai_user_report(uid,False,lang)
+
+    if any(x in q for x in ["language","luqad","afaan"]):
+        return _ai_choose_language_text()
+
+    if any(x in q for x in ["force join","channel","join channel"]):
+        if lang=="so": return f"📢 <b>FORCE JOIN</b>\n\nSystem status: <b>{'OPEN' if CHANNEL_WINDOW_OPEN else 'CLOSED'}</b>. Haddii channels la maamulo, user-ku waa inuu ku biiro channels-ka loo baahan yahay kadibna CONFIRM sameeyo."
+        return f"📢 <b>FORCE JOIN</b>\n\nSystem status: <b>{'OPEN' if CHANNEL_WINDOW_OPEN else 'CLOSED'}</b>. If channels are active, the user must join the required channels and then confirm."
+
+    if any(x in q for x in ["fee","gas","commission"]):
+        if lang=="so": return f"💸 <b>FEES</b>\n\nCrypto fee-ga hadda waa <b>{crypto_fee_percent():.2f}%</b>. Haddii aad ii sheegto waxa aad samaynayso, waxaan kuu sharxi karaa kharashka ku khuseeya."
+        return f"💸 <b>FEES</b>\n\nThe current Crypto fee is <b>{crypto_fee_percent():.2f}%</b>. Tell me what you are doing and I can explain the applicable charge."
+
+    if any(x in q for x in ["help","caawi","sidee","what can you do","maxaad qaban","all system"]):
+        return _ai_help_text(lang,admin)
+
+    if admin:
+        candidates=re.findall(r"(?:@?[A-Za-z0-9_]{5,32}|\d{6,20})",q)
+        for cand in candidates:
+            found=_ai_find_user(cand)
+            if found: return _ai_user_report(found,True,lang)
+
+    if lang=="so":
+        return ("🤖 <b>Waan fahmay.</b>\n\nWaxaan kaa caawin karaa Balance, Premium/Trial, downloads, Music, Withdrawal, Referral, verification, Crypto iyo khaladaadka adeegga.\n\nQor dhibaatadaada sida aad u aragtay; button looma baahna.")
+    return ("🤖 <b>I understand.</b>\n\nI can help with Balance, Premium/Trial, downloads, Music, Withdrawal, Referral, verification, Crypto and service errors.\n\nDescribe the problem in your own words; no button is required.")
+
+
+def _admin_stats_text(kind, lang="en"):
+    if kind=="users":
+        active=sum(1 for u in users.values() if not u.get("banned")); banned=sum(1 for u in users.values() if u.get("banned"))
+        return (f"👥 <b>USERS</b>\n\nTotal: <b>{len(users)}</b>\nActive: <b>{active}</b>\nBanned: <b>{banned}</b>" if lang=="en" else f"👥 <b>USERS</b>\n\nDhammaan: <b>{len(users)}</b>\nActive: <b>{active}</b>\nBanned: <b>{banned}</b>")
+    if kind=="balances":
+        total=sum(float(u.get("balance",0) or 0) for u in users.values()); blocked=sum(float(u.get("blocked",0) or 0) for u in users.values())
+        locked=sum(1 for u in users.values() if u.get("balance_locked"))
+        return (f"💰 <b>BALANCE STATS</b>\n\nUser balances (stored assets): <b>{total:,.6f}</b>\nBlocked: <b>{blocked:,.6f}</b>\nLocked accounts: <b>{locked}</b>" if lang=="en" else f"💰 <b>BALANCE STATS</b>\n\nBalance-yada users-ka: <b>{total:,.6f}</b>\nBlocked: <b>{blocked:,.6f}</b>\nAccounts xiran: <b>{locked}</b>")
+    if kind=="withdrawals":
+        pending=sum(1 for w in withdraws if str(w.get("status","pending")).lower()=="pending")
+        confirmed=sum(1 for w in withdraws if str(w.get("status","")).lower() in ("confirmed","paid","completed"))
+        rejected=sum(1 for w in withdraws if str(w.get("status","")).lower() in ("rejected","reject"))
+        return (f"💸 <b>WITHDRAWAL STATS</b>\n\nTotal: <b>{len(withdraws)}</b>\nPending: <b>{pending}</b>\nConfirmed/Paid: <b>{confirmed}</b>\nRejected: <b>{rejected}</b>" if lang=="en" else f"💸 <b>WITHDRAWAL STATS</b>\n\nDhammaan: <b>{len(withdraws)}</b>\nPending: <b>{pending}</b>\nConfirmed/Paid: <b>{confirmed}</b>\nRejected: <b>{rejected}</b>")
+    if kind=="banned":
+        rows=[(uid,u) for uid,u in users.items() if u.get("banned")][:30]
+        if not rows: return "🚫 No banned users." if lang=="en" else "🚫 Ma jiraan users banned ah."
+        return ("🚫 <b>BANNED USERS</b>\n\n" if lang=="en" else "🚫 <b>BANNED USERS</b>\n\n")+"\n".join(f"{i+1}. {('@'+str(u.get('username'))) if u.get('username') else uid} — <code>{uid}</code>" for i,(uid,u) in enumerate(rows))
+    if kind=="locks":
+        rows=[(uid,u) for uid,u in users.items() if u.get("balance_locked")][:30]
+        return ("🔒 <b>BALANCE LOCKS</b>\n\n"+ ("No locked users." if not rows else "\n".join(f"{i+1}. {('@'+str(u.get('username'))) if u.get('username') else uid} — <code>{uid}</code>" for i,(uid,u) in enumerate(rows))))
+    if kind=="admins":
+        admins=get_admin_ids()
+        return ("👑 <b>ADMINS</b>\n\n"+"\n".join(f"• <code>{a}</code>" for a in admins))
+    return ""
+
+
+# ---------- Main bot entry: opens the dedicated Customer AI bot ----------
+@bot.message_handler(func=lambda m: m.text == "🤖 CUSTOMER AI")
+def customer_ai_admin_alias(m):
+    # The admin keyboard historically used a spaced label. Keep it functional
+    # while the normal user keyboard keeps the compact label.
+    return customer_ai_handler(m)
+
+@bot.message_handler(func=lambda m: m.text == "🤖CUSTOMER AI")
+def customer_ai_handler(m):
+    global _CUSTOMER_AI_USERNAME_CACHE
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m): return
+    username=_customer_ai_identity()
+    if is_admin(m.from_user.id):
+        token_ready=bool(CUSTOMER_AI_BOT_TOKEN)
+        status="🟢 CONFIGURED" if token_ready and username else "🔴 NOT CONFIGURED"
+        bot.send_message(m.chat.id,
+            "🤖 <b>CUSTOMER AI ADMIN</b>\n\n"
+            f"Status: <b>{status}</b>\n"
+            f"AI Bot: <b>{('@'+username) if username else 'Not detected'}</b>\n"
+            f"Token variable: <code>CUSTOMER_AI_BOT_TOKEN</code>\n\n"
+            "Customer AI-ga wuxuu isticmaalaa isla MongoDB-ga main bot-ka, sidaas darteed account-ka user-ka ayuu si toos ah uga akhriyaa.\n\n"
+            "AI bot-ka dhexdiisa buttons ma jiraan; waxaa lagu shaqeeyaa /commands iyo su'aalo caadi ah.\n\n"
+            "<b>Admin commands:</b> <code>/system</code>, <code>/user ID|BOTID|@username</code>, <code>/users</code>, <code>/balances</code>, <code>/withdrawals</code>, <code>/banned</code>, <code>/locks</code>, <code>/admins</code>")
+        return
+    if CUSTOMER_AI_BOT_TOKEN and username:
+        lang = get_user_lang(m.from_user.id)
+        if lang == "so":
+            ai_text = f"🤖 <b>CAWIMAAD AI</b>\n@{html.escape(username)}"
+        else:
+            ai_text = f"🤖 <b>CUSTOMER AI</b>\n@{html.escape(username)}"
+        kb=InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🤖 OPEN CUSTOMER AI", url=f"https://t.me/{username}"))
+        bot.send_message(m.chat.id, ai_text, reply_markup=kb)
+    else:
+        bot.send_message(m.chat.id,
+            "⚠️ <b>Customer AI lama shidin.</b>\n\n"
+            "Ku dar Railway Variable: <code>CUSTOMER_AI_BOT_TOKEN</code> oo ah token-ka BotFather ee Customer AI bot-ka, kadib Redeploy samee.")
+
+
+# ---------- Dedicated Customer AI bot handlers ----------
+if customer_ai_bot:
+    @customer_ai_bot.message_handler(commands=['start'])
+    def customer_ai_start(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            users[uid]={"username":message.from_user.username or "","first_name":message.from_user.first_name or "User",
+                        "balance":0.0,"blocked":0.0,"ref":random_ref(),"bot_id":random_botid(),"invited":0,"banned":False,
+                        "verified":False,"email_verified":False,"phone_verified":False,"whatsapp_verified":False,"verification_method":None,
+                        "balance_locked":False,"balance_activation_code":None,"balance_lock_until":None,"quick_access":False,"youtube_30m":False,
+                        "premium_until":None,"premium_warning_sent":False,"trial_used":False,"trial_pending":False,"trial_version_used":None,
+                        "trial_pending_version":None,"referral_50_rewarded":False,"referred_by":None,"joined_date":datetime.now().strftime("%Y-%m-%d"),
+                        "last_seen_at":datetime.now(timezone.utc).isoformat(),"month":now_month(),"language":None,"customer_ai_language":None,"currency":"USD","balance_asset":"USD",
+                        "gender":None,"city":None}
+            save_user(uid)
+        else:
+            users[uid]["username"]=message.from_user.username or users[uid].get("username","")
+            users[uid]["first_name"]=message.from_user.first_name or users[uid].get("first_name","User")
+            touch_user(uid)
+        if users[uid].get("banned"):
+            customer_ai_bot.send_message(message.chat.id,"🚫 You are banned from this service. / Waxaad ka mamnuucan tahay adeeggan."); return
+        if not _ai_language(uid):
+            customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text(),reply_markup=_ai_language_keyboard()); return
+        lang=_ai_language(uid)
+        customer_ai_bot.send_message(message.chat.id,
+            ("🤖 <b>SOO DHAWOW CUSTOMER SUPPORT</b>\n\nQor dhibaatadaada si caadi ah. Waxaan kaa caawin karaa downloads, account, lacag, Premium, referral, verification iyo khaladaadka system-ka.\n\n<code>/help</code> — Cawimaad\n<code>/language</code> — Beddel luqadda."
+             if lang=="so" else
+             "🤖 <b>WELCOME TO CUSTOMER SUPPORT</b>\n\nDescribe your problem naturally. I can help with downloads, account, balance, Premium, referrals, verification and common service problems.\n\nUse <code>/help</code> or tap Contact admin directly for human support."),reply_markup=_support_start_keyboard(lang))
+
+    @customer_ai_bot.message_handler(commands=['english','en','somali','so','arabic','ar','french','fr','spanish','es'])
+    def customer_ai_language_commands(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        cmd=(message.text or "").split()[0].lower()
+        mapping={"/english":"en","/en":"en","/somali":"so","/so":"so","/arabic":"ar","/ar":"ar","/french":"fr","/fr":"fr","/spanish":"es","/es":"es"}
+        code=mapping.get(cmd)
+        if code:
+            _set_ai_language(uid,code)
+            customer_ai_bot.send_message(message.chat.id,{"en":"🇬🇧 <b>English selected.</b>","so":"🇸🇴 <b>Soomaali ayaa la doortay.</b>","ar":"🇸🇦 <b>تم اختيار العربية.</b>","fr":"🇫🇷 <b>Français sélectionné.</b>","es":"🇪🇸 <b>Español seleccionado.</b>"}[code])
+
+    @customer_ai_bot.message_handler(commands=['language','lang'])
+    def customer_ai_language(message):
+        customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text(),reply_markup=_ai_language_keyboard())
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith('cai_lang:'))
+    def customer_ai_language_callback(call):
+        uid=str(call.from_user.id); code=call.data.split(':',1)[1]
+        if uid not in users or code not in LANGUAGES:
+            customer_ai_bot.answer_callback_query(call.id,'Language unavailable.',show_alert=True); return
+        _set_ai_language(uid,code)
+        customer_ai_bot.answer_callback_query(call.id,'✅')
+        customer_ai_bot.edit_message_text(f"✅ {LANGUAGES[code]['name']} selected.",call.message.chat.id,call.message.message_id,parse_mode='HTML')
+
+    @customer_ai_bot.message_handler(commands=['help'])
+    def customer_ai_help(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_help_text(lang,is_admin(uid)))
+
+    @customer_ai_bot.message_handler(commands=['balance'])
+    def customer_ai_balance(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_chat_action(message.chat.id,"typing"); customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"balance",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['profile','id'])
+    def customer_ai_profile(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_user_report(uid,False,lang))
+
+    @customer_ai_bot.message_handler(commands=['premium','trial'])
+    def customer_ai_premium(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"premium trial",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['verification','verify','otp'])
+    def customer_ai_verification(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"verification otp",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['crypto'])
+    def customer_ai_crypto(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"crypto usdt btc",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['downloads','download'])
+    def customer_ai_downloads(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"download video tiktok youtube instagram",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['music','mp3'])
+    def customer_ai_music(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"music mp3",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['withdrawal','withdraw'])
+    def customer_ai_withdrawal(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_withdrawal_report(uid,lang))
+
+    @customer_ai_bot.message_handler(commands=['referral','refer'])
+    def customer_ai_referral(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"referral",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['system'])
+    def customer_ai_system(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"system dashboard",True,lang))
+        else:
+            customer_ai_bot.send_message(message.chat.id,_ai_system_overview(lang,False))
+
+    @customer_ai_bot.message_handler(commands=['user'])
+    def customer_ai_user(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command." if lang=="en" else "❌ Command-kan Admin oo keliya ayaa isticmaali kara."); return
+        parts=message.text.split(maxsplit=1)
+        if len(parts)<2:
+            customer_ai_bot.send_message(message.chat.id,"Usage: <code>/user USER_ID</code> or <code>/user BOT_ID</code> or <code>/user @username</code>"); return
+        found=_ai_find_user(parts[1])
+        customer_ai_bot.send_message(message.chat.id,_ai_user_report(found,True,lang) if found else ("❌ User not found." if lang=="en" else "❌ User-ka lama helin."))
+
+    @customer_ai_bot.message_handler(commands=['panel','admin','stats'])
+    def customer_ai_admin_panel(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command."); return
+        kb=InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("📊 USERS",callback_data="cai:users"),InlineKeyboardButton("💰 BALANCES",callback_data="cai:balances"))
+        kb.add(InlineKeyboardButton("💸 WITHDRAWALS",callback_data="cai:withdrawals"),InlineKeyboardButton("👑 ADMINS",callback_data="cai:admins"))
+        kb.add(InlineKeyboardButton("📢 BROADCAST",callback_data="cai:broadcast"),InlineKeyboardButton("🔄 REFRESH",callback_data="cai:users"))
+        customer_ai_bot.send_message(message.chat.id,"🤖 <b>CUSTOMER AI ADMIN PANEL</b>\n\nChoose an admin action:",reply_markup=kb)
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith("cai:"))
+    def customer_ai_admin_callback(call):
+        uid=str(call.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.answer_callback_query(call.id,"Admin only",show_alert=True); return
+        action=call.data.split(":",1)[1]
+        if action=="broadcast":
+            msg=customer_ai_bot.send_message(call.message.chat.id,"📢 Send the broadcast text for all users:")
+            customer_ai_bot.register_next_step_handler(msg,customer_ai_broadcast_process)
+            customer_ai_bot.answer_callback_query(call.id)
+            return
+        customer_ai_bot.answer_callback_query(call.id)
+        customer_ai_bot.send_message(call.message.chat.id,_admin_stats_text(action if action in {"users","balances","withdrawals","admins"} else "users","en"))
+
+    def customer_ai_broadcast_process(message):
+        if not is_admin(message.from_user.id): return
+        text=(message.text or "").strip()
+        if not text:
+            customer_ai_bot.send_message(message.chat.id,"❌ Empty message."); return
+        sent=0
+        for uid in list(users):
+            try: customer_ai_bot.send_message(int(uid),text); sent+=1
+            except: pass
+        customer_ai_bot.send_message(message.chat.id,f"✅ Broadcast sent to {sent} users.")
+
+    @customer_ai_bot.message_handler(commands=['streak','health','broadcast'])
+    def customer_ai_extra_admin_commands(message):
+        uid=str(message.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command."); return
+        cmd=(message.text or "").split()[0].lower()
+        if cmd=="/streak":
+            customer_ai_bot.send_message(message.chat.id,"🔥 Streak control is available in the main bot Admin Panel → 🔥 STREAK SYSTEM.")
+        elif cmd=="/health":
+            customer_ai_bot.send_message(message.chat.id,f"🟢 <b>HEALTH</b>\n\nUsers: {len(users)}\nDownloads: {int(videos_data.get('total',0) or 0)}\nAdmins: {len(get_admin_ids())}\nCustomer AI: {'ONLINE' if customer_ai_bot else 'OFFLINE'}")
+        elif cmd=="/broadcast":
+            msg=customer_ai_bot.send_message(message.chat.id,"📢 Send broadcast text:"); customer_ai_bot.register_next_step_handler(msg,customer_ai_broadcast_process)
+
+    @customer_ai_bot.message_handler(commands=['users','balances','withdrawals','withdrawal_stats','banned','locks','admins'])
+    def customer_ai_admin_reports(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command." if lang=="en" else "❌ Command-kan Admin oo keliya ayaa isticmaali kara."); return
+        cmd=(message.text or "").split()[0].lower()
+        kind={"/users":"users","/balances":"balances","/withdrawals":"withdrawals","/withdrawal_stats":"withdrawals","/banned":"banned","/locks":"locks","/admins":"admins"}.get(cmd,"users")
+        customer_ai_bot.send_message(message.chat.id,_admin_stats_text(kind,lang))
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text and m.text.strip() in _support_button_labels()))
+    def customer_ai_support_button(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        _support_begin(customer_ai_bot,message)
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith("ticket:"))
+    def customer_ai_ticket_admin_callback(call):
+        uid=str(call.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.answer_callback_query(call.id,"❌ Admin only",show_alert=True); return
+        parts=(call.data or "").split(":",2)
+        if len(parts)!=3: return
+        action,code=parts[1],parts[2]
+        ticket=_support_get_ticket(code)
+        if not ticket:
+            customer_ai_bot.answer_callback_query(call.id,"Ticket not found",show_alert=True); return
+        if action in ("fix","reject"):
+            status="fixed" if action=="fix" else "rejected"
+            updated=_support_update_status(code,status,uid) or ticket
+            _support_notify_user(updated,action)
+            customer_ai_bot.answer_callback_query(call.id,"✅ Fixed" if action=="fix" else "❌ Rejected")
+            try: customer_ai_bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+            except Exception: pass
+            customer_ai_bot.send_message(call.message.chat.id,("🔧" if action=="fix" else "❌")+f" <b>Ticket {html.escape(code)} marked {status.upper()}.</b>",parse_mode="HTML")
+        elif action=="contact":
+            updated=_support_update_status(code,"contacting",uid) or ticket
+            SUPPORT_ADMIN_CONTACT_PENDING[uid]={"ticket_code":code,"user_id":str(updated.get("user_id"))}
+            customer_ai_bot.answer_callback_query(call.id,"💬 Send your message")
+            customer_ai_bot.send_message(call.message.chat.id,f"💬 <b>Contact User</b>\n\nSend the message you want to send to ticket <code>{html.escape(code)}</code>.",parse_mode="HTML")
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text and str(m.from_user.id) in SUPPORT_ADMIN_CONTACT_PENDING))
+    def customer_ai_admin_contact_send(message):
+        aid=str(message.from_user.id)
+        if not is_admin(aid): return
+        state=SUPPORT_ADMIN_CONTACT_PENDING.pop(aid,None)
+        if not state: return
+        target=int(state["user_id"]); code=state["ticket_code"]; text=(message.text or "").strip()
+        if not text: return
+        try:
+            customer_ai_bot.send_message(target,f"👤 <b>Admin message</b>\n\n{html.escape(text)}\n\n🎫 Ticket: <code>{html.escape(code)}</code>",parse_mode="HTML")
+            customer_ai_bot.send_message(message.chat.id,f"✅ Message sent to user for ticket <code>{html.escape(code)}</code>.",parse_mode="HTML")
+        except Exception as e:
+            customer_ai_bot.send_message(message.chat.id,f"❌ Could not contact user: <code>{html.escape(str(e))}</code>",parse_mode="HTML")
+
+    @customer_ai_bot.message_handler(content_types=["contact"])
+    def customer_ai_support_contact(message):
+        uid=str(message.from_user.id); ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+        if not ticket: return
+        contact=getattr(message,"contact",None)
+        if contact and getattr(contact,"user_id",None) not in (None,int(uid)):
+            customer_ai_bot.send_message(message.chat.id,"❌ Please share your own phone number using Telegram's contact button.")
+            return
+        ticket["phone"]=str(getattr(contact,"phone_number","") or "Not provided")
+        _support_email_step(customer_ai_bot,message,uid)
+
+    @customer_ai_bot.message_handler(func=lambda m: str(m.from_user.id) in SUPPORT_TICKET_REQUESTS and bool(m.text))
+    def customer_ai_support_flow(message):
+        uid=str(message.from_user.id); ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+        if not ticket: return
+        text=(message.text or "").strip()
+        if not ticket.get("phone"):
+            if text.lower() in {"skip","skip phone","⏭️ skip phone"}:
+                ticket["phone"]="Not provided"; _support_email_step(customer_ai_bot,message,uid)
+            return
+        if not ticket.get("email"):
+            if text.lower() in {"skip","skip gmail","⏭️ skip gmail"}:
+                ticket["email"]="Not provided"; _support_issue_step(customer_ai_bot,message,uid); return
+            if re.match(r"^[^\s@]+@gmail\.com$",text,re.I) or re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$",text):
+                ticket["email"]=text; _support_issue_step(customer_ai_bot,message,uid)
+            else: customer_ai_bot.send_message(message.chat.id,"❌ Please enter a valid Gmail/email address or tap Skip Gmail.")
+            return
+        if text.lower() in {"cancel","❌ cancel","/cancel"}:
+            SUPPORT_TICKET_REQUESTS.pop(uid,None); customer_ai_bot.send_message(message.chat.id,"❌ Ticket cancelled.",reply_markup=ReplyKeyboardRemove()); return
+        ticket["issue"]=text; _finish_support_ticket(customer_ai_bot,message,uid)
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text))
+    def customer_ai_message(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        if users[uid].get("banned"):
+            customer_ai_bot.send_message(message.chat.id,"🚫 You are banned from this service."); return
+        touch_user(uid)
+        lang=_ai_language(uid)
+        if not lang:
+            customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text()); return
+        customer_ai_bot.send_chat_action(message.chat.id,"typing")
+        answer=_ai_intent_answer(uid,message.text or "",is_admin(uid),lang)
+        customer_ai_bot.send_message(message.chat.id,answer)
+
+
+@bot.message_handler(func=lambda m: m.text == "💸 WITHDRAWAL")
+def withdraw_menu(m):
+    touch_user(m.from_user.id)
+    users.setdefault(str(m.from_user.id),{})["withdraw_flow"]=True
+    save_user(str(m.from_user.id))
+    if balance_is_locked(str(m.from_user.id)):
+        bot.send_message(m.chat.id,balance_locked_message(str(m.from_user.id)),reply_markup=localized_user_menu(str(m.from_user.id))); return
+    if banned_guard(m):
+        return
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("USDT-BEP20")
+    kb.add("🔙 CANCEL")
+    try:
+        bot.send_message(m.chat.id, "Select withdrawal method:", reply_markup=kb)
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text in ["USDT-BEP20", "🔙 CANCEL"])
+def withdraw_method(m):
+    if m.text == "🔙 CANCEL":
+        uid=str(m.from_user.id); users.get(uid,{}).pop("withdraw_flow",None); users.get(uid,{}).pop("temp_addr",None); save_user(uid); back_to_main_menu(m)
+        return
+    if m.text == "USDT-BEP20":
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add("🔙 CANCEL")
+        try:
+            msg = bot.send_message(m.chat.id, "Enter your USDT BEP20 address (must start with 0x)\nOr press 🔙 CANCEL", reply_markup=kb)
+            bot.register_next_step_handler(msg, withdraw_address_step)
+        except: pass
+
+def withdraw_address_step(m):
+    uid = str(m.from_user.id)
+    text = (m.text or "").strip()
+    if text == "🔙 CANCEL":
+        users.get(uid,{}).pop("withdraw_flow",None); users.get(uid,{}).pop("temp_addr",None); save_user(uid); back_to_main_menu(m)
+        return
+    if not text.startswith("0x"):
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add("🔙 CANCEL")
+        try:
+            msg = bot.send_message(m.chat.id, "❌ Invalid address. Must start with 0x.\nTry again or press 🔙 CANCEL", reply_markup=kb)
+            bot.register_next_step_handler(msg, withdraw_address_step)
+        except: pass
+        return
+    users[uid]["temp_addr"] = text
+    save_user(uid)
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("🔙 CANCEL")
+    try:
+        min_w = get_setting("min_withdrawal", 1.0)
+        msg = bot.send_message(m.chat.id, f"Enter withdrawal amount in {cur_code(uid)}\nMinimum: {money_text(uid,min_w)}\nBalance: {money_text(uid,users[uid]['balance'])}\n💲 Fee: {float(get_setting('fee_percent',0.0) or 0.0):.4f}%\n📉 Low W/D Fee: ${float(get_setting('low_fee',0.0) or 0.0):.8f}\n\nOr press 🔙 CANCEL", reply_markup=kb)
+        bot.register_next_step_handler(msg, withdraw_amount_step)
+    except: pass
+
+def withdraw_amount_step(m):
+    uid=str(m.from_user.id); text=(m.text or "").strip()
+    if text=="🔙 CANCEL":
+        users.get(uid,{}).pop("withdraw_flow",None); users.get(uid,{}).pop("temp_addr",None); save_user(uid); back_to_main_menu(m); return
+    try: local_amt=float(text)
+    except:
+        msg=bot.send_message(m.chat.id,"❌ Invalid number. Try again or press 🔙 CANCEL"); bot.register_next_step_handler(msg,withdraw_amount_step); return
+    code=cur_code(uid); price=asset_usd_price(code)
+    if price<=0: bot.send_message(m.chat.id,"❌ Current market rate unavailable.",reply_markup=localized_user_menu(uid)); return
+    asset_amt=local_amt; usd_amt=asset_to_usd(code,asset_amt); available=available_asset_amount(uid)
+    min_w=float(get_setting("min_withdrawal",1.0) or 1.0)
+    if usd_amt<min_w: bot.send_message(m.chat.id,f"❌ Minimum withdrawal is {money_text(uid,min_w)}",reply_markup=localized_user_menu(uid)); return
+    if asset_amt>available: bot.send_message(m.chat.id,f"❌ Insufficient available balance. Available: {format_asset(code,available)}",reply_markup=localized_user_menu(uid)); return
+    fee_pct=float(get_setting("fee_percent",0.0) or 0.0); low_fee=float(get_setting("low_fee",0.0) or 0.0)
+    calculated_fee=usd_amt*fee_pct/100.0; low_fee_pct=(low_fee/usd_amt*100.0) if usd_amt > 0 and low_fee > 0 else 0.0; total_fee=calculated_fee+low_fee; amount_sent=max(0.0,usd_amt-total_fee)
+    wid=random.randint(10000,99999); users[uid]["balance"]=round(balance_amount(uid)-asset_amt,12); save_user(uid)
+    withdrawal={"id":wid,"user":uid,"asset":code,"amount":asset_amt,"amount_usd":usd_amt,"fee":calculated_fee,"low_fee":low_fee,"amount_sent":amount_sent,"blocked":asset_amt,"blocked_usd":usd_amt,"address":users[uid].get("temp_addr","N/A"),"status":"pending","time":datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    users[uid].pop("withdraw_flow",None); users[uid].pop("temp_addr",None); save_user(uid)
+    withdraws.append(withdrawal); save_withdraws(); log_activity(uid,"withdrawal_requested",{"asset":code,"amount":asset_amt,"amount_usd":usd_amt,"request_id":wid})
+    receipt_text=(f"✅ <b>WITHDRAWAL REQUEST RECEIVED</b>\n"
+                   f"━━━━━━━━━━━━━━━━━━\n"
+                   f"🧾 <b>Request ID:</b> <code>{wid}</code>\n"
+                   f"💰 <b>Amount:</b> {format_asset(code,asset_amt)}\n"
+                   f"💵 <b>USD Value:</b> ${usd_amt:.2f}\n"
+                   f"💲 <b>Fee:</b> {fee_pct:.4f}% (-${calculated_fee:.2f})\n"
+                   f"📉 <b>Low W/D Fee:</b> ${low_fee:.8f} ({low_fee_pct:.4f}%)\n"
+                   f"💸 <b>Total Fee:</b> ${total_fee:.8f}\n"
+                   f"💵 <b>Amount Sent:</b> ${amount_sent:.2f}\n"
+                   f"🏦 <b>Address:</b> {html.escape(str(withdrawal['address']))}\n"
+                   f"⏳ <b>Status:</b> PENDING\n\n"
+                   f"Your requested amount is now counted as <b>Pending Amount</b> until Admin makes a decision.")
+    try: bot.send_message(int(uid),receipt_text)
+    except: pass
+    admin_text=(f"💳 <b>NEW WITHDRAWAL</b>\n\n"
+                f"👤 User: <code>{uid}</code>\n"
+                f"🤖 BOT ID: <code>{html.escape(str(users[uid].get('bot_id','N/A')))}</code>\n"
+                f"💰 Amount: {format_asset(code,asset_amt)}\n"
+                f"💵 USD value: ${usd_amt:.2f}\n"
+                f"💲 Fee: {fee_pct:.4f}% (-${calculated_fee:.2f})\n"
+                f"📉 Low W/D Fee: ${low_fee:.8f} ({low_fee_pct:.4f}%)\n"
+                f"💸 Total Fee: ${total_fee:.8f}\n"
+                f"💵 Amount Sent: ${amount_sent:.2f}\n"
+                f"🧾 Request ID: <code>{wid}</code>\n"
+                f"🏦 Address: {html.escape(str(withdrawal['address']))}\n"
+                f"⏳ Status: <b>PENDING</b>\n\n"
+                f"ℹ️ Pending is separate from Blocked Amount until Admin presses <b>BAN MONEY</b>.")
+    markup=InlineKeyboardMarkup(row_width=2); markup.add(InlineKeyboardButton("✅ CONFIRM",callback_data=f"confirm_{wid}"),InlineKeyboardButton("❌ REJECT",callback_data=f"reject_{wid}"),InlineKeyboardButton("🚫 BAN USER",callback_data=f"ban_{uid}"),InlineKeyboardButton("💰 BAN MONEY",callback_data=f"block_{wid}"))
+    for admin in ADMIN_IDS:
+        try: bot.send_message(admin,admin_text,reply_markup=markup)
+        except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("confirm_", "reject_", "ban_", "block_")))
+def admin_callbacks(call):
+    if not is_admin(call.from_user.id):
+        try:
+            bot.answer_callback_query(call.id, "❌ You are not admin")
+        except: pass
+        return
+
+    data = call.data
+    if data.startswith("confirm_"):
+        wid = int(data.split("_")[1])
+        w = next((x for x in withdraws if x["id"] == wid), None)
+        if not w or w["status"] != "pending":
+            return
+        w["status"] = "paid"
+        # Pending withdrawal was reserved by reducing balance. It becomes
+        # completed now; it was never part of Blocked Amount.
+        save_user(w["user"])
+        save_withdraws()
+        try:
+            bot.answer_callback_query(call.id, "✅ Confirmed")
+            bot.send_message(int(w["user"]), f"✅ Withdrawal #{wid} approved!")
+        except: pass
+    elif data.startswith("reject_"):
+        wid = int(data.split("_")[1])
+        w = next((x for x in withdraws if x["id"] == wid), None)
+        if not w or w["status"] != "pending":
+            return
+        w["status"] = "rejected"
+        users[w["user"]]["balance"] = round(balance_amount(w["user"])+float(w.get("amount",w.get("blocked",0))),12)
+        save_user(w["user"])
+        save_withdraws()
+        try:
+            bot.answer_callback_query(call.id, "❌ Rejected")
+            bot.send_message(int(w["user"]), f"❌ Withdrawal #{wid} rejected")
+        except: pass
+    elif data.startswith("ban_"):
+        uid = data.split("_")[1]
+        if uid in users:
+            users[uid]["banned"] = True
+            save_user(uid)
+            try:
+                bot.answer_callback_query(call.id, "🚫 User banned")
+                bot.send_message(int(uid), "🚫 You have been banned by admin.")
+            except: pass
+    elif data.startswith("block_"):
+        wid = int(data.split("_")[1])
+        w = next((x for x in withdraws if x["id"] == wid), None)
+        if not w or w["status"] != "pending":
+            return
+        uid = w["user"]
+        amt = float(w.get("amount",w.get("blocked",0)) or 0)
+        w["status"] = "blocked"
+        w["blocked"] = amt
+        code = str(random.randint(1000, 9999))
+        w["block_code"] = code
+        # The withdrawal was pending; Admin explicitly moves it into the
+        # Blocked Amount bucket here.
+        users[uid]["blocked"] = round(blocked_amount(uid)+amt,12)
+        save_user(uid)
+        save_withdraws()
+        try:
+            bot.answer_callback_query(call.id, "💰 Money Blocked")
+            bot.send_message(int(uid), f"🚫 Your withdrawal of ${amt:.2f} is BLOCKED.\n🔢 Block Code: {code}\nContact admin to unlock.")
+        except: pass
+
+@bot.message_handler(func=lambda m: m.text == "💰 UNBLOCK MONEY")
+def unblock_money_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "🔢 Send 4-digit Block Code to UNBLOCK funds:")
+        bot.register_next_step_handler(msg, unblock_money_process)
+    except: pass
+
+def unblock_money_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    code = (m.text or "").strip()
+    w = next((x for x in withdraws if x.get("block_code") == code), None)
+    if not w:
+        try:
+            bot.send_message(m.chat.id, "❌ Invalid Block Code")
+        except: pass
+        return
+
+    uid = w["user"]
+    amt = float(w.get("blocked",w.get("amount",0)) or 0)
+    users[uid]["balance"] = round(balance_amount(uid)+amt,12)
+    users[uid]["blocked"] = round(max(0.0,blocked_amount(uid)-amt),12)
+    w["status"] = "unblocked"
+    w.pop("block_code", None)
+    w["blocked"] = 0.0
+    save_user(uid)
+    save_withdraws()
+    try:
+        bot.send_message(int(uid), f"✅ Your blocked ${amt:.2f} is now available in balance!")
+        bot.send_message(m.chat.id, f"✅ Money unblocked for user {uid}")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🔥 UN BAN-USER")
+def unban_user_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send Telegram ID of user to UNBAN:")
+        bot.register_next_step_handler(msg, unban_user_process)
+    except: pass
+
+def unban_user_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    uid = (m.text or "").strip()
+    if uid not in users:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found")
+        except: pass
+        return
+    users[uid]["banned"] = False
+    save_user(uid)
+    try:
+        bot.send_message(m.chat.id, f"✅ User {uid} unbanned")
+        bot.send_message(int(uid), "✅ You have been unbanned by admin.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "👑 ADMIN LIST")
+def admin_list_handler(m):
+    if not is_admin(m.from_user.id): return
+    ids=get_admin_ids()
+    lines=["👑 <b>ADMIN LIST</b>",""]
+    for i,x in enumerate(ids,1):
+        role="GENERAL ADMIN" if x==PRIMARY_ADMIN_ID else "ADMIN"
+        lines.append(f"{i}. <code>{x}</code> — <b>{role}</b>")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "💼 PORTFOLIO STATS")
+def portfolio_stats_handler(m):
+    if not is_admin(m.from_user.id): return
+    refresh_market_rates(False)
+    users_with_assets=0; total=0.0; crypto_total=0.0
+    for uid,u in users.items():
+        v=total_assets_usd(uid); total+=v
+        if v>0: users_with_assets+=1
+        for code,amt in (u.get("portfolio") or {}).items():
+            if is_crypto(code): crypto_total += asset_to_usd(code,float(amt or 0))
+        if is_crypto(cur_code(uid)): crypto_total += balance_usd_value(uid)
+    fee,gas,count=get_crypto_fee_stats_today()
+    bot.send_message(m.chat.id, f"💼 <b>PORTFOLIO STATISTICS</b>\n\n👥 Users with assets: <b>{users_with_assets}</b>\n💰 Total tracked value: <b>${total:,.2f}</b>\n🪙 Crypto value: <b>${crypto_total:,.2f}</b>\n\n📈 <b>TODAY</b>\n💸 Fees: <b>${fee:,.2f}</b>\n⛽ Gas: <b>${gas:,.2f}</b>\n🔄 Conversions: <b>{count}</b>")
+
+@bot.message_handler(func=lambda m: m.text in ["🟢 OPEN HOLD","🔴 CLOSE HOLD","🟢 OPEN CRYPTO","🔴 CLOSE CRYPTO","💸 CRYPTO FEE","⛽ GAS FEE","💰 CRYPTO MIN DEPOSIT","📈 CRYPTO FEE STATS"])
+def crypto_admin_controls(m):
+    if not is_admin(m.from_user.id): return
+    action=m.text
+    if action=="🟢 OPEN HOLD": set_setting("crypto_hold_enabled",True); bot.send_message(m.chat.id,"🟢 <b>Crypto 1H Hold is OPEN.</b> New crypto conversions will be held for 1 hour."); return
+    if action=="🔴 CLOSE HOLD": set_setting("crypto_hold_enabled",False); bot.send_message(m.chat.id,"🔴 <b>Crypto 1H Hold is CLOSED.</b> Existing holds keep their current status."); return
+    if action=="🟢 OPEN CRYPTO": set_setting("crypto_enabled",True); bot.send_message(m.chat.id,"🟢 <b>Crypto is OPEN.</b> Users can use crypto currencies."); return
+    if action=="🔴 CLOSE CRYPTO":
+        # Disable new crypto operations first, then liquidate every crypto holding.
+        set_setting("crypto_enabled",False)
+        converted=0; fees=0.0; gross_total_all=0.0; net_total_all=0.0
+        refresh_market_rates(True)
+        for uid,u in list(users.items()):
+            with CRYPTO_TX_LOCK:
+                cur=cur_code(uid)
+                current_amt=float(u.get("balance",0) or 0)
+                current_blocked=float(u.get("blocked",0) or 0)
+                gross_total=0.0; asset_rows=[]
+                if is_crypto(cur) and current_amt>0:
+                    gross=asset_to_usd(cur,current_amt)
+                    if gross>0:
+                        fee,gas,_=crypto_fee_usd(gross,cur); asset_rows.append((cur,current_amt,gross,fee,gas)); gross_total+=gross
+                p=u.get("portfolio") if isinstance(u.get("portfolio"),dict) else {}
+                for code,amt in list(p.items()):
+                    amt=float(amt or 0)
+                    if is_crypto(code) and amt>0:
+                        gross=asset_to_usd(code,amt)
+                        if gross>0:
+                            fee,gas,_=crypto_fee_usd(gross,code); asset_rows.append((code,amt,gross,fee,gas)); gross_total+=gross
+                if not asset_rows:
+                    if is_crypto(cur):
+                        u["balance"]=0.0; u["blocked"]=0.0; u["balance_asset"]="USD"; u["currency"]="USD"; u["portfolio"]={}
+                        save_user(uid)
+                    continue
+                total_cost=sum(r[3]+r[4] for r in asset_rows); net_total=max(0.0,gross_total-total_cost)
+                gross_total_all+=gross_total; net_total_all+=net_total; fees+=total_cost
+
+                # Blocked amount is preserved as blocked USD when the source was
+                # the current crypto balance. Active crypto conversion holds are
+                # released because the admin explicitly closed the crypto market.
+                blocked_usd=0.0
+                if is_crypto(cur) and current_blocked>0:
+                    blocked_usd=min(asset_to_usd(cur,current_blocked),gross_total)
+                    if gross_total>0: blocked_usd=max(0.0,blocked_usd-total_cost*(blocked_usd/gross_total))
+                blocked_usd=min(blocked_usd,net_total)
+
+                # Preserve existing non-crypto cash. Crypto proceeds are always
+                # added to USD cash; if the current balance itself is crypto, that
+                # balance is replaced by the USD proceeds.
+                if is_crypto(cur):
+                    u["balance_asset"]="USD"; u["currency"]="USD"
+                    u["balance"]=round(net_total,12)
+                    u["blocked"]=round(blocked_usd,12)
+                elif cur=="USD":
+                    u["balance"]=round(current_amt+net_total,12)
+                    # Existing USD blocked funds remain blocked; crypto portfolio
+                    # proceeds do not create a new blocked amount.
+                    blocked_usd=current_blocked
+                    u["blocked"]=round(current_blocked,12)
+                else:
+                    # Legacy single-balance accounts using another fiat currency
+                    # are converted to USD so the post-close account has one clean
+                    # USD balance and the crypto proceeds are included.
+                    current_usd=asset_to_usd(cur,current_amt)
+                    current_blocked_usd=asset_to_usd(cur,current_blocked)
+                    u["balance_asset"]="USD"; u["currency"]="USD"
+                    u["balance"]=round(current_usd+net_total,12)
+                    u["blocked"]=round(current_blocked_usd,12)
+                    blocked_usd=current_blocked_usd
+                u["portfolio"]={}
+                now=datetime.now(timezone.utc)
+                for code,amt,gross,fee,gas in asset_rows:
+                    net=max(0.0,gross-fee-gas)
+                    crypto_fee_ledger_col.insert_one({"user_id":uid,"type":"crypto_close_fee","from_asset":code,"to_asset":"USD","gross_usd":gross,"fee_usd":fee,"gas_fee_usd":gas,"net_usd":net,"time":now,"reason":"admin_close_crypto"})
+                    balance_ledger_col.insert_one({"user_id":uid,"type":"crypto_close","from_asset":code,"to_asset":"USD","gross_usd":gross,"fee_usd":fee,"gas_fee_usd":gas,"net_usd":net,"time":now})
+                conversion_holds_col.update_many({"user_id":uid,"status":"hold"},{"$set":{"status":"closed_crypto_returned","released_at":now,"released_by":"admin_close_crypto"}})
+                save_user(uid); converted+=1
+                available_usd=max(0.0,float(u.get("balance",0) or 0)-float(u.get("blocked",0) or 0)) if cur_code(uid)=="USD" else 0.0
+                try:
+                    bot.send_message(int(uid), "🔴 <b>CRYPTO SERVICE CLOSED</b>\n\nAll your crypto holdings have been converted to <b>USD</b> at the current live market price.\nYour crypto portfolio has been cleared.\n\n" f"💰 <b>Available Balance:</b> ${available_usd:,.2f} USD\n" f"🔒 <b>Blocked Amount:</b> ${float(u.get('blocked',0) or 0):,.2f} USD\n\n" f"💸 Fees + gas: ${total_cost:,.2f} USD\nYou can use the USD balance normally.")
+                except Exception as e: print("Close crypto notify error:",uid,e)
+        bot.send_message(m.chat.id, f"🔴 <b>CRYPTO CLOSED</b>\n\n👥 Users converted: <b>{converted}</b>\n💵 Gross crypto value: <b>${gross_total_all:,.2f}</b>\n💸 Fees + gas: <b>${fees:,.2f}</b>\n💰 Returned to USD: <b>${net_total_all:,.2f}</b>\n\n🗑 All crypto portfolio entries were removed.")
+        return
+    if action=="💰 CRYPTO MIN DEPOSIT":
+        cur=crypto_min_deposit_usd(); msg=bot.send_message(m.chat.id,f"💰 <b>CRYPTO MINIMUM DEPOSIT</b>\n\nCurrent minimum: <b>${cur:,.2f}</b>\n\nSend the new minimum in USD. Example: <code>10</code>. Send <code>0</code> to allow everyone.")
+        bot.register_next_step_handler(msg,crypto_min_deposit_process); return
+    if action=="💸 CRYPTO FEE":
+        cur=crypto_fee_percent(); msg=bot.send_message(m.chat.id,f"💸 <b>CRYPTO CONVERSION FEE</b>\nCurrent: <b>{cur:.4f}%</b>\n\nSend new percentage. Example: <code>1</code> or <code>0</code>.")
+        bot.register_next_step_handler(msg,crypto_fee_process); return
+    if action=="⛽ GAS FEE":
+        cur=crypto_gas_fee_usd(); mode=str(get_setting("crypto_gas_mode","AUTO") or "AUTO")
+        msg=bot.send_message(m.chat.id,f"⛽ <b>GAS FEE CONTROL</b>\nMode: <b>{html.escape(mode)}</b>\nCurrent reserve/fallback: <b>${cur:.4f} USD</b>\n\nSend <code>AUTO</code> to use live network estimates when supported (ETH/BNB/BTC), or send a USD fallback such as <code>0.10</code>.")
+        bot.register_next_step_handler(msg,crypto_gas_process); return
+    fee,gas,count=get_crypto_fee_stats_today()
+    bot.send_message(m.chat.id,f"📈 <b>CRYPTO FEES TODAY</b>\n\n💸 Conversion fees: <b>${fee:,.2f}</b>\n⛽ Gas/network reserve: <b>${gas:,.2f}</b>\n💰 Total collected: <b>${fee+gas:,.2f}</b>\n🔄 Transactions: <b>{count}</b>")
+
+def crypto_min_deposit_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        value=float((m.text or '').replace(',','').strip())
+        if value<0: raise ValueError
+        set_setting("crypto_min_deposit_usd",value)
+        bot.send_message(m.chat.id,f"✅ Crypto minimum deposit is now <b>${value:,.2f}</b> USD." if value>0 else "✅ Crypto minimum deposit is now <b>OFF</b>. All users may access Crypto.")
+    except Exception:
+        bot.send_message(m.chat.id,"❌ Invalid amount. Send a number such as <code>10</code> or <code>0</code>.")
+
+def crypto_fee_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        v=float((m.text or '').replace('%','').strip());
+        if v<0 or v>100: raise ValueError
+        set_setting("crypto_fee_percent",v); bot.send_message(m.chat.id,f"✅ Crypto conversion fee set to <b>{v:.4f}%</b>")
+    except: bot.send_message(m.chat.id,"❌ Invalid fee. Send 0–100.")
+
+def crypto_gas_process(m):
+    if not is_admin(m.from_user.id): return
+    raw=(m.text or '').strip()
+    if raw.upper()=="AUTO":
+        set_setting("crypto_gas_mode","AUTO"); bot.send_message(m.chat.id,"✅ Gas mode set to <b>AUTO</b>. Live network estimates will be used where supported; admin fallback remains available."); return
+    try:
+        v=float(raw.replace('$','').strip())
+        if v<0 or v>10000: raise ValueError
+        set_setting("crypto_gas_mode","ADMIN"); set_setting("crypto_gas_fee_usd",v); bot.send_message(m.chat.id,f"✅ Gas mode set to <b>ADMIN</b> with <b>${v:.4f}</b> USD reserve")
+    except: bot.send_message(m.chat.id,"❌ Invalid. Send AUTO or a USD amount such as 0.10.")
+
+@bot.message_handler(func=lambda m: m.text == "⏳ HOLD CHECK")
+def hold_check_admin(m):
+    if not is_admin(m.from_user.id): return
+    hs=list(conversion_holds_col.find({"status":"hold"}).sort("created_at",-1).limit(50))
+    if not hs: bot.send_message(m.chat.id,"⏳ No active holds."); return
+    lines=["⏳ <b>ACTIVE HOLDS</b>",""]
+    for h in hs:
+        uid=str(h.get("user_id")); u=users.get(uid,{}); name=("@"+u.get("username")) if u.get("username") else uid; exp=parse_seen_time(h.get("expires_at")); left=max(0,int((exp-datetime.now(timezone.utc)).total_seconds())) if exp else 0
+        source_docs=h.get("source_snapshot") or []
+        src=[]
+        for d in source_docs[:5]: src.append(str(d.get("source") or d.get("type") or "unknown"))
+        source_text=", ".join(dict.fromkeys(src)) if src else "legacy/unknown"
+        lines.append(f"👤 {name} ({uid})\n💵 ${float(h.get('usd_amount',0)):,.2f} USD\n🔄 {h.get('from_asset')} → USD\n⏱️ {left//60}m {left%60}s\n🆔 {h.get('_id')}\n📍 Source: {source_text}")
+    bot.send_message(m.chat.id,"\n\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "✅ RELEASE HOLD")
+def release_hold_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"Send Hold ID or Telegram User ID to release active hold(s):"); bot.register_next_step_handler(msg,release_hold_process)
+
+def release_hold_process(m):
+    if not is_admin(m.from_user.id): return
+    key=(m.text or "").strip(); q={"status":"hold"}
+    if key.isdigit(): q["user_id"]=key
+    else:
+        try: from bson.objectid import ObjectId; q["_id"]=ObjectId(key)
+        except: bot.send_message(m.chat.id,"❌ Invalid ID"); return
+    hs=list(conversion_holds_col.find(q))
+    if not hs: bot.send_message(m.chat.id,"❌ Hold not found"); return
+    now=datetime.now(timezone.utc)
+    for h in hs: conversion_holds_col.update_one({"_id":h["_id"],"status":"hold"},{"$set":{"status":"released_early","released_at":now,"released_by":str(m.from_user.id)}})
+    uid=str(hs[0].get("user_id")); bot.send_message(m.chat.id,f"✅ Released {len(hs)} hold(s) for {uid}.")
+    try: bot.send_message(int(uid),"✅ Your held amount has been released early by admin and is now available.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "📜 HOLD HISTORY")
+def hold_history_admin(m):
+    if not is_admin(m.from_user.id): return
+    hs=list(conversion_holds_col.find({}).sort("created_at",-1).limit(50))
+    if not hs: bot.send_message(m.chat.id,"📜 No hold history yet."); return
+    lines=["📜 <b>HOLD HISTORY</b>",""]
+    for h in hs:
+        uid=str(h.get("user_id")); u=users.get(uid,{}); name=("@"+u.get("username")) if u.get("username") else uid
+        lines.append(f"👤 {name} | {h.get('from_asset')} → USD | ${float(h.get('usd_amount',0)):,.2f} | {h.get('status')} | {h.get('created_at')}")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "💳 WITHDRAWAL CHECK")
+def withdrawal_check_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Enter Withdrawal Request ID:")
+        bot.register_next_step_handler(msg, withdrawal_check_process)
+    except: pass
+
+def withdrawal_check_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        wid = int(m.text.strip())
+    except:
+        try:
+            bot.send_message(m.chat.id, "❌ Invalid Request ID")
+        except: pass
+        return
+
+    w = next((x for x in withdraws if x["id"] == wid), None)
+    if not w:
+        try:
+            bot.send_message(m.chat.id, "❌ Request not found")
+        except: pass
+        return
+    uid = w["user"]
+    bot_id = users.get(uid, {}).get("bot_id", "Unknown")
+    invited = users.get(uid, {}).get("invited", 0)
+    msg_text = f"💳 WITHDRAWAL DETAILS\n\n🧾 Request ID: {w['id']}\n👤 User ID: {uid}\n🤖 BOT ID: {bot_id}\n👥 Referrals: {invited}\n💰 Amount: {format_asset(w.get('asset','USD'),w['amount'])}\n💵 USD Value: ${float(w.get('amount_usd',w.get('amount',0))):.2f}\n🏦 Address: {w['address']}\n📊 Status: {w['status'].upper()}\n⏰ Time: {w['time']}"
+    try:
+        bot.send_message(m.chat.id, msg_text)
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "📊 STATS")
+def stats_handler(m):
+    if not is_admin(m.from_user.id):
+        return
+    total_users = len(users)
+    total_balance = sum(asset_to_usd((u.get("balance_asset") or u.get("currency") or "USD"),u.get("balance",0)) for u in users.values())
+    total_blocked = sum(asset_to_usd((u.get("balance_asset") or u.get("currency") or "USD"),u.get("blocked",0)) for u in users.values())
+    total_withdraws = len(withdraws)
+    pending_withdraws = len([w for w in withdraws if w["status"] == "pending"])
+    msg = f"📊 BOT STATS\n\n👥 Total Users: {total_users}\n💰 Total Balance: ${total_balance:.2f}\n⏳ Total Blocked: ${total_blocked:.2f}\n🧾 Total Withdrawals: {total_withdraws}\n⏳ Pending Withdrawals: {pending_withdraws}"
+    try:
+        bot.send_message(m.chat.id, msg)
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "⏱️ FREE MAX MIN")
+def free_max_minutes_start(m):
+    if not is_admin(m.from_user.id): return
+    current = int(get_setting("free_max_minutes", FREE_MAX_MINUTES_DEFAULT))
+    msg = bot.send_message(m.chat.id, f"⏱️ Current FREE limit: {current} minutes\n\nSend new maximum minutes for FREE users (example: 10):")
+    bot.register_next_step_handler(msg, free_max_minutes_process)
+
+
+def free_max_minutes_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        minutes = int((m.text or "").strip())
+        if minutes < 1 or minutes > 1440: raise ValueError
+        set_setting("free_max_minutes", minutes)
+        bot.send_message(m.chat.id, f"✅ FREE maximum download duration set to {minutes} minutes.")
+    except Exception:
+        bot.send_message(m.chat.id, "❌ Enter a whole number from 1 to 1440 minutes.")
+
+
+@bot.message_handler(func=lambda m: m.text == "⏱️ PREMIUM MAX MIN")
+def premium_max_minutes_start(m):
+    if not is_admin(m.from_user.id): return
+    current = int(get_setting("premium_max_minutes", PREMIUM_MAX_MINUTES_DEFAULT))
+    msg = bot.send_message(m.chat.id, f"⏱️ Current PREMIUM limit: {current} minutes\n\nSend new maximum minutes for PREMIUM users (example: 120):")
+    bot.register_next_step_handler(msg, premium_max_minutes_process)
+
+
+def premium_max_minutes_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        minutes = int((m.text or "").strip())
+        if minutes < 1 or minutes > 1440: raise ValueError
+        set_setting("premium_max_minutes", minutes)
+        bot.send_message(m.chat.id, f"✅ PREMIUM maximum download duration set to {minutes} minutes.")
+    except Exception:
+        bot.send_message(m.chat.id, "❌ Enter a whole number from 1 to 1440 minutes.")
+
+
+@bot.message_handler(func=lambda m: m.text == "📦 FREE MAX MB")
+def admin_free_max_mb(m):
+    if not is_admin(m.from_user.id): return
+    cur=int(get_setting("free_max_mb",49)); msg=bot.send_message(m.chat.id,f"📦 <b>FREE MAX MB</b>\n\nCurrent: <b>{cur} MB</b>\nSend new maximum file size for FREE users (1-2048 MB):")
+    bot.register_next_step_handler(msg,admin_free_max_mb_step)
+
+def admin_free_max_mb_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        v=int((m.text or '').strip());
+        if v<1 or v>2048: raise ValueError
+        set_setting("free_max_mb",v); bot.send_message(m.chat.id,f"✅ FREE max file size: <b>{v} MB</b>")
+    except Exception: bot.send_message(m.chat.id,"❌ Enter 1-2048 MB.")
+
+@bot.message_handler(func=lambda m: m.text == "📦 TRIAL MAX MB")
+def admin_trial_max_mb(m):
+    if not is_admin(m.from_user.id): return
+    cur=int(get_setting("trial_max_mb",0) or 0); current="Unlimited" if cur==0 else f"{cur} MB"; msg=bot.send_message(m.chat.id,f"📦 <b>TRIAL MAX MB</b>\n\nCurrent: <b>{current}</b>\nSend <code>Unlimited</code> or a limit from 1-2048 MB:")
+    bot.register_next_step_handler(msg,admin_trial_max_mb_step)
+
+def admin_trial_max_mb_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        raw=(m.text or '').strip().lower()
+        if raw in {"unlimited","unlimit","0"}:
+            set_setting("trial_max_mb",0); bot.send_message(m.chat.id,"✅ TRIAL max file size: <b>Unlimited</b>"); return
+        v=int(raw)
+        if v<1 or v>2048: raise ValueError
+        set_setting("trial_max_mb",v); bot.send_message(m.chat.id,f"✅ TRIAL max file size: <b>{v} MB</b>")
+    except Exception: bot.send_message(m.chat.id,"❌ Enter Unlimited or 1-2048 MB.")
+
+@bot.message_handler(func=lambda m: m.text == "📦 PREMIUM MAX MB")
+def admin_premium_max_mb(m):
+    if not is_admin(m.from_user.id): return
+    cur=int(get_setting("premium_max_mb",0) or 0); current="Unlimited" if cur==0 else f"{cur} MB"; msg=bot.send_message(m.chat.id,f"📦 <b>PREMIUM MAX MB</b>\n\nCurrent: <b>{current}</b>\nSend <code>Unlimited</code> or a limit from 1-2048 MB:")
+    bot.register_next_step_handler(msg,admin_premium_max_mb_step)
+
+def admin_premium_max_mb_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        raw=(m.text or '').strip().lower()
+        if raw in {"unlimited","unlimit","0"}:
+            set_setting("premium_max_mb",0); bot.send_message(m.chat.id,"✅ PREMIUM max file size: <b>Unlimited</b>"); return
+        v=int(raw)
+        if v<1 or v>2048: raise ValueError
+        set_setting("premium_max_mb",v); bot.send_message(m.chat.id,f"✅ PREMIUM max file size: <b>{v} MB</b>")
+    except Exception: bot.send_message(m.chat.id,"❌ Enter Unlimited or 1-2048 MB.")
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ DOWNLOAD LIMITS")
+def admin_download_limits(m):
+    if not is_admin(m.from_user.id): return
+    fm=int(get_setting("free_max_minutes",FREE_MAX_MINUTES_DEFAULT)); pm=int(get_setting("premium_max_minutes",PREMIUM_MAX_MINUTES_DEFAULT))
+    fmb=int(get_setting("free_max_mb",49)); tmb=int(get_setting("trial_max_mb",0) or 0); pmb=int(get_setting("premium_max_mb",0) or 0)
+    fyt=int(get_setting("free_youtube_max_mb",FREE_YOUTUBE_MAX_MB_DEFAULT) or FREE_YOUTUBE_MAX_MB_DEFAULT)
+    pyt=int(get_setting("premium_youtube_max_mb",PREMIUM_YOUTUBE_MAX_MB_DEFAULT) or 0); tyt=int(get_setting("trial_youtube_max_mb",TRIAL_YOUTUBE_MAX_MB_DEFAULT) or 0)
+    pu='Unlimited' if pyt==0 else f'{pyt} MB'; tu='Unlimited' if tyt==0 else f'{tyt} MB'
+    fmb_text="Unlimited" if fmb==0 else f"{fmb} MB"; tmb_text="Unlimited" if tmb==0 else f"{tmb} MB"; pmb_text="Unlimited" if pmb==0 else f"{pmb} MB"
+    bot.send_message(m.chat.id,f"⚙️ <b>DOWNLOAD LIMITS</b>\n\n🆓 FREE: {fm} min / {fmb_text}\n📺 FREE YouTube: {fyt} MB\n🎁 TRIAL: {tmb_text} / YouTube {tu}\n💎 PREMIUM: {pm} min / {pmb_text} / YouTube {pu}\n▶️ Full YouTube for Free: <b>{'OPEN' if youtube_full_free_enabled() else 'CLOSED'}</b>")
+
+@bot.message_handler(func=lambda m: m.text == "▶️ YOUTUBE FREE ACCESS")
+def admin_youtube_free_access(m):
+    if not is_admin(m.from_user.id): return
+    enabled=youtube_full_free_enabled()
+    msg=bot.send_message(m.chat.id,
+        f"▶️ <b>YOUTUBE FREE ACCESS</b>\n\nCurrent: <b>{'OPEN' if enabled else 'CLOSED'}</b>\n\n"
+        "Send <code>ON</code> to allow Free users to download full YouTube videos.\n"
+        "Send <code>OFF</code> to keep full YouTube Premium-only.\n"
+        "YouTube Shorts remain Free either way.\n\n"
+        "Reply with <code>ON</code> or <code>OFF</code>.")
+    bot.register_next_step_handler(msg, admin_youtube_free_access_step)
+
+def admin_youtube_free_access_step(m):
+    if not is_admin(m.from_user.id): return
+    v=(m.text or '').strip().lower()
+    if v not in {'on','off'}:
+        bot.send_message(m.chat.id,"❌ Send only ON or OFF."); return
+    set_setting("youtube_full_free", v=='on')
+    bot.send_message(m.chat.id, f"✅ Full YouTube for Free users: <b>{'OPEN' if v=='on' else 'CLOSED'}</b>\nYouTube Shorts remain Free.")
+
+@bot.message_handler(func=lambda m: m.text == "📺 FREE YOUTUBE MB")
+def admin_free_youtube_mb(m):
+    if not is_admin(m.from_user.id): return
+    cur=int(get_setting("free_youtube_max_mb",FREE_YOUTUBE_MAX_MB_DEFAULT) or FREE_YOUTUBE_MAX_MB_DEFAULT)
+    msg=bot.send_message(m.chat.id,f"📺 <b>FREE YOUTUBE MAX MB</b>\n\nCurrent: <b>{cur} MB</b>\nSend a new limit from 1-2048 MB:")
+    bot.register_next_step_handler(msg,admin_free_youtube_mb_step)
+
+def admin_free_youtube_mb_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        v=int((m.text or '').strip())
+        if v<1 or v>2048: raise ValueError
+        set_setting("free_youtube_max_mb",v)
+        bot.send_message(m.chat.id,f"✅ Free YouTube maximum: <b>{v} MB</b>")
+    except Exception:
+        bot.send_message(m.chat.id,"❌ Enter 1-2048 MB.")
+
+@bot.message_handler(func=lambda m: m.text == "📺 PREMIUM YOUTUBE MB")
+def admin_premium_youtube_mb(m):
+    if not is_admin(m.from_user.id): return
+    cur=int(get_setting("premium_youtube_max_mb",PREMIUM_YOUTUBE_MAX_MB_DEFAULT) or 0)
+    current='Unlimited' if cur==0 else f'{cur} MB'
+    msg=bot.send_message(m.chat.id,f"📺 <b>PREMIUM/TRIAL YOUTUBE LIMIT</b>\n\nCurrent: <b>{current}</b>\nSend <code>Unlimited</code> or a limit from 1-2048 MB:")
+    bot.register_next_step_handler(msg,admin_premium_youtube_mb_step)
+
+def admin_premium_youtube_mb_step(m):
+    if not is_admin(m.from_user.id): return
+    raw=(m.text or '').strip().lower()
+    if raw in {'unlimited','unlimit','0'}:
+        set_setting("premium_youtube_max_mb",0); set_setting("trial_youtube_max_mb",0)
+        bot.send_message(m.chat.id,"✅ Premium/Trial YouTube file-size limit: <b>Unlimited</b>."); return
+    try:
+        v=int(raw)
+        if v<1 or v>2048: raise ValueError
+        set_setting("premium_youtube_max_mb",v); set_setting("trial_youtube_max_mb",v)
+        bot.send_message(m.chat.id,f"✅ Premium/Trial YouTube maximum: <b>{v} MB</b>")
+    except Exception:
+        bot.send_message(m.chat.id,"❌ Enter Unlimited or 1-2048 MB.")
+
+@bot.message_handler(func=lambda m: m.text == "📋 YOUTUBE LIMITS")
+def admin_youtube_limits(m):
+    if not is_admin(m.from_user.id): return
+    free=int(get_setting("free_youtube_max_mb",FREE_YOUTUBE_MAX_MB_DEFAULT) or FREE_YOUTUBE_MAX_MB_DEFAULT)
+    prem=int(get_setting("premium_youtube_max_mb",PREMIUM_YOUTUBE_MAX_MB_DEFAULT) or 0)
+    trial=int(get_setting("trial_youtube_max_mb",TRIAL_YOUTUBE_MAX_MB_DEFAULT) or 0)
+    p='Unlimited' if prem==0 else f'{prem} MB'; t='Unlimited' if trial==0 else f'{trial} MB'
+    bot.send_message(m.chat.id,f"📋 <b>YOUTUBE LIMITS</b>\n\n🆓 Free YouTube: <b>{free} MB</b>\n🎁 Trial YouTube: <b>{t}</b>\n💎 Premium YouTube: <b>{p}</b>\n▶️ Full YouTube for Free: <b>{'OPEN' if youtube_full_free_enabled() else 'CLOSED'}</b>\n\nShorts are Free. Full videos require Premium when access is CLOSED.")
+
+@bot.message_handler(func=lambda m: m.text == "📸 INSTAGRAM API")
+def admin_instagram_api_setup(m):
+    if not is_admin(m.from_user.id): return
+    url,host,key=_instagram_api_config(); mask=("••••"+key[-4:] if len(key)>4 else ("set" if key else "not set"))
+    msg=bot.send_message(m.chat.id,f"📸 <b>Instagram RapidAPI Setup</b>\n\nCurrent URL: <code>{html.escape(url or 'not set')}</code>\nHost: <code>{html.escape(host or 'not set')}</code>\nKey: <code>{mask}</code>\n\nSend in ONE message:\n<code>URL | HOST | API_KEY</code>\n\nExample: <code>https://example.p.rapidapi.com/download | example.p.rapidapi.com | YOUR_KEY</code>")
+    bot.register_next_step_handler(msg,admin_instagram_api_setup_step)
+
+def admin_instagram_api_setup_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        parts=[x.strip() for x in (m.text or '').split('|')]
+        if len(parts)!=3 or not parts[0].startswith('http') or not parts[1] or not parts[2]: raise ValueError
+        set_setting('instagram_api_url',parts[0]); set_setting('instagram_api_host',parts[1]); set_setting('instagram_api_key',parts[2])
+        bot.send_message(m.chat.id,"✅ Instagram RapidAPI configuration saved in MongoDB. It is no longer required to put these settings in environment variables.")
+    except Exception: bot.send_message(m.chat.id,"❌ Format: URL | HOST | API_KEY")
+
+@bot.message_handler(func=lambda m: m.text == "📸 INSTAGRAM STATUS")
+def admin_instagram_status(m):
+    if not is_admin(m.from_user.id): return
+    url,host,key=_instagram_api_config(); status='🟢 CONFIGURED' if url and host and key else '🔴 NOT CONFIGURED'
+    bot.send_message(m.chat.id,f"📸 <b>INSTAGRAM API STATUS</b>\n\n{status}\nURL: <code>{html.escape(url or '—')}</code>\nHost: <code>{html.escape(host or '—')}</code>\nKey: {'set' if key else 'missing'}")
+
+@bot.message_handler(func=lambda m: m.text == "🛰️ COBALT STATUS")
+def cobalt_status_admin(m):
+    if not is_admin(m.from_user.id): return
+    ok, info = _cobalt_health()
+    free_m = int(get_setting("free_max_minutes", FREE_MAX_MINUTES_DEFAULT))
+    prem_m = int(get_setting("premium_max_minutes", PREMIUM_MAX_MINUTES_DEFAULT))
+    status = "🟢 ONLINE" if ok else "🔴 OFFLINE / NOT CONFIGURED"
+    bot.send_message(m.chat.id, f"🛰️ <b>COBALT STATUS</b>\n\n{status}\n{html.escape(str(info))}\n\n⏱️ FREE: {free_m} min\n💎 PREMIUM: {prem_m} min\n\nCOBALT_API_URL: {'configured' if COBALT_API_URL else 'not configured'}")
+
+
+@bot.message_handler(func=lambda m: m.text == "📉 CHANGE MINIMUM")
+def change_min_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send new minimum withdrawal amount (e.g., 0.001 or 1):")
+        bot.register_next_step_handler(msg, change_min_process)
+    except: pass
+
+def change_min_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        new_min = float(m.text.strip())
+        set_setting("min_withdrawal", new_min)
+        bot.send_message(m.chat.id, f"✅ Minimum withdrawal updated to: ${new_min}")
+    except:
+        bot.send_message(m.chat.id, "❌ Invalid number.")
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD FEE")
+def add_fee_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send fee percentage (e.g., 1.5 for 1.5% or 0 for 0%):")
+        bot.register_next_step_handler(msg, add_fee_process)
+    except: pass
+
+def add_fee_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        fee_pct = float(m.text.strip())
+        set_setting("fee_percent", fee_pct)
+        bot.send_message(m.chat.id, f"✅ Withdrawal fee percentage set to: {fee_pct}%")
+    except:
+        bot.send_message(m.chat.id, "❌ Invalid number.")
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD LOW FEE")
+def add_low_fee_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send low withdrawal fee amount (e.g., 0.05):")
+        bot.register_next_step_handler(msg, add_low_fee_process)
+    except: pass
+
+def add_low_fee_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        low_fee = float(m.text.strip())
+        set_setting("low_fee", low_fee)
+        bot.send_message(m.chat.id, f"✅ Low W/D fee set to: ${low_fee}")
+    except:
+        bot.send_message(m.chat.id, "❌ Invalid number.")
+
+@bot.message_handler(func=lambda m: m.text == "🎁 GIFT ALL")
+def gift_all_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send amount to gift to ALL users (e.g. 1 or 0.5):")
+        bot.register_next_step_handler(msg, gift_all_process)
+    except: pass
+
+def gift_all_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        amount = float(m.text.strip())
+        if amount <= 0:
+            bot.send_message(m.chat.id, "❌ Amount must be greater than 0")
+            return
+        
+        for uid in users: ledger_credit(uid,amount,"admin_gift_all",{"admin_id":str(m.from_user.id)})
+        bot.send_message(m.chat.id, f"🎁 Successfully added ${amount} USD worth of balance to all users!")
+    except Exception as e:
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "🗑️ REMOVE ALL")
+def remove_all_start(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        msg = bot.send_message(m.chat.id, "Send amount and reason separated by pipe (|)\nExample:\n0.5 | Reason")
+        bot.register_next_step_handler(msg, remove_all_process)
+    except: pass
+
+def remove_all_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        parts = m.text.split("|")
+        if len(parts) < 2:
+            bot.send_message(m.chat.id, "❌ Invalid format. Use: Amount | Reason")
+            return
+        remove_amt = float(parts[0].strip())
+        reason = parts[1].strip()
+        
+        if remove_amt <= 0:
+            bot.send_message(m.chat.id, "❌ Amount must be greater than 0")
+            return
+        for uid in users:
+            asset_amt=usd_to_asset(cur_code(uid),remove_amt)
+            asset_amt=min(asset_amt,available_asset_amount(uid))
+            if asset_amt>0: ledger_debit(uid,asset_amt,"admin_remove_all",{"admin_id":str(m.from_user.id),"reason":reason})
+            
+        count = 0
+        for uid in users:
+            try:
+                bot.send_message(int(uid), f"⚠️ Your Account Has Been Charged: ${remove_amt:.2f}\nReason: {reason}")
+                count += 1
+            except: pass
+        bot.send_message(m.chat.id, f"✅ Successfully removed ${remove_amt} from all users and notified {count} users. Reason: {reason}")
+    except Exception as e:
+        bot.send_message(m.chat.id, f"❌ Error: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "🚫 BAN USER MANUAL")
+def manual_ban_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send Telegram ID or BOT ID to BAN user:")
+        bot.register_next_step_handler(msg, manual_ban_process)
+    except: pass
+
+def manual_ban_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    uid_input = (m.text or "").strip()
+    uid = uid_input if uid_input in users else find_user_by_botid(uid_input)
+    if not uid:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found")
+        except: pass
+        return
+    users[uid]["banned"] = True
+    save_user(uid)
+    try:
+        bot.send_message(m.chat.id, f"🚫 User {uid} banned")
+        bot.send_message(int(uid), "🚫 You have been banned by admin.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🔍 RAADI")
+def raadi_stats(m):
+    if not is_admin(m.from_user.id):
+        return
+    total_videos = videos_data.get("total", 0)
+    platform_stats = videos_data.get("platforms", {})
+    users_stats = videos_data.get("users", {})
+    
+    top_downloader = "None"
+    sorted_users = []
+    if users_stats:
+        sorted_users = sorted(users_stats.items(), key=lambda x: x[1], reverse=True)
+        top_uid, top_cnt = sorted_users[0]
+        top_downloader = f'<a href="tg://user?id={top_uid}">{top_uid}</a> ({top_cnt} videos)'
+
+    tt = platform_stats.get("tiktok", 0)
+    yt = platform_stats.get("youtube", 0)
+    fb = platform_stats.get("facebook", 0)
+    pin = platform_stats.get("pinterest", 0)
+    ig = platform_stats.get("instagram", 0)
+    snap = platform_stats.get("snapchat", 0)
+    tw = platform_stats.get("twitter", 0)
+
+    msg_lines = [
+        "🔍 DOWNLOAD ANALYTICS\n",
+        f"🎬 Total Videos Downloaded: {total_videos}",
+        f"🏆 Top Downloader: {top_downloader}\n",
+        "📊 Downloads by Platform:",
+        f"• TikTok: {tt}",
+        f"• YouTube: {yt}",
+        f"• Facebook: {fb}",
+        f"• Instagram: {ig}",
+        f"• Pinterest: {pin}",
+        f"• Snapchat: {snap}",
+        f"• X/Twitter: {tw}\n",
+        "🥇 Top 40 Users:"
+    ]
+    for i, (uid, count) in enumerate(sorted_users[:40], start=1):
+        bot_id = users.get(str(uid), {}).get("bot_id", "N/A")
+        msg_lines.append(f'{i}. 👤 <a href="tg://user?id={uid}">{uid}</a> - 🎬 {count} videos | 🤖 BOT ID: {bot_id}')
+
+    try:
+        bot.send_message(m.chat.id, "\n".join(msg_lines), parse_mode="HTML")
+    except Exception as e:
+        print(f"RAADI error: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "📢 BROADCAST")
+def broadcast_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "📝 Send the broadcast message to all users:")
+        bot.register_next_step_handler(msg, broadcast_send)
+    except: pass
+
+def broadcast_send(m):
+    if not is_admin(m.from_user.id):
+        return
+    # copyMessage preserves Telegram custom-emoji entities instead of flattening
+    # them into ordinary keyboard emoji. It also preserves the original rich text.
+    sent=failed=0
+    for uid in list(users.keys()):
+        try:
+            bot.copy_message(int(uid), m.chat.id, m.message_id)
+            sent+=1
+        except Exception:
+            failed+=1
+    try:
+        bot.send_message(m.chat.id, f"✅ Broadcast sent to <b>{sent}</b> users\n❌ Failed: <b>{failed}</b>",parse_mode="HTML")
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "📢 BROADCAST MEDIA")
+def broadcast_media_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    msg = bot.send_message(m.chat.id, "Send the Video or Photo with caption (or without):")
+    bot.register_next_step_handler(msg, broadcast_media_process)
+
+def broadcast_media_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    
+    if not (m.video or m.photo):
+        bot.send_message(m.chat.id, "❌ Please send a valid Video or Photo.")
+        return
+        
+    # copy_message preserves the original caption entities, including Telegram custom emojis.
+    sent=failed=0
+    for uid in list(users.keys()):
+        try:
+            bot.copy_message(int(uid),m.chat.id,m.message_id); sent+=1
+        except Exception:
+            failed+=1
+    bot.send_message(m.chat.id, f"✅ Media broadcast sent to <b>{sent}</b> users.\n❌ Failed: <b>{failed}</b>",parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "SEND PAY")
+def send_pay_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send payment details in this format:\n\nTitle | Description | Price in Stars\n\nExample:\nVIP Access | 1 Month VIP Subscription | 50")
+        bot.register_next_step_handler(msg, send_pay_process)
+    except: pass
+
+def send_pay_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        parts = m.text.split("|")
+        if len(parts) != 3:
+            bot.send_message(m.chat.id, "❌ Invalid format. Use: Title | Description | Price")
+            return
+            
+        title = parts[0].strip()
+        desc = parts[1].strip()
+        price = int(parts[2].strip())
+        prices = [LabeledPrice(label=title, amount=price)]
+        
+        count = 0
+        for uid in users:
+            try:
+                bot.send_invoice(
+                    int(uid),
+                    title=title,
+                    description=desc,
+                    invoice_payload=f"stars_pay_{price}",
+                    provider_token="",
+                    currency="XTR",
+                    prices=prices
+                )
+                count += 1
+            except Exception as e:
+                continue
+        bot.send_message(m.chat.id, f"✅ Telegram Stars payment sent to {count} users.")
+    except Exception as e:
+        bot.send_message(m.chat.id, f"❌ Error processing payment: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "📌 POST CHANNEL")
+def post_channel_start(m):
+    global CHANNEL_WINDOW_OPEN
+    if not is_admin(m.from_user.id):
+        return
+    CHANNEL_WINDOW_OPEN = True
+    POST_CHANNELS.clear()
+    try:
+        msg = bot.send_message(m.chat.id, "Send channel usernames\nExample:\n@channel1\n\nMax 10 channels. Send DONE when finished.")
+        bot.register_next_step_handler(msg, post_channel_add)
+    except: pass
+
+def post_channel_add(m):
+    if m.text.lower() == "done":
+        try:
+            bot.send_message(m.chat.id, f"✅ {len(POST_CHANNELS)} channels added.")
+        except: pass
+        return
+    if len(POST_CHANNELS) >= MAX_CHANNELS:
+        try:
+            bot.send_message(m.chat.id, "⚠️ Maximum 10 channels allowed.")
+        except: pass
+        return
+    username = m.text.replace("@", "").strip()
+    POST_CHANNELS.append(username)
+    try:
+        msg = bot.send_message(m.chat.id, f"Channel @{username} added\nTotal: {len(POST_CHANNELS)}\nSend another or DONE")
+        bot.register_next_step_handler(msg, post_channel_add)
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "CLOSE CHANNEL POST")
+def close_channel_post(m):
+    if not is_admin(m.from_user.id):
+        return
+    MANAGED_CHANNELS.clear()
+    try:
+        bot.send_message(m.chat.id, "❌ All channels removed.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "👥 SEE LIST")
+def see_users(m):
+    if not is_admin(m.from_user.id):
+        return
+    total = len(users)
+    count = 0
+    for uid in users:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💬 OPEN CHAT", url=f"tg://user?id={uid}"))
+        qa_status = "⚡ Quick Access: YES" if users[str(uid)].get("quick_access") else "Quick Access: NO"
+        try:
+            bot.send_message(m.chat.id, f"👤 User ID: {uid} | {qa_status}", reply_markup=kb)
+        except: pass
+        count += 1
+        if count >= 20:
+            break
+    try:
+        bot.send_message(m.chat.id, f"📊 Total Users: {total}")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🔒 LOCK BOT")
+def lock_bot_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "✍️ Send the lock message users should receive.")
+        bot.register_next_step_handler(msg, lock_bot_process)
+    except: pass
+
+def lock_bot_process(m):
+    global BOT_LOCKED, LOCK_MESSAGE
+    if not is_admin(m.from_user.id):
+        return
+    text = (m.text or "").strip()
+    if text:
+        LOCK_MESSAGE = text
+        BOT_LOCKED = True
+        try:
+            bot.send_message(m.chat.id, "🔒 Bot locked successfully.")
+        except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🔓 UNLOCK BOT")
+def unlock_bot(m):
+    global BOT_LOCKED
+    if not is_admin(m.from_user.id):
+        return
+    BOT_LOCKED = False
+    try:
+        bot.send_message(m.chat.id, "🔓 Bot unlocked successfully.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "📢 ADD ADS")
+def add_ads_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "✍️ Format:\nButton Name | Link | Qoraal yar", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_add_ads)
+    except: pass
+
+def process_add_ads(m):
+    global ADS_ENABLED, ADS_BTN_TEXT, ADS_URL, ADS_TEXT
+    if not is_admin(m.from_user.id):
+        return
+    parts = [p.strip() for p in (m.text or "").split("|")]
+    if len(parts) < 2:
+        try:
+            bot.send_message(m.chat.id, "❌ Format error.")
+        except: pass
+        return
+    ADS_BTN_TEXT = parts[0]
+    ADS_URL = parts[1]
+    ADS_TEXT = parts[2] if len(parts) > 2 else "✨ Nagala soco baraha bulshada!"
+    ADS_ENABLED = True
+    try:
+        bot.send_message(m.chat.id, "✅ Ads saved and enabled!")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🗑 DELETE ADS")
+def delete_ads(m):
+    global ADS_ENABLED, ADS_BTN_TEXT, ADS_URL, ADS_TEXT
+    if not is_admin(m.from_user.id):
+        return
+    ADS_ENABLED = False
+    ADS_BTN_TEXT = ""
+    ADS_URL = ""
+    ADS_TEXT = ""
+    try:
+        bot.send_message(m.chat.id, "🗑 Ads deleted.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "📥 IMPORT USERS")
+def import_users_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send Telegram IDs separated by spaces or new lines.")
+        bot.register_next_step_handler(msg, import_users_process)
+    except: pass
+
+def import_users_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    ids = (m.text or "").replace("\n", " ").split()
+    added = 0
+    for uid in ids:
+        uid = uid.strip()
+        if uid.isdigit() and uid not in users:
+            users[uid] = {
+                "balance": 0.0,
+                "blocked": 0.0,
+                "ref": random_ref(),
+                "bot_id": random_botid(),
+                "invited": 0,
+                "banned": False,
+                "verified": False,
+                "quick_access": False,
+                "youtube_30m": False,
+                "premium_until": None,
+                "premium_warning_sent": False,
+                "trial_used": False,
+                "trial_pending": False,
+                "trial_version_used": None,
+                "trial_pending_version": None,
+                "referral_50_rewarded": False,
+                "referred_by": None,
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                "currency": "USD",
+                "language": None,
+                "gender": None,
+                "city": None,
+                "joined_date": datetime.now().strftime("%Y-%m-%d"),
+                "month": now_month()
+            }
+            save_user(uid)
+            added += 1
+    try:
+        bot.send_message(m.chat.id, f"✅ Imported {added} users successfully.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "📢 REFERRAL BROADCAST")
+def admin_referral_broadcast(m):
+    if not is_admin(m.from_user.id):
+        return
+    reward = referral_reward_amount()
+    username = bot.get_me().username
+    def _send_referral(uid):
+        u=users.get(str(uid),{})
+        ref=str(u.get("ref") or "").strip()
+        if not ref:
+            ref=random_ref(); users[str(uid)]["ref"]=ref; save_user(str(uid))
+        link=f"https://t.me/{username}?start={ref}"
+        kb=InlineKeyboardMarkup(); kb.add(_referral_share_button(link, "🎁 Join DownloadVedioYTBot and download videos, music and more.\n🔗 Referral link: " + link))
+        return bot.send_message(int(uid),
+            "🎁 <b>REFERRAL EARNING UPDATE</b>\n\n"
+            f"💰 You can earn <b>${reward:.2f}</b> for every eligible person you refer.\n"
+            f"🔗 Your Referral Link: <code>{html.escape(link)}</code>\n\n"
+            "📤 Use the <b>Share</b> button below to share your referral link directly.\n"
+            "👥 When someone joins through your link and qualifies, the referral reward is credited according to the bot's referral rules.",
+            reply_markup=kb,parse_mode="HTML")
+    sent,failed=broadcast_users(_send_referral, list(users.keys()))
+    bot.send_message(m.chat.id, f"✅ Referral broadcast completed.\n\n📨 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>", reply_markup=admin_menu(),parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🔗 GET REFERRAL CODE")
+def get_ref_code_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send user username (e.g. @username):")
+        bot.register_next_step_handler(msg, get_ref_username)
+    except: pass
+
+def get_ref_username(m):
+    if not is_admin(m.from_user.id):
+        return
+    username = m.text.replace("@", "").strip()
+    try:
+        msg = bot.send_message(m.chat.id, f"User: @{username}\nNow send referral code number:")
+        bot.register_next_step_handler(msg, lambda x: save_custom_ref_code(x, username))
+    except: pass
+
+def save_custom_ref_code(m, username):
+    if not is_admin(m.from_user.id):
+        return
+    code = m.text.strip()
+    if not code.isdigit():
+        try:
+            bot.send_message(m.chat.id, "❌ Code must be a number")
+        except: pass
+        return
+    user_id = next((uid for uid, data in users.items() if data.get("username", "").lower() == username.lower()), None)
+    if not user_id:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found")
+        except: pass
+        return
+    users[user_id]["ref"] = code
+    save_user(user_id)
+    try:
+        bot.send_message(m.chat.id, f"✅ Referral code updated for @{username}")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🔎 SEARCH USER")
+def search_user(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send User Telegram ID")
+        bot.register_next_step_handler(msg, search_user_result)
+    except: pass
+
+def search_user_result(m):
+    if not is_admin(m.from_user.id):
+        return
+    uid = m.text.strip()
+    if uid in users:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💬 OPEN CHAT", url=f"tg://user?id={uid}"))
+        kb.add(InlineKeyboardButton("✉️ MESSAGE USER", callback_data=f"msguser|{uid}"))
+        try:
+            bot.send_message(m.chat.id, f"👤 User Found\nID: {uid}", reply_markup=kb)
+        except: pass
+    else:
+        try:
+            bot.send_message(m.chat.id, "❌ User not found")
+        except: pass
+
+# ================= NEW FEATURE: CUSTOM REFERRAL CODES & PAY =================
+
+def is_ref_taken(code):
+    for uid, data in users.items():
+        if str(data.get("ref")) == str(code):
+            return True
+    return False
+
+@bot.message_handler(func=lambda m: m.text == "💳 PAY")
+@bot.callback_query_handler(func=lambda call: call.data == "buy_ref_menu")
+def pay_custom_ref_handler(m):
+    if bot_locked_guard(m if hasattr(m, "from_user") else m.message) or banned_guard(m if hasattr(m, "from_user") else m.message):
+        return
+        
+    chat_id = m.chat.id if hasattr(m, "chat") else m.message.chat.id
+    if not get_setting("pay_rev_enabled", False):
+        try:
+            bot.send_message(chat_id, "❌ Custom referral code purchase system is currently disabled by admin.")
+        except: pass
+        if hasattr(m, "id"):
+            bot.answer_callback_query(m.id)
+        return
+    try:
+        msg = bot.send_message(chat_id, "💳 **Buy Custom Referral Code**\n\nEnter your desired referral code (letters/numbers):")
+        bot.register_next_step_handler(msg, pay_custom_ref_code_input)
+        if hasattr(m, "id"):
+            bot.answer_callback_query(m.id)
+    except: pass
+
+def pay_custom_ref_code_input(m):
+    uid = str(m.from_user.id)
+    code = (m.text or "").strip()
+    if not code or len(code) > 30:
+        try:
+            msg = bot.send_message(m.chat.id, "❌ Invalid code. Please enter a valid referral code:")
+            bot.register_next_step_handler(msg, pay_custom_ref_code_input)
+        except: pass
+        return
+
+    if is_ref_taken(code):
+        try:
+            msg = bot.send_message(m.chat.id, "⚠️ This referral code already taken. Please choose another one:")
+            bot.register_next_step_handler(msg, pay_custom_ref_code_input)
+        except: pass
+        return
+
+    length = len(code)
+    if length <= 5:
+        price = get_setting("ref_price_short", 50)
+    else:
+        price = get_setting("ref_price_long", 20)
+
+    prices = [LabeledPrice(label=f"Custom Ref: {code}", amount=price)]
+    try:
+        bot.send_invoice(
+            m.chat.id,
+            title="Custom Referral Code",
+            description=f"Purchase custom referral code: {code}",
+            invoice_payload=f"buy_ref_{code}",
+            provider_token="",
+            currency="XTR",
+            prices=prices
+        )
+    except Exception as e:
+        try:
+            bot.send_message(m.chat.id, f"❌ Error creating invoice: {e}")
+        except: pass
+
+@bot.message_handler(content_types=['successful_payment'])
+def successful_payment_handler(message):
+    payment = message.successful_payment
+    payload = payment.invoice_payload
+    uid = str(message.from_user.id)
+    stars = int(getattr(payment, "total_amount", 0) or 0)
+    if payload.startswith("managed_remove_ads:"):
+        parts=payload.split(":")
+        if len(parts)>=5:
+            bid=str(parts[1]); buyer=str(parts[2]); months=str(parts[3]); expected=int(parts[4] or 0); d=managed_bots_col.find_one({"bot_id":bid})
+            if str(message.from_user.id)!=buyer or not d or months not in {"3","6","12"} or stars < expected:
+                bot.send_message(message.chat.id,"❌ Remove Ads payment could not be validated."); return
+            now=datetime.now(timezone.utc); until=now+timedelta(days=30*int(months))
+            state=managed_ad_users_col.find_one({"bot_id":bid,"user_id":buyer}) or {}
+            old=state.get("ads_until")
+            try:
+                old_dt=datetime.fromisoformat(str(old).replace("Z","+00:00")) if old else now
+                if old_dt.tzinfo is None: old_dt=old_dt.replace(tzinfo=timezone.utc)
+            except Exception: old_dt=now
+            until=max(now,old_dt)+timedelta(days=30*int(months))
+            managed_ad_users_col.update_one({"bot_id":bid,"user_id":buyer},{"$set":{"ads_removed":True,"ads_until":until,"ads_removed_at":now,"last_ad_payment_stars":stars,"remove_ads_months":int(months)}},upsert=True)
+            managed_ad_pending_lock.acquire()
+            try:
+                for token,row in list(managed_ad_pending.items()):
+                    if str(row.get("bot_id") or "") == bid and str(row.get("uid") or "") == buyer:
+                        managed_ad_pending.pop(token,None)
+            finally:
+                managed_ad_pending_lock.release()
+            bot.send_message(message.chat.id,f"🎉 <b>Ads Removed</b>\n\n⭐ Paid: <b>{stars} Stars</b>\n⏱️ Duration: <b>{months} months</b>\n⏰ Until: <b>{html.escape(local_datetime_text(buyer,until))}</b>\n\nAds are disabled for this bot until the selected date.",parse_mode="HTML")
+            mb=managed_bot_objects.get(bid) or _managed_bot_start_instance(d)
+            if mb:
+                try:
+                    mb.send_message(int(buyer),f"🎉 <b>Remove Ads activated!</b>\n\n⭐ Paid: <b>{stars} Stars</b>\n⏱️ <b>{months} months</b>\n⏰ Until: <b>{html.escape(local_datetime_text(buyer,until))}</b>",parse_mode="HTML")
+                except Exception: pass
+        return
+
+    if payload.startswith("managed_premium_stars:"):
+        parts=payload.split(":")
+        if len(parts)>=4:
+            bid=str(parts[1]); months=str(parts[2]); expected_stars=int(parts[3] or 0); d=managed_bots_col.find_one({"bot_id":bid})
+            if not d or str(d.get("owner_id"))!=uid or stars < expected_stars:
+                bot.send_message(message.chat.id,"❌ This Premium payment could not be validated."); return
+            price=get_premium_prices().get(months)
+            if price is None: bot.send_message(message.chat.id,"❌ Premium plan is no longer available."); return
+            now=datetime.now(timezone.utc); old=d.get("premium_until")
+            try: old_dt=datetime.fromisoformat(str(old).replace("Z","+00:00")) if old else now; old_dt=old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            except Exception: old_dt=now
+            until=max(now,old_dt)+timedelta(days=30*int(months)); managed_bots_col.update_one({"bot_id":bid},{"$set":{"premium_until":until.isoformat(),"premium_source":"stars","premium_updated_at":now}})
+            premium_logs_col.insert_one({"user_id":uid,"bot_id":bid,"months":int(months),"price":price,"until":until.isoformat(),"time":now,"type":"managed_bot_stars_purchase","stars":stars})
+            bot.send_message(message.chat.id,f"🎉 <b>Premium Activated</b>\n\n🤖 @{html.escape(str(d.get('username') or 'unknown'))}\n⭐ Paid: <b>{stars} Stars</b>\n⏱️ {months} month(s)\n⏰ Expires: <b>{html.escape(local_datetime_text(uid,until))}</b>",parse_mode="HTML")
+            mb=managed_bot_objects.get(bid) or _managed_bot_start_instance(d)
+            if mb:
+                try: mb.send_message(int(uid),f"🎉 <b>Premium Activated</b>\n\n⭐ Paid with Telegram Stars: <b>{stars}</b>\n⏰ Expires: <b>{html.escape(local_datetime_text(uid,until))}</b>\n\nPowered-by and promotional messages are now hidden for this bot.",parse_mode="HTML")
+                except Exception: pass
+        return
+
+    if payload.startswith("managed_creator_premium_stars:"):
+        parts=payload.split(":")
+        if len(parts)>=4:
+            bid=str(parts[1]); months=str(parts[2]); expected_stars=int(parts[3] or 0); d=managed_bots_col.find_one({"bot_id":bid}); price=get_premium_prices().get(months)
+            if not d or str(d.get("owner_id"))!=uid or price is None or stars < expected_stars:
+                bot.send_message(message.chat.id,"❌ Premium Stars payment could not be validated."); return
+            now=datetime.now(timezone.utc); old=d.get("premium_until")
+            try: old_dt=datetime.fromisoformat(str(old).replace("Z","+00:00")) if old else now; old_dt=old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+            except Exception: old_dt=now
+            until=max(now,old_dt)+timedelta(days=30*int(months)); managed_bots_col.update_one({"bot_id":bid},{"$set":{"premium_until":until.isoformat(),"premium_source":"stars","premium_updated_at":now}})
+            premium_logs_col.insert_one({"user_id":uid,"bot_id":bid,"months":int(months),"price":price,"until":until.isoformat(),"time":now,"type":"creator_stars_purchase","stars":stars})
+            bot.send_message(message.chat.id,f"🎉 <b>Premium Activated</b>\n\n🤖 @{html.escape(str(d.get('username') or 'unknown'))}\n⭐ Paid: <b>{stars} Stars</b>\n⏱️ {months} month(s)\n⏰ {html.escape(local_datetime_text(uid,until))}",parse_mode="HTML")
+        return
+
+    if payload.startswith("balance_topup:"):
+        rate = float(get_setting("stars_per_usd", 100))
+        usd = stars / rate if rate > 0 else 0.0
+        credit_user_balance(uid, usd, "stars_topup", network_commission=True)
+        log_activity(uid, "stars_topup", {"stars": stars, "usd": usd})
+        bot.send_message(message.chat.id, f"✅ <b>Balance Added</b>\n\n⭐ Stars: {stars}\n💵 Added: ${usd:.2f}\n💰 New balance: {money_text(uid, users[uid]['balance'])}")
+        return
+    
+    if payload.startswith("buy_ref_"):
+        code = payload.replace("buy_ref_", "")
+        if is_ref_taken(code) and users.get(uid, {}).get("ref") != code:
+            try:
+                bot.send_message(message.chat.id, "⚠️ This referral code has just been taken by someone else. Please contact admin or try another code.")
+            except: pass
+            return
+        users[uid]["ref"] = code
+        save_user(uid)
+        bot_username = bot.get_me().username
+        link = f"https://t.me/{bot_username}?start={code}"
+        try:
+            bot.send_message(
+                message.chat.id,
+                f"🎉 <b>Success!</b> Your custom referral code has been successfully activated.\n\n"
+                f"🔑 Code: <code>{code}</code>\n"
+                f"🔗 New Referral Link:\n{link}",
+                parse_mode="HTML"
+            )
+        except: pass
+
+@bot.message_handler(func=lambda m: m.text == "Reveral Prices")
+def admin_referral_prices(m):
+    if not is_admin(m.from_user.id): return
+    short_p = get_setting("ref_price_short", 50)
+    long_p = get_setting("ref_price_long", 20)
+    msg = f"⚙️ Referral Code Prices (Telegram Stars)\n\n• 1-5 chars price: {short_p} Stars\n• 6+ chars price: {long_p} Stars\n\nSend new price for short codes (1-5 chars) or type CANCEL:"
+    msg_sent = bot.send_message(m.chat.id, msg, parse_mode="Markdown")
+    bot.register_next_step_handler(msg_sent, set_short_price)
+
+def set_short_price(m):
+    if not is_admin(m.from_user.id): return
+    if m.text.strip().lower() == "cancel":
+        bot.send_message(m.chat.id, "Cancelled.")
+        return
+    try:
+        p = int(m.text.strip())
+        set_setting("ref_price_short", p)
+        msg = bot.send_message(m.chat.id, f"✅ Short code price set to {p} Stars.\n\nNow send price for 6+ characters codes:")
+        bot.register_next_step_handler(msg, set_long_price)
+    except:
+        msg = bot.send_message(m.chat.id, "❌ Invalid number. Try again or type CANCEL:")
+        bot.register_next_step_handler(msg, set_short_price)
+
+def set_long_price(m):
+    if not is_admin(m.from_user.id): return
+    if m.text.strip().lower() == "cancel":
+        bot.send_message(m.chat.id, "Cancelled.")
+        return
+    try:
+        p = int(m.text.strip())
+        set_setting("ref_price_long", p)
+        bot.send_message(m.chat.id, f"✅ Long code price set to {p} Stars successfully!")
+    except:
+        msg = bot.send_message(m.chat.id, "❌ Invalid number. Try again or type CANCEL:")
+        bot.register_next_step_handler(msg, set_long_price)
+
+@bot.message_handler(func=lambda m: m.text == "Delete Pay")
+def delete_pay_handler(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("pay_rev_enabled", False)
+    bot.send_message(m.chat.id, "🛑 Referral code purchase system is now CLOSED (Deleted Pay).")
+
+@bot.message_handler(func=lambda m: m.text == "Open Pay rev")
+def open_pay_handler(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("pay_rev_enabled", True)
+    bot.send_message(m.chat.id, "🟢 Referral code purchase system is now OPEN.")
+
+# ================= NEW FEATURE: SEND VERIFY BROADCAST =================
+
+@bot.message_handler(func=lambda m: m.text == "Send verify")
+def send_verify_broadcast_start(m):
+    if not is_admin(m.from_user.id): return
+    msg = bot.send_message(m.chat.id, "✍️ Send the message you want to broadcast with the email verification button to unverified users:")
+    bot.register_next_step_handler(msg, send_verify_broadcast_process)
+
+def send_verify_broadcast_process(m):
+    if not is_admin(m.from_user.id): return
+    text = m.text
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔐 Verify Now", callback_data="start_verify_flow"))
+    
+    target_ids=[uid for uid,udata in users.items() if not udata.get("verified",False)]
+    count,failed=broadcast_users(lambda uid: bot.send_message(int(uid), text, reply_markup=kb), target_ids)
+    bot.send_message(m.chat.id, f"✅ Verification broadcast sent to <b>{count}</b> unverified users.\n❌ Failed: <b>{failed}</b>",parse_mode="HTML")
+
+# ================= LINK HANDLER =================
+
+def grant_premium_days(uid,days,reason="admin"):
+    uid=str(uid); now=datetime.now(timezone.utc); old=users.get(uid,{}).get("premium_until")
+    try: old_dt=datetime.fromisoformat(str(old).replace("Z","+00:00")) if old else now
+    except Exception: old_dt=now
+    if old_dt.tzinfo is None: old_dt=old_dt.replace(tzinfo=timezone.utc)
+    until=max(now,old_dt)+timedelta(days=int(days)); users[uid]["premium_until"]=until.isoformat(); users[uid]["premium_warning_sent"]=False; users[uid]["premium_source"]=("trial" if "trial" in str(reason).lower() else "paid"); save_user(uid)
+    premium_logs_col.insert_one({"user_id":uid,"days":int(days),"until":until.isoformat(),"time":now.isoformat(),"type":reason}); log_activity(uid,"premium_grant",{"days":days,"reason":reason})
+    return until
+
+# ================= PREMIUM SYSTEM =================
+def get_premium_prices():
+    return {k: float(get_setting(f"premium_price_{k}", v)) for k, v in PREMIUM_DEFAULT_PRICES.items()}
+
+def premium_features_text():
+    platforms=", ".join(premium_platform_names())
+    return (
+        "💎 <b>PREMIUM</b>\n\n"
+        "🚀 Priority download queue + high concurrency\n"
+        "⚡ Premium queue is faster than Free queue\n"
+        "⚡ No artificial speed throttle from the bot\n"
+        "🎥 Higher quality: 720p • 1080p • 1440p • 4K\n"
+        "▶️ Full YouTube videos + Shorts\n"
+        f"📥 <b>{len(premium_platform_names())} platforms</b>: {html.escape(platforms)}\n"
+        "🎵 Better music metadata\n"
+        "📦 Premium file-size limit is admin controlled\n\n"
+        "🔐 Verification requirement can be controlled by Admin."
+    )
+
+def premium_plan_keyboard():
+    prices = get_premium_prices()
+    kb = InlineKeyboardMarkup(row_width=2)
+    for months in ["1", "3", "9", "12"]:
+        label = {"1":"1 Month", "3":"3 Months", "9":"9 Months", "12":"12 Months"}[months]
+        kb.add(InlineKeyboardButton(f"{label} — ${prices[months]:.2f}", callback_data=f"premium_buy:{months}"))
+    return kb
+
+def send_quality_menu(chat_id, link):
+    uid = str(chat_id)
+    premium_quality_pending[uid] = {"link": link, "created": time.time()}
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("720p", callback_data="quality:720"), InlineKeyboardButton("1080p", callback_data="quality:1080"))
+    kb.add(InlineKeyboardButton("1440p", callback_data="quality:1440"), InlineKeyboardButton("4K", callback_data="quality:2160"))
+    bot.send_message(chat_id, "💎 <b>Premium Quality</b>\n\nChoose your download quality:", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: m.text == "💎 PREMIUM")
+def premium_button(m):
+    touch_user(m.from_user.id)
+    if bot_locked_guard(m) or banned_guard(m): return
+    show_premium_menu(m.chat.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "premium_menu")
+def premium_menu_callback(call):
+    bot.answer_callback_query(call.id)
+    show_premium_menu(call.message.chat.id)
+
+def show_premium_menu(chat_id):
+    uid = str(chat_id)
+    if is_premium(uid):
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🎥 Choose Quality", callback_data="premium_quality_info"))
+        bot.send_message(chat_id, premium_features_text() + f"\n\n✅ <b>Active until:</b> {premium_until_text(uid)}", reply_markup=kb)
+    else:
+        if premium_verification_required() and not user_is_verified(uid):
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("🔐 VERIFY ACCOUNT", callback_data="start_verify_flow"))
+            bot.send_message(chat_id, premium_features_text() + "\n\n⚠️ Verification is required before Premium. Choose any available verification method.", reply_markup=kb)
+            return
+        kb = premium_plan_keyboard()
+        if trial_available(uid):
+            kb.add(InlineKeyboardButton(f"🎁 {trial_days()} DAY FREE TRIAL", callback_data="premium_trial"))
+        kb.add(InlineKeyboardButton("💳 ADD BALANCE", callback_data="topup_menu"))
+        bot.send_message(chat_id, premium_features_text() + "\n\n💰 <b>Choose a plan:</b>", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("premium_buy:"))
+def premium_buy_callback(call):
+    uid = str(call.from_user.id)
+    if premium_verification_required() and not user_is_verified(uid):
+        bot.answer_callback_query(call.id, "❌ Verify your account first.", show_alert=True); return
+    months = call.data.split(":",1)[1]
+    if balance_is_locked(uid):
+        bot.answer_callback_query(call.id,"❌ Your balance is temporarily closed.",show_alert=True); return
+    if months not in PREMIUM_DEFAULT_PRICES:
+        bot.answer_callback_query(call.id, "Invalid plan.", show_alert=True); return
+    price = get_premium_prices()[months]
+    bal = balance_amount(uid)
+    price_asset = usd_to_asset(cur_code(uid), price)
+    available = available_asset_amount(uid)
+    if available < price_asset:
+        bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True)
+        bot.send_message(call.message.chat.id, f"❌ You need <b>{format_asset(cur_code(uid),price_asset)}</b> (${price:.2f}). Your available balance is <b>{format_asset(cur_code(uid),available)}</b>.\n\n💰 Earn more through referrals or ask admin to add balance.")
+        return
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(f"✅ Pay ${price:.2f} from balance", callback_data=f"premium_confirm:{months}"))
+    kb.add(InlineKeyboardButton("❌ Cancel", callback_data="premium_cancel"))
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"💎 <b>{months} month Premium</b>\n\nPrice: <b>{money_text(uid, price)}</b> (USD ${price:.2f})\nYour balance: <b>{money_text(uid, bal)}</b>\n\nConfirm payment?", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("premium_confirm:"))
+def premium_confirm_callback(call):
+    uid = str(call.from_user.id)
+    months = call.data.split(":",1)[1]
+    price = get_premium_prices().get(months)
+    if price is None or (premium_verification_required() and not user_is_verified(uid)):
+        bot.answer_callback_query(call.id, "❌ Premium purchase unavailable.", show_alert=True); return
+    bal = balance_amount(uid)
+    price_asset = usd_to_asset(cur_code(uid), price)
+    available = available_asset_amount(uid)
+    if available < price_asset:
+        bot.answer_callback_query(call.id, "❌ Insufficient balance.", show_alert=True); return
+    now = datetime.now(timezone.utc)
+    old = users[uid].get("premium_until")
+    try:
+        old_dt = datetime.fromisoformat(str(old).replace("Z", "+00:00")) if old else now
+        if old_dt.tzinfo is None: old_dt = old_dt.replace(tzinfo=timezone.utc)
+    except Exception: old_dt = now
+    base = max(now, old_dt)
+    until = base + timedelta(days=30*int(months))
+    ledger_debit(uid,price_asset,"premium_purchase",{"price_usd":price,"months":months})
+    users[uid]["premium_until"] = until.isoformat()
+    users[uid]["premium_warning_sent"] = False
+    users[uid]["premium_source"] = "paid"
+    save_user(uid)
+    premium_logs_col.insert_one({"user_id": uid, "months": int(months), "price": price, "until": until.isoformat(), "time": now.isoformat(), "type": "purchase"})
+    bot.answer_callback_query(call.id, "✅ Premium activated!")
+    bot.edit_message_text(f"🎉 <b>Premium Activated!</b>\n\n📅 Duration: {months} months\n💵 Paid: ${price:.2f}\n⏰ Expires: <b>{local_datetime_text(uid, until)}</b>\n\n🌐 <b>17 Premium/Trial Platforms:</b>\n{html.escape(', '.join(premium_platform_names()))}\n\n⚡ Priority downloads\n🎥 Higher quality\n▶️ Full YouTube is unlocked.", call.message.chat.id, call.message.message_id, parse_mode="HTML")
+    send_premium_email(uid, "Premium Activated", months, price, until)
+
+@bot.callback_query_handler(func=lambda call: call.data == "premium_cancel")
+def premium_cancel(call):
+    bot.answer_callback_query(call.id, "Cancelled")
+    try: bot.edit_message_text("❌ Premium purchase cancelled.", call.message.chat.id, call.message.message_id)
+    except Exception: pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "premium_quality_info")
+def premium_quality_info(call):
+    bot.answer_callback_query(call.id)
+    current = users.get(str(call.from_user.id), {}).get("premium_quality", "Not selected")
+    bot.send_message(call.message.chat.id, f"💎 <b>Premium quality</b> is saved per account.\n\nCurrent: <b>{current if current != '2160' else '4K'}</b>\n\nSend a new link and the saved quality will be used automatically.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_quality:"))
+def set_quality_callback(call):
+    uid = str(call.from_user.id)
+    if not (is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)):
+        bot.answer_callback_query(call.id, "❌ Premium/Trial required.", show_alert=True); return
+    q = call.data.split(":",1)[1]
+    if q not in PREMIUM_QUALITY_FORMATS:
+        bot.answer_callback_query(call.id, "Invalid quality.", show_alert=True); return
+    users[uid]["premium_quality"] = q
+    save_user(uid)
+    pending = premium_quality_pending.pop(uid, None)
+    bot.answer_callback_query(call.id, "✅ Quality saved")
+    bot.edit_message_text(f"✅ Premium quality saved: {q if q != '2160' else '4K'}\n\nFuture downloads will use this quality automatically.", call.message.chat.id, call.message.message_id)
+    if pending and pending.get("link") and not pending.get("set_only"):
+        download_executor_for(call.from_user.id).submit(download_media, call.message.chat.id, pending["link"], None, q)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quality:"))
+def quality_callback(call):
+    uid = str(call.from_user.id)
+    if not (is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)):
+        bot.answer_callback_query(call.id, "❌ Premium/Trial required.", show_alert=True); return
+    q = call.data.split(":",1)[1]
+    data = premium_quality_pending.get(uid)
+    if not data:
+        bot.answer_callback_query(call.id, "❌ Quality session expired. Send the link again.", show_alert=True); return
+    premium_quality_pending.pop(uid, None)
+    users.setdefault(uid,{})["premium_quality"]=q; save_user(uid)
+    bot.answer_callback_query(call.id, f"✅ {q if q != '2160' else '4K'} saved")
+    download_executor_for(call.from_user.id).submit(download_media, call.message.chat.id, data["link"], None, q)
+
+def send_premium_email(uid, subject, months, price, until):
+    email=users.get(str(uid),{}).get("email")
+    if not email: return False
+    body=("<html><body style='margin:0;background:#f3f8f5;font-family:Arial;color:#10231d'>"
+          "<div style='max-width:620px;margin:30px auto;background:white;border-radius:22px;overflow:hidden'>"
+          "<div style='padding:28px;background:linear-gradient(135deg,#087f5b,#19b77d);color:white'><h1 style='margin:0'>💎 Downloader Bot</h1><p>Premium account notification</p></div>"
+          f"<div style='padding:30px'><h2>{html.escape(subject)}</h2><p>Your Premium access is active.</p><div style='background:#f0faf6;padding:18px;border-radius:14px'><b>Duration:</b> {months if months else 'Trial / Reward'}<br><b>Paid:</b> ${price:.2f}<br><b>Expires:</b> {html.escape(local_datetime_text(uid, until))}<br><b>Platforms:</b> {len(premium_platform_names())}<br><b>YouTube:</b> Premium only<br><b>Speed:</b> No artificial bot throttle</div><p>Thank you for using our service.</p></div></div></body></html>")
+    return send_html_email(email,subject,body)
+
+def send_premium_expiry_email(uid,until,days_left=None,expired=False):
+    email=users.get(str(uid),{}).get("email")
+    if not email: return False
+    subject="Your Downloader Bot Premium has expired" if expired else f"Your Downloader Bot Premium expires in {days_left} day(s)"
+    title="⏰ Premium Expired" if expired else "⚠️ Premium Expiry Reminder"
+    body=("<html><body style='margin:0;background:#f4f7f6;font-family:Arial'><div style='max-width:620px;margin:30px auto;background:#fff;border-radius:20px;padding:30px'>"
+          f"<h1>{title}</h1><p>Your Premium {('has ended.' if expired else f'will expire in {days_left} day(s).')}</p><p><b>Expiry:</b> {until.strftime('%Y-%m-%d %H:%M UTC')}</p><p>Open <b>💎 PREMIUM</b> in Telegram to renew.</p></div></body></html>")
+    return send_html_email(email,subject,body)
+
+def conversion_hold_worker():
+    while True:
+        try:
+            now=datetime.now(timezone.utc)
+            for h in conversion_holds_col.find({"status":"hold","expires_at":{"$lte":now}}):
+                conversion_holds_col.update_one({"_id":h["_id"],"status":"hold"},{"$set":{"status":"released_auto","released_at":now}})
+                try: bot.send_message(int(h.get("user_id")),f"✅ Your ${float(h.get('usd_amount',0)):,.2f} USD hold has expired. The amount is now available.")
+                except: pass
+        except Exception as e: print("Hold worker error:",e)
+        time.sleep(60)
+
+def premium_expiry_worker():
+    while True:
+        try:
+            now=datetime.now(timezone.utc)
+            for uid,data in list(users.items()):
+                until=data.get("premium_until")
+                if not until: continue
+                try: dt=until if isinstance(until,datetime) else datetime.fromisoformat(str(until).replace("Z","+00:00")); dt=dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except Exception: continue
+                if dt<=now:
+                    data["premium_until"]=None; data["premium_warning_sent"]=False; save_user(uid)
+                    try: bot.send_message(int(uid),f"⏰ <b>Your Downloader Bot Premium has expired.</b>\n\n🕒 Expired at: <b>{local_datetime_text(uid, dt)}</b>\n\n💎 Open Premium to renew.")
+                    except Exception: pass
+                    send_premium_expiry_email(uid,dt,expired=True)
+                elif dt-now<=timedelta(days=7) and not data.get("premium_warning_sent",False):
+                    data["premium_warning_sent"]=True; save_user(uid); days=max(1,int((dt-now).total_seconds()//86400))
+                    try: bot.send_message(int(uid),f"⚠️ <b>Premium expires in {days} day(s).</b>\n\nRenew now to keep Premium features.")
+                    except Exception: pass
+                    send_premium_expiry_email(uid,dt,days_left=days)
+        except Exception as e: print("Premium worker error:",e)
+        time.sleep(PREMIUM_CHECK_INTERVAL)
+
+# ================= PREMIUM EXTRA PLATFORMS =================
+PLATFORM_PATTERNS.update({
+    "reddit": ("reddit.com", "redd.it"),
+    "threads": ("threads.net",),
+    "likee": ("likee.video", "like.video"),
+    "vimeo": ("vimeo.com",),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+    "soundcloud": ("soundcloud.com",),
+    "twitch": ("twitch.tv",),
+    "tumblr": ("tumblr.com",),
+    "streamable": ("streamable.com",),
+    "odnoklassniki": ("ok.ru",),
+})
+PREMIUM_EXTRA_PLATFORMS = ["Reddit", "Threads", "Likee", "Vimeo", "Dailymotion", "SoundCloud", "Twitch", "Tumblr", "Streamable", "OK.ru"]
+
+def _download_request_job(chat_id, link, quality, uid):
+    """Run access checks and media extraction in the download worker.
+
+    This keeps the Telegram message handler responsive: link detection and queueing
+    happen immediately, while the potentially slow YouTube duration probe runs in
+    the worker instead of blocking the incoming-message handler.
+    """
+    try:
+        platform=detect_platform(link)
+        has_priority=is_admin(uid) or is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)
+        if bool(get_setting("verify_before_send_enabled",False)) and not has_priority and not user_is_verified(uid):
+            verify_pending[int(uid)]={"link":link,"queued":True,"time":time.time()}
+            kb=InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("📩 Verify via DM",callback_data="via_telegram"))
+            kb.add(InlineKeyboardButton("🤖 Verify via Bot",url=f"https://t.me/Verifyd_bot?start=verify_{uid}"))
+            bot.send_message(chat_id,"🔐 <b>Verification Required</b>\n\nPlease verify that you are not a robot before your download can be sent.",reply_markup=kb,parse_mode="HTML")
+            return
+        if premium_required_for_platform(platform,uid,link) and not has_priority:
+            if platform=="youtube" and users.get(str(uid),{}).get("youtube_30m",False):
+                pass
+            else:
+                duration=None
+                if platform=="youtube":
+                    try: duration=_youtube_duration_seconds(link)
+                    except Exception: duration=None
+                kb=InlineKeyboardMarkup().add(InlineKeyboardButton("💎 OPEN PREMIUM",callback_data="premium_menu"))
+                bot.send_message(chat_id,premium_gate_message(uid,platform,duration),reply_markup=kb,parse_mode="HTML")
+                return
+        download_media(chat_id,link,None,quality)
+    except Exception as e:
+        print("Download request worker failed:",repr(e))
+        try: bot.send_message(chat_id,"❌ Download failed. Please try again.")
+        except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text and "http" in m.text)
+def handle_links(message):
+    touch_user(message.from_user.id)
+    if bot_locked_guard(message) or banned_guard(message): return
+    user_id = message.from_user.id
+    uid = str(user_id)
+    link = extract_url(message.text)
+    if not link: return
+
+    if CHANNEL_WINDOW_OPEN and POST_CHANNELS:
+        for ch in POST_CHANNELS:
+            try:
+                member = bot.get_chat_member(f"@{ch}", user_id)
+                if member.status not in ["member", "administrator", "creator"]:
+                    pending_links[user_id] = link; send_multi_join(user_id); return
+            except Exception:
+                pending_links[user_id] = link; send_multi_join(user_id); return
+
+    # Verification is required before Premium and before protected downloads.
+    if VERIFY_ENABLED and not user_is_verified(uid):
+        verify_pending[user_id] = {"link": link}
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("📩 Verify via DM", callback_data="via_telegram"))
+        kb.add(InlineKeyboardButton("🤖 Verify via Bot", url=f"https://t.me/Verifyd_bot?start=verify_{user_id}"))
+        bot.send_message(message.chat.id, "🔐 Verification Required\n\nPlease verify your account before downloading.", reply_markup=kb); return
+
+    platform = detect_platform(link)
+    # Access checks and any YouTube duration probe run inside the worker so the incoming
+    # link is acknowledged/queued immediately instead of blocking the message handler.
+    # Premium quality is selected once and stored on the user.
+    # If no quality has been selected yet, ask once; future links use the saved quality.
+    if is_quick_access(uid):
+        quality = users.get(uid, {}).get("premium_quality") or "1080"
+    elif is_premium(uid) or _is_trial_active(uid):
+        # Priority downloads should start immediately. Keep the user's saved
+        # quality when present; otherwise use 1080p automatically instead of
+        # stopping the first download for a quality-selection prompt.
+        quality = users.get(uid, {}).get("premium_quality") or "1080"
+
+    try:
+        # No visible preparation message. download_media immediately starts
+        # Telegram's native upload action (Sending a video / Sending a photo).
+        download_executor_for(uid).submit(
+            _download_request_job, message.chat.id, link,
+            quality if (is_quick_access(uid) or is_premium(uid) or _is_trial_active(uid)) else None, uid
+        )
+    except Exception: pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "multi_checkjoin")
+def multi_checkjoin(call):
+    user_id = call.from_user.id
+    joined_all = True
+    for ch in POST_CHANNELS:
+        try:
+            member = bot.get_chat_member(f"@{ch}", user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                joined_all = False
+                break
+        except:
+            joined_all = False
+            break
+
+    if joined_all:
+        try:
+            bot.answer_callback_query(call.id, "✅ Join verified")
+        except: pass
+        if user_id in pending_links:
+            link = pending_links[user_id]
+            del pending_links[user_id]
+            try:
+                download_executor_for(user_id).submit(download_media, user_id, link, None)
+            except: pass
+        else:
+            # Multi-channel confirmation must also complete onboarding: show
+            # the configurable welcome message and the user's real main menu.
+            try:
+                bot.send_message(
+                    user_id,
+                    render_start_message(str(user_id)),
+                    reply_markup=welcome_destination_markup(),
+                    parse_mode="HTML"
+                )
+                bot.send_message(user_id, "👇 <b>Main Menu</b>", reply_markup=localized_user_menu(str(user_id)), parse_mode="HTML")
+            except Exception as e:
+                print("MULTI WELCOME AFTER CONFIRM ERROR:", repr(e))
+    else:
+        try:
+            bot.answer_callback_query(call.id, "❌ You must join all channels first!", show_alert=True)
+        except: pass
+
+@bot.message_handler(func=lambda m: m.text == "🟢 Open Verify Before Send")
+def admin_verify_before_send_on(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("verify_before_send_enabled",True)
+    bot.send_message(m.chat.id,"🟢 <b>VERIFY BEFORE SEND: OPEN</b>\n\nUnverified users must verify before a download is sent. The link is queued immediately and the verification check runs in the worker.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔴 Close Verify Before Send")
+def admin_verify_before_send_off(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("verify_before_send_enabled",False)
+    bot.send_message(m.chat.id,"🔴 <b>VERIFY BEFORE SEND: CLOSED</b>\n\nDownloads will not ask for this verification gate.",parse_mode="HTML",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "❌ CLOSE WINDOWS")
+def close_channel_windows(m):
+    global CHANNEL_WINDOW_OPEN
+    if not is_admin(m.from_user.id):
+        return
+    CHANNEL_WINDOW_OPEN = False
+    try:
+        bot.send_message(m.chat.id, "✅ Channel join system disabled.")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "✅ VERIFY ON")
+def verify_on(m):
+    global VERIFY_ENABLED
+    if not is_admin(m.from_user.id):
+        return
+    VERIFY_ENABLED = True
+    try:
+        bot.send_message(m.chat.id, "✅ Verify system enabled")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "❌ VERIFY OFF")
+def verify_off(m):
+    global VERIFY_ENABLED
+    if not is_admin(m.from_user.id):
+        return
+    VERIFY_ENABLED = False
+    try:
+        bot.send_message(m.chat.id, "❌ Verify system disabled")
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "CHANNEL POST")
+def start_channel_post(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send the main text for the channel post.")
+        bot.register_next_step_handler(msg, post_main_text)
+    except: pass
+
+def post_main_text(m):
+    pending_post[m.from_user.id] = {"text": m.text, "buttons": []}
+    try:
+        msg = bot.send_message(m.chat.id, "Send button like:\n\nButton Name | Text when clicked\n\nSend DONE when finished.")
+        bot.register_next_step_handler(msg, add_buttons)
+    except: pass
+
+def add_buttons(m):
+    uid = m.from_user.id
+    if m.text.lower() == "done":
+        data = pending_post.get(uid)
+        if not data:
+            return
+        kb = InlineKeyboardMarkup()
+        for i, btn in enumerate(data["buttons"]):
+            kb.add(InlineKeyboardButton(btn["name"], callback_data=f"postbtn_{i}"))
+        for ch in MANAGED_CHANNELS:
+            try:
+                msg = bot.send_message(ch, data["text"], reply_markup=kb)
+                channel_posts[msg.message_id] = data
+            except: pass
+        pending_post.pop(uid, None)
+        try:
+            bot.send_message(m.chat.id, "✅ Post sent")
+        except: pass
+        return
+
+    try:
+        name, content = m.text.split("|", 1)
+        pending_post[uid]["buttons"].append({"name": name.strip(), "content": content.strip()})
+        msg = bot.send_message(m.chat.id, "Button added. Send another or DONE")
+        bot.register_next_step_handler(msg, add_buttons)
+    except:
+        try:
+            msg = bot.send_message(m.chat.id, "❌ Format error\nButton Name | Text")
+            bot.register_next_step_handler(msg, add_buttons)
+        except: pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("postbtn_"))
+def post_button_click(call):
+    index = int(call.data.split("_")[1])
+    data = channel_posts.get(call.message.message_id)
+    if not data or index >= len(data["buttons"]):
+        return
+    text = data["buttons"][index]["content"]
+    kb = InlineKeyboardMarkup()
+    for i, btn in enumerate(data["buttons"]):
+        kb.add(InlineKeyboardButton(btn["name"], callback_data=f"postbtn_{i}"))
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+    except: pass
+
+@bot.message_handler(func=lambda m: m.text == "➕ ADD BALANCE")
+def add_balance_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send BOT ID or Telegram ID and amount:")
+        bot.register_next_step_handler(msg, add_balance_process)
+    except: pass
+
+def add_balance_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        uid_str, amt_str = m.text.strip().split()
+        amt = float(amt_str)
+        uid = uid_str if uid_str in users else find_user_by_botid(uid_str)
+        if not uid or amt <= 0:
+            try:
+                bot.send_message(m.chat.id, "❌ Invalid input")
+            except: pass
+            return
+        asset_amt=ledger_credit(uid,amt,"admin_add_balance",{"admin_id":str(m.from_user.id)})
+        try:
+            bot.send_message(m.chat.id, f"✅ Added ${amt:.2f} USD = {format_asset(cur_code(uid),asset_amt)} to user {uid}")
+            bot.send_message(int(uid), f"💰 Your balance increased by ${amt:.2f}")
+        except: pass
+    except:
+        try:
+            bot.send_message(m.chat.id, "❌ Format error.")
+        except: pass
+
+@bot.message_handler(func=lambda m: m.text == "➖ REMOVE MONEY")
+def remove_balance_start(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        msg = bot.send_message(m.chat.id, "Send BOT ID or Telegram ID and amount:")
+        bot.register_next_step_handler(msg, remove_balance_process)
+    except: pass
+
+def remove_balance_process(m):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        uid_str, amt_str = m.text.strip().split()
+        amt = float(amt_str)
+        uid = uid_str if uid_str in users else find_user_by_botid(uid_str)
+        if not uid or amt <= 0:
+            try:
+                bot.send_message(m.chat.id, "❌ Invalid input")
+            except: pass
+            return
+        if available_asset_amount(uid) < usd_to_asset(cur_code(uid),amt):
+            try:
+                bot.send_message(m.chat.id, "❌ Insufficient balance")
+            except: pass
+            return
+        asset_amt=usd_to_asset(cur_code(uid),amt)
+        ledger_debit(uid,asset_amt,"admin_remove_balance",{"admin_id":str(m.from_user.id)})
+        try:
+            bot.send_message(m.chat.id, f"✅ Removed ${amt:.2f} USD from user {uid}")
+            bot.send_message(int(uid), f"💸 ${amt:.2f} removed from your balance")
+        except: pass
+    except:
+        try:
+            bot.send_message(m.chat.id, "❌ Format error.")
+        except: pass
+
+# ================= PREMIUM VERIFICATION CONTROL =================
+@bot.message_handler(func=lambda m: m.text in ["🔐 PREMIUM VERIFY ON","🔓 PREMIUM VERIFY OFF"])
+def premium_verify_control(m):
+    if not is_admin(m.from_user.id): return
+    enabled = m.text == "🔐 PREMIUM VERIFY ON"
+    set_setting("premium_verify_required", enabled)
+    bot.send_message(m.chat.id, f"{'🔐 Premium verification is now REQUIRED.' if enabled else '🔓 Premium verification is now OPTIONAL.'}\n\nUsers can still use any available Gmail/SMS/WhatsApp verification when required.")
+
+# ================= ADMIN BALANCE LOCK / VIEW MANAGEMENT =================
+def _balance_snapshot(uid):
+    u=users.get(str(uid),{})
+    return {
+        "user_id":str(uid), "username":u.get("username",""), "bot_id":u.get("bot_id",""),
+        "balance":float(u.get("balance",0) or 0), "blocked":float(u.get("blocked",0) or 0),
+        "balance_asset":u.get("balance_asset") or u.get("currency") or "USD",
+        "currency":u.get("currency") or "USD", "portfolio":dict(u.get("portfolio") or {}),
+        "created_at":datetime.now(timezone.utc),
+        "expires_at":datetime.now(timezone.utc)+timedelta(days=10),
+    }
+
+def _close_one_balance(uid, notify=True):
+    uid=str(uid)
+    if uid not in users: return None
+    old=balance_freezes_col.find_one({"user_id":uid,"status":"closed"})
+    if old and balance_lock_remaining(uid)>0: return old.get("activation_code")
+    snap=_balance_snapshot(uid); code=generate_balance_activation_code(); snap.update({"status":"closed","activation_code":code})
+    balance_freezes_col.delete_many({"user_id":uid,"status":"closed"}); balance_freezes_col.insert_one(snap)
+    users[uid]["balance_locked"]=True; users[uid]["balance_activation_code"]=code; users[uid]["balance_lock_until"]=snap["expires_at"].isoformat(); save_user(uid)
+    if notify:
+        try: bot.send_message(int(uid),"🔒 <b>Your Balance has been temporarily closed by Admin.</b>\n\n" f"🗝 <b>Activation Code:</b> <code>{code}</code>\n" f"⏳ Open within <b>10 days</b> to keep your funds.\n" "If the deadline passes without activation, the saved balance is permanently removed.\n\n" "Contact Customer/Admin if you need your balance activated.")
+        except Exception: pass
+    return code
+
+def _restore_one_balance(uid):
+    uid=str(uid); snap=balance_freezes_col.find_one({"user_id":uid,"status":"closed"})
+    if not snap: return False,"No closed balance record."
+    exp=parse_seen_time(snap.get("expires_at"))
+    if exp and exp<=datetime.now(timezone.utc):
+        balance_freezes_col.delete_one({"_id":snap["_id"]}); users[uid]["balance_locked"]=False; users[uid]["balance_activation_code"]=None; users[uid]["balance_lock_until"]=None; users[uid]["balance"]=0.0; users[uid]["blocked"]=0.0; users[uid]["portfolio"]={}; save_user(uid)
+        return False,"The 10-day activation period has expired; the balance was permanently removed."
+    users[uid]["balance"]=float(snap.get("balance",0) or 0); users[uid]["blocked"]=float(snap.get("blocked",0) or 0); users[uid]["balance_asset"]=snap.get("balance_asset") or "USD"; users[uid]["currency"]=snap.get("currency") or users[uid]["balance_asset"]; users[uid]["portfolio"]=dict(snap.get("portfolio") or {}); users[uid]["balance_locked"]=False; users[uid]["balance_activation_code"]=None; users[uid]["balance_lock_until"]=None; save_user(uid)
+    balance_freezes_col.update_one({"_id":snap["_id"]},{"$set":{"status":"opened","opened_at":datetime.now(timezone.utc)}})
+    return True,"Balance restored successfully."
+
+@bot.message_handler(func=lambda m: m.text == "💰 SEE BALANCE")
+def admin_see_balance_broadcast(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"💰 <b>SEE BALANCE</b>\n\nSend the message you want users to receive together with their current balance.\nExample: <code>You have $100 balance. Come use your balance.</code>")
+    bot.register_next_step_handler(msg,admin_see_balance_broadcast_step)
+
+def admin_see_balance_broadcast_step(m):
+    if not is_admin(m.from_user.id): return
+    custom=(m.text or "").strip()
+    if not custom: bot.send_message(m.chat.id,"❌ Message cannot be empty."); return
+    sent=0
+    for uid,u in list(users.items()):
+        try:
+            if balance_is_locked(uid):
+                text=balance_locked_message(uid)
+            else:
+                av=available_asset_amount(uid); bl=blocked_amount(uid); pd=pending_withdrawal_amount(uid)
+                text=(f"💰 <b>Available Balance:</b> {format_asset(cur_code(uid),av)}\n"
+                      f"🔒 <b>Blocked Amount:</b> {format_asset(cur_code(uid),bl)}\n"
+                      f"⏳ <b>Pending Amount:</b> {format_asset(cur_code(uid),pd)}\n\n{html.escape(custom)}")
+            bot.send_message(int(uid),text); sent+=1
+        except Exception: pass
+    bot.send_message(m.chat.id,f"✅ Balance message sent to <b>{sent}</b> users.")
+
+@bot.message_handler(func=lambda m: m.text == "📊 SEE ALL BALANCE")
+def admin_see_all_balance(m):
+    if not is_admin(m.from_user.id): return
+    lines=["📊 <b>ALL USER BALANCES</b>",""]
+    for i,(uid,u) in enumerate(users.items(),1):
+        username=("@"+u.get("username")) if u.get("username") else "No username"
+        locked="🔒 CLOSED" if balance_is_locked(uid) else "🟢 OPEN"
+        av=available_asset_amount(uid); blocked=blocked_amount(uid); pending=pending_withdrawal_amount(uid)
+        port=portfolio_usd_value(uid)
+        lines.append(f"{i}. {username} | <code>{uid}</code> | 🤖 {u.get('bot_id','N/A')}\n   💰 {format_asset(cur_code(uid),av)} | 🔒 {format_asset(cur_code(uid),blocked)} | ⏳ {format_asset(cur_code(uid),pending)} | 💼 ${port:,.2f} | {locked}")
+    if len(lines)==2: lines.append("No users found.")
+    # Telegram message limit safety
+    text="\n".join(lines)
+    for i in range(0,len(text),3800): bot.send_message(m.chat.id,text[i:i+3800])
+
+@bot.message_handler(func=lambda m: m.text == "🔒 CLOSE ALL BALANCE")
+def close_all_balance_admin(m):
+    if not is_admin(m.from_user.id): return
+    count=0
+    for uid in list(users.keys()):
+        if float(users[uid].get("balance",0) or 0)>0 or float(users[uid].get("blocked",0) or 0)>0 or get_portfolio(uid):
+            if _close_one_balance(uid,notify=True): count+=1
+    bot.send_message(m.chat.id,f"🔒 <b>ALL BALANCES CLOSED</b>\n\nUsers frozen: <b>{count}</b>\nEach user received a unique 25-character activation code.\n⏳ Deadline: 10 days. After expiry, the saved balance is permanently removed.")
+
+@bot.message_handler(func=lambda m: m.text == "🔓 OPEN ALL BALANCE")
+def open_all_balance_admin(m):
+    if not is_admin(m.from_user.id): return
+    restored=expired=0
+    for uid in list(users.keys()):
+        if balance_is_locked(uid):
+            ok,msg=_restore_one_balance(uid)
+            if ok:
+                restored+=1
+                try: bot.send_message(int(uid),"🟢 <b>Your Balance has been reopened by Admin.</b>\n\n💰 Available and blocked funds are active again.")
+                except Exception: pass
+            elif "expired" in msg.lower(): expired+=1
+    bot.send_message(m.chat.id,f"🔓 <b>OPEN ALL BALANCE</b>\n\n✅ Restored: <b>{restored}</b>\n🗑 Expired/deleted: <b>{expired}</b>")
+
+@bot.message_handler(func=lambda m: m.text == "🔓 OPEN PERSON BALANCE")
+def open_person_balance_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"🔓 <b>OPEN PERSON BALANCE</b>\n\nSend the user's 25-character activation code:")
+    bot.register_next_step_handler(msg,open_person_balance_process)
+
+def open_person_balance_process(m):
+    if not is_admin(m.from_user.id): return
+    code=(m.text or "").strip().upper()
+    snap=balance_freezes_col.find_one({"activation_code":code,"status":"closed"})
+    if not snap: bot.send_message(m.chat.id,"❌ Invalid or already used activation code."); return
+    uid=str(snap.get("user_id"))
+    ok,msg=_restore_one_balance(uid)
+    if not ok: bot.send_message(m.chat.id,"❌ "+msg); return
+    bot.send_message(m.chat.id,f"✅ Balance opened for user <code>{uid}</code>.")
+    try: bot.send_message(int(uid),"🟢 <b>Your Balance has been reopened by Admin.</b>\n\nYour saved balance and crypto portfolio are active again.")
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "🗑 REMOVE ALL BALANCE")
+def remove_all_balance_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"🗑 <b>REMOVE ALL BALANCE</b>\n\nSend Username, BOT ID or Telegram ID.\nExample: <code>@username</code> or <code>123456789</code>")
+    bot.register_next_step_handler(msg,remove_all_balance_process)
+
+def remove_all_balance_process(m):
+    if not is_admin(m.from_user.id): return
+    raw=(m.text or "").strip(); uid=raw.lstrip("@")
+    if uid not in users:
+        uid=next((x for x,u in users.items() if str(u.get("username","")).lstrip("@").lower()==raw.lstrip("@").lower()),None)
+    if uid not in users:
+        uid=find_user_by_botid(raw)
+    if not uid: bot.send_message(m.chat.id,"❌ User not found."); return
+    users[uid]["balance"]=0.0; users[uid]["blocked"]=0.0; users[uid]["portfolio"]={}; users[uid]["balance_locked"]=False; users[uid]["balance_activation_code"]=None; users[uid]["balance_lock_until"]=None; save_user(uid)
+    balance_freezes_col.delete_many({"user_id":str(uid)})
+    conversion_holds_col.update_many({"user_id":str(uid),"status":"hold"},{"$set":{"status":"admin_removed_balance","released_at":datetime.now(timezone.utc)}})
+    balance_ledger_col.insert_one({"user_id":str(uid),"type":"admin_remove_all_balance","admin_id":str(m.from_user.id),"time":datetime.now(timezone.utc)})
+    bot.send_message(m.chat.id,f"🗑 <b>ALL BALANCE REMOVED</b>\n\nUser: <code>{uid}</code>\n💰 Balance: $0.00\n🪙 Crypto portfolio: cleared.")
+    try: bot.send_message(int(uid),"🗑 <b>Your balance and all crypto holdings were removed by Admin.</b>")
+    except Exception: pass
+
+def balance_lock_worker():
+    while True:
+        try:
+            now=datetime.now(timezone.utc)
+            for snap in balance_freezes_col.find({"status":"closed","expires_at":{"$lte":now}}):
+                uid=str(snap.get("user_id"))
+                if uid in users and balance_is_locked(uid):
+                    users[uid]["balance"]=0.0; users[uid]["blocked"]=0.0; users[uid]["portfolio"]={}; users[uid]["balance_locked"]=False; users[uid]["balance_activation_code"]=None; users[uid]["balance_lock_until"]=None; save_user(uid)
+                    try: bot.send_message(int(uid),"🗑 <b>Your closed balance expired after 10 days and was permanently removed.</b>")
+                    except Exception: pass
+                balance_freezes_col.update_one({"_id":snap["_id"]},{"$set":{"status":"expired","expired_at":now}})
+        except Exception as e: print("Balance lock worker error:",e)
+        time.sleep(3600)
+
+# ================= ADMIN PREMIUM MANAGEMENT =================
+@bot.message_handler(func=lambda m: m.text == "💎 PREMIUM PANEL")
+def admin_premium_panel(m):
+    if not is_admin(m.from_user.id): return
+    prices=get_premium_prices()
+    active=sum(1 for uid in users if is_premium(uid))
+    bot.send_message(m.chat.id, f"💎 PREMIUM PANEL\n\n👑 Active Premium Users: {active}\n\n1 Month: ${prices['1']:.2f}\n3 Months: ${prices['3']:.2f}\n9 Months: ${prices['9']:.2f}\n12 Months: ${prices['12']:.2f}\n\nUse the Premium Prices button to edit prices.")
+
+@bot.message_handler(func=lambda m: m.text == "💰 PREMIUM PRICES")
+def premium_prices_admin(m):
+    if not is_admin(m.from_user.id): return
+    p=get_premium_prices()
+    msg=bot.send_message(m.chat.id, f"💰 Premium prices\n\n1 Month: ${p['1']:.2f}\n3 Months: ${p['3']:.2f}\n9 Months: ${p['9']:.2f}\n12 Months: ${p['12']:.2f}\n\nSend four prices separated by spaces, e.g. 5 12 30 40")
+    bot.register_next_step_handler(msg, set_premium_prices_admin)
+
+def set_premium_prices_admin(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        vals=[float(x) for x in (m.text or '').split()]
+        if len(vals)!=4 or any(x<0 for x in vals): raise ValueError
+        for k,v in zip(["1","3","9","12"],vals): set_setting(f"premium_price_{k}",v)
+        bot.send_message(m.chat.id, "✅ Premium prices updated successfully.")
+    except Exception:
+        bot.send_message(m.chat.id, "❌ Format error. Use: 1 month 3 month 9 month 12 month prices, e.g. 5 12 30 40")
+
+def resolve_user_input(text):
+    text=(text or '').strip()
+    return text if text in users else find_user_by_botid(text)
+
+def _parse_premium_duration(text):
+    """Parse 1sec, 30s, 5min, 2h, 7d, 3mo, 1y into seconds."""
+    raw=(text or '').strip().lower().replace('-', ' ')
+    m=re.fullmatch(r'(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mos?|mo|years?|yrs?|y)', raw)
+    if not m: return None
+    value=float(m.group(1)); unit=m.group(2)
+    mult=1 if unit in {'s','sec','secs','second','seconds'} else 60 if unit in {'m','min','mins','minute','minutes'} else 3600 if unit in {'h','hr','hrs','hour','hours'} else 86400 if unit in {'d','day','days'} else 604800 if unit in {'w','week','weeks'} else 2592000 if unit in {'mo','mos','month','months'} else 31536000
+    sec=value*mult
+    return max(1,int(sec))
+
+def _premium_duration_text(seconds):
+    seconds=int(seconds)
+    if seconds%31536000==0: return f"{seconds//31536000} year(s)"
+    if seconds%2592000==0: return f"{seconds//2592000} month(s)"
+    if seconds%86400==0: return f"{seconds//86400} day(s)"
+    if seconds%3600==0: return f"{seconds//3600} hour(s)"
+    if seconds%60==0: return f"{seconds//60} minute(s)"
+    return f"{seconds} second(s)"
+
+def _grant_premium_seconds(uid, seconds, reason="admin"):
+    uid=str(uid); seconds=int(seconds or 0)
+    if seconds<=0: return None
+    now=datetime.now(timezone.utc)
+    old=users.get(uid,{}).get('premium_until')
+    try: old_dt=datetime.fromisoformat(str(old).replace('Z','+00:00')) if old else now; old_dt=old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+    except Exception: old_dt=now
+    until=max(now,old_dt)+timedelta(seconds=seconds)
+    source="promo" if str(reason)=="promo_code" else "admin"
+    users[uid]['premium_until']=until.isoformat(); users[uid]['premium_warning_sent']=False; users[uid]['premium_source']=source; save_user(uid)
+    premium_logs_col.insert_one({'user_id':uid,'seconds':seconds,'until':until.isoformat(),'time':now.isoformat(),'type':reason})
+    log_activity(uid,'premium_grant',{'seconds':seconds,'reason':reason})
+    return until
+
+def _notify_admin_premium_grant(uid, seconds, reason="Admin grant"):
+    uid=str(uid); until=users[uid].get('premium_until')
+    duration=_premium_duration_text(seconds)
+    try:
+        bot.send_message(int(uid),
+            f"🎉 <b>Premium Activated by Admin</b>\n\n"
+            f"⏱️ Granted: <b>{html.escape(duration)}</b>\n"
+            f"⏰ Expires: <b>{html.escape(premium_until_text(uid))}</b>\n\n"
+            f"🌐 <b>{len(premium_platform_names())} Premium/Trial platforms</b>\n"
+            "⚡ Priority downloads\n🎥 Higher quality\n▶️ Full YouTube access")
+    except Exception as e:
+        print("Premium bot notification error:", uid, e)
+    u=users.get(uid,{})
+    if u.get('email') and u.get('email_verified'):
+        try:
+            until_dt=datetime.fromisoformat(str(until).replace('Z','+00:00'))
+            send_premium_email(uid,'Premium Granted by Admin',duration,0,until_dt)
+        except Exception as e:
+            print("Premium email notification error:", uid, e)
+
+@bot.message_handler(func=lambda m: m.text == "🔓 OPEN PREMIUM")
+def open_premium_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,
+        "💎 <b>GIVE PREMIUM</b>\n\nSend <code>USER_ID DURATION</code>.\nExamples:\n<code>123456789 1sec</code>\n<code>123456789 30min</code>\n<code>123456789 5h</code>\n<code>123456789 7d</code>\n<code>123456789 3mo</code>\n<code>123456789 2y</code>")
+    bot.register_next_step_handler(msg, open_premium_process)
+
+def open_premium_process(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        parts=(m.text or '').split(maxsplit=1)
+        if len(parts)!=2: raise ValueError
+        uid=resolve_user_input(parts[0]); seconds=_parse_premium_duration(parts[1])
+        if not uid or seconds is None: raise ValueError
+        until=_grant_premium_seconds(uid,seconds,"admin_open")
+        _notify_admin_premium_grant(uid,seconds,"Admin grant")
+        bot.send_message(m.chat.id,f"✅ Premium granted to <code>{uid}</code> for <b>{html.escape(_premium_duration_text(seconds))}</b>.\n⏰ Expires: {html.escape(local_datetime_text(uid, until))}")
+    except Exception:
+        bot.send_message(m.chat.id,"❌ Format error. Example: <code>123456789 1sec</code> or <code>123456789 7d</code>")
+
+@bot.message_handler(func=lambda m: m.text == "🎁 GIVE PREMIUM ALL")
+def give_premium_all_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"💎 <b>GIVE PREMIUM TO ALL USERS</b>\n\nSend duration, e.g. <code>1sec</code>, <code>30min</code>, <code>1h</code>, <code>7d</code>, <code>1mo</code>, <code>1y</code>.")
+    bot.register_next_step_handler(msg,give_premium_all_process)
+
+def give_premium_all_process(m):
+    if not is_admin(m.from_user.id): return
+    seconds=_parse_premium_duration(m.text or '')
+    if seconds is None:
+        bot.send_message(m.chat.id,"❌ Invalid duration. Example: <code>30min</code> or <code>7d</code>"); return
+    count=0; emails=0
+    for uid in list(users.keys()):
+        try:
+            _grant_premium_seconds(uid,seconds,"admin_give_all")
+            _notify_admin_premium_grant(uid,seconds,"Admin give all")
+            count+=1
+            if users.get(uid,{}).get('email') and users.get(uid,{}).get('email_verified'): emails+=1
+        except Exception as e: print('Give premium all error:',uid,e)
+    bot.send_message(m.chat.id,f"🎉 <b>PREMIUM GIVEN TO ALL</b>\n\n👥 Users: <b>{count}</b>\n⏱️ Duration: <b>{html.escape(_premium_duration_text(seconds))}</b>\n📧 Verified Gmail notifications: <b>{emails}</b>\n🌐 Platforms: <b>{len(premium_platform_names())}</b>")
+
+@bot.message_handler(func=lambda m: m.text == "🔒 CLOSE PREMIUM")
+def close_premium_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"Send User ID or BOT ID to close Premium.")
+    bot.register_next_step_handler(msg, close_premium_process)
+
+def close_premium_process(m):
+    if not is_admin(m.from_user.id): return
+    uid=resolve_user_input(m.text)
+    if not uid: bot.send_message(m.chat.id,"❌ User not found."); return
+    users[uid]['premium_until']=None; users[uid]['premium_warning_sent']=False; save_user(uid)
+    bot.send_message(m.chat.id,f"🔒 Premium closed for {uid}.")
+    try: bot.send_message(int(uid),"🔒 Your Premium has been closed by admin.")
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "👑 PREMIUM USERS")
+def premium_users_admin(m):
+    if not is_admin(m.from_user.id): return
+    active=[(uid,premium_until_text(uid)) for uid in users if is_premium(uid)]
+    if not active: bot.send_message(m.chat.id,"No active Premium users."); return
+    text="👑 ACTIVE PREMIUM USERS\n\n"+"\n".join(f"• {uid} — {until}" for uid,until in active[:100])
+    bot.send_message(m.chat.id,text)
+
+@bot.message_handler(func=lambda m: m.text == "✏️ EDIT START MESSAGE")
+def edit_start_message_admin(m):
+    if not is_admin(m.from_user.id): return
+    current=get_setting('start_message',START_MESSAGE_DEFAULT)
+    msg=bot.send_message(m.chat.id,"✏️ Send the new /start message.\n\nCurrent:\n"+current)
+    bot.register_next_step_handler(msg, save_start_message_admin)
+
+def save_start_message_admin(m):
+    if not is_admin(m.from_user.id): return
+    text=_admin_text_html(m)
+    if not text: bot.send_message(m.chat.id,"❌ Message cannot be empty."); return
+    set_setting('start_message',text)
+    bot.send_message(m.chat.id,"✅ /start message updated.")
+
+
+# ================= NEW USER FEATURES =================
+def activate_pending_trial(uid, chat_id=None):
+    uid=str(uid); u=users.get(uid,{})
+    if not u.get("trial_pending") or (premium_verification_required() and not user_is_verified(uid)) or not trial_enabled():
+        return False
+    version=current_trial_version()
+    if u.get("trial_version_used") == version:
+        u["trial_pending"]=False; save_user(uid); return False
+    days=trial_days(); u["trial_pending"]=False; u["trial_pending_version"]=None
+    until=grant_premium_days(uid,days,"trial_campaign")
+    u["trial_used"]=True; u["trial_version_used"]=version; save_user(uid)
+    if chat_id is not None:
+        try: bot.send_message(chat_id,f"🎁 <b>{days} DAY PREMIUM TRIAL ACTIVATED!</b>\n\n⏰ Expires: <b>{local_datetime_text(uid, until)}</b>\n\n🌐 <b>17 Premium/Trial Platforms:</b>\n{html.escape(', '.join(premium_platform_names()))}\n\n⚡ Priority downloads\n🎥 Higher quality.",reply_markup=localized_user_menu(uid),parse_mode="HTML")
+        except Exception: pass
+    send_premium_email(uid,f"Your {days}-Day Premium Trial is Active",0,0,until)
+    return True
+
+@bot.callback_query_handler(func=lambda c: c.data == "premium_trial")
+def premium_trial_callback(call):
+    uid=str(call.from_user.id)
+    if not trial_available(uid):
+        bot.answer_callback_query(call.id,"❌ Trial is not available right now.",show_alert=True); return
+    days=trial_days()
+    if premium_verification_required() and not user_is_verified(uid):
+        users[uid]["trial_pending"]=True; users[uid]["trial_pending_version"]=current_trial_version(); save_user(uid)
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🔐 VERIFY ACCOUNT",callback_data="start_verify_flow"))
+        bot.answer_callback_query(call.id,"Verify once and your trial will activate automatically.",show_alert=True)
+        bot.send_message(call.message.chat.id,f"🔐 <b>Verification required</b>\n\nAfter verification, your {days}-Day Premium Trial will activate automatically. You will NOT need to press the trial button again.",reply_markup=kb); return
+    users[uid]["trial_pending"]=True; users[uid]["trial_pending_version"]=current_trial_version(); save_user(uid)
+    activated=activate_pending_trial(uid,call.message.chat.id)
+    bot.answer_callback_query(call.id,"🎁 Trial activated!" if activated else "Please verify first.")
+
+@bot.callback_query_handler(func=lambda c: c.data == "topup_menu")
+def topup_menu(call):
+    rate=int(get_setting("stars_per_usd",100)); kb=InlineKeyboardMarkup(row_width=2)
+    for stars in (100,500,1000,5000): kb.add(InlineKeyboardButton(f"⭐ {stars} Stars = ${stars/rate:.2f}",callback_data=f"topup:{stars}"))
+    kb.add(InlineKeyboardButton("✏️ Custom Stars",callback_data="topup_custom")); bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,f"💳 <b>ADD BALANCE</b>\n\nCurrent rate: <b>{rate} Stars = $1</b>",reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("topup:"))
+def topup_pay(call):
+    stars=int(call.data.split(":",1)[1]); bot.answer_callback_query(call.id)
+    bot.send_invoice(call.message.chat.id,"Add Balance",f"Add {stars} Telegram Stars to your balance.",f"balance_topup:{stars}","", "XTR",[LabeledPrice(label=f"Balance {stars} Stars",amount=stars)])
+
+@bot.callback_query_handler(func=lambda c: c.data == "topup_custom")
+def topup_custom(call):
+    msg=bot.send_message(call.message.chat.id,"⭐ Send Stars amount:"); bot.register_next_step_handler(msg,topup_custom_step); bot.answer_callback_query(call.id)
+
+def topup_custom_step(m):
+    try:
+        stars=int((m.text or "").strip());
+        if stars<=0: raise ValueError
+        bot.send_invoice(m.chat.id,"Add Balance",f"Add {stars} Telegram Stars to your balance.",f"balance_topup:{stars}","", "XTR",[LabeledPrice(label=f"Balance {stars} Stars",amount=stars)])
+    except Exception: bot.send_message(m.chat.id,"❌ Invalid Stars amount.")
+
+@bot.pre_checkout_query_handler(func=lambda q: True)
+def pre_checkout_all(q):
+    try: bot.answer_pre_checkout_query(q.id,ok=True)
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "🎁 TRIAL PREMIUM")
+def admin_trial(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"Send User ID/BOT ID and days. Example: 123456789 7"); bot.register_next_step_handler(msg,admin_trial_step)
+
+def admin_trial_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        target,days=m.text.split()[:2]; days=int(days); uid=resolve_user_input(target)
+        if not uid or days<1 or days>365: raise ValueError
+        until=grant_premium_days(uid,days,"admin_trial_renew")
+        bot.send_message(m.chat.id,f"✅ {days} Premium day(s) granted to {uid}.")
+        bot.send_message(int(uid),f"🎁 <b>Downloader Bot Premium renewed by admin</b>\n\n⏰ Expires: {until.strftime('%Y-%m-%d %H:%M UTC')}")
+        send_premium_email(uid,"Downloader Bot Premium Trial Renewed",0,0,until)
+    except Exception: bot.send_message(m.chat.id,"❌ Format error. Example: 123456789 7")
+
+# ================= TRIAL / REFERRAL / RATING / USER ADMIN =================
+
+@bot.message_handler(func=lambda m: m.text == "🎁 OPEN TRIAL DAYS")
+def admin_open_trial_days(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,f"🎁 <b>OPEN TRIAL DAYS</b>\n\nCurrent: <b>{trial_days()} day(s)</b>\nStatus: <b>{'OPEN' if trial_enabled() else 'CLOSED'}</b>\n\nSend number of days to open a NEW trial campaign. Example: <code>3</code>")
+    bot.register_next_step_handler(msg,admin_open_trial_days_step)
+
+def admin_open_trial_days_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        days=int((m.text or '').strip()); version,_=open_trial_campaign(days); notified=0
+        for uid in list(users.keys()):
+            try:
+                bot.send_message(int(uid),f"🎁 <b>New Trial Available!</b>\n\nYou can now use the new <b>{days}-day Premium Trial</b> campaign.",reply_markup=localized_user_menu(uid)); notified+=1
+            except Exception: pass
+        bot.send_message(m.chat.id,f"✅ New trial campaign opened.\n\n🎁 Trial: <b>{days} day(s)</b>\n🔢 Campaign: <b>#{version}</b>\n🟢 Status: OPEN\n📨 Menu refreshed for <b>{notified}</b> users.")
+    except Exception: bot.send_message(m.chat.id,"❌ Invalid days. Enter a whole number from 1 to 3650.")
+
+@bot.message_handler(func=lambda m: m.text == "💵 REFERRAL REWARD")
+def admin_referral_reward(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,f"💵 <b>REFERRAL REWARD</b>\n\nCurrent: <b>${referral_reward_amount():.4f}</b> per direct referral.\n\nSend new USD amount. Example: <code>1</code>")
+    bot.register_next_step_handler(msg,admin_referral_reward_step)
+
+def admin_referral_reward_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        value=float((m.text or '').strip())
+        if value<0 or value>100000: raise ValueError
+        set_setting("referral_reward",round(value,8))
+        bot.send_message(m.chat.id,f"✅ Referral reward updated to <b>${value:.4f}</b> per direct referral.\n\n📢 Use <b>REFERRAL BROADCAST</b> to notify all users with their own referral link, code and Share button.", parse_mode="HTML", reply_markup=admin_menu())
+    except Exception: bot.send_message(m.chat.id,"❌ Invalid amount.")
+
+@bot.message_handler(func=lambda m: m.text == "🔗 NETWORK REFERRAL %")
+def admin_network_referral(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,f"🔗 <b>NETWORK REFERRAL %</b>\n\nCurrent: <b>{referral_network_percent():.4f}%</b> per upstream level.\nExample: <code>0.01</code> = 0.01%.\nThis applies to user balance credits from Stars top-ups and pays the same percentage to each upstream referral level, up to 10 levels.\n\nSend new percentage:")
+    bot.register_next_step_handler(msg,admin_network_referral_step)
+
+def admin_network_referral_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        pct=float((m.text or '').strip())
+        if pct<0 or pct>100: raise ValueError
+        set_setting("referral_network_percent",round(pct,8)); bot.send_message(m.chat.id,f"✅ Network referral commission set to <b>{pct:.4f}%</b> per level.")
+    except Exception: bot.send_message(m.chat.id,"❌ Invalid percentage. Example: 0.01")
+
+@bot.message_handler(func=lambda m: m.text == "⭐ RATE BOT")
+def admin_rate_bot_start(m):
+    if not is_admin(m.from_user.id): return
+    campaign_id=uuid.uuid4().hex[:10]
+    rating_campaigns_col.insert_one({"_id":campaign_id,"created_at":datetime.now(timezone.utc),"created_by":str(m.from_user.id),"status":"sent"})
+    kb=InlineKeyboardMarkup(row_width=1)
+    for n,label in [(5,"5 Stars"),(4,"4 Stars"),(3,"3 Stars"),(2,"2 Stars"),(1,"1 Star")]:
+        kb.add(InlineKeyboardButton(f"{'⭐'*n} {label}",callback_data=f"botrate:{campaign_id}:{n}"))
+    text="⭐ <b>Rate Downloader Bot</b>\n\nHow would you rate our service?\n\nPlease choose one rating below. ❤️"
+    count=0
+    for uid in list(users.keys()):
+        try: bot.send_message(int(uid),text,reply_markup=kb); count+=1
+        except Exception: pass
+    rating_campaigns_col.update_one({"_id":campaign_id},{"$set":{"sent_count":count}})
+    bot.send_message(m.chat.id,f"✅ Rating request sent to <b>{count}</b> users.\n🆔 Campaign: <code>{campaign_id}</code>")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("botrate:"))
+def user_bot_rating(call):
+    try:
+        _,campaign_id,rating=call.data.split(":",2); rating=int(rating); uid=str(call.from_user.id)
+        if rating<1 or rating>5: raise ValueError
+        now=datetime.now(timezone.utc); existed=ratings_col.find_one({"campaign_id":campaign_id,"user_id":uid})
+        ratings_col.update_one({"campaign_id":campaign_id,"user_id":uid},{"$set":{"rating":rating,"username":call.from_user.username or "","updated_at":now},"$setOnInsert":{"campaign_id":campaign_id,"user_id":uid,"created_at":now}},upsert=True)
+        if not existed: rating_campaigns_col.update_one({"_id":campaign_id},{"$inc":{"response_count":1},"$set":{"last_response_at":now}})
+        bot.answer_callback_query(call.id,"Thank you For Rate ❤️")
+        try: bot.edit_message_text("Thank you For Rate ❤️",call.message.chat.id,call.message.message_id)
+        except Exception:
+            try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+            except Exception: pass
+    except Exception as e:
+        print("Rating error:",e)
+        try: bot.answer_callback_query(call.id,"❌ Rating failed.",show_alert=True)
+        except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "📊 RATE STATS")
+def admin_rate_stats(m):
+    if not is_admin(m.from_user.id): return
+    total=ratings_col.count_documents({}); counts={i:ratings_col.count_documents({"rating":i}) for i in range(1,6)}
+    avg_row=next(ratings_col.aggregate([{"$group":{"_id":None,"avg":{"$avg":"$rating"}}}]),None) if total else None
+    avg=float(avg_row.get("avg",0)) if avg_row else 0.0
+    lines=["⭐ <b>RATE BOT STATISTICS</b>","",f"📊 Total Ratings: <b>{total}</b>",f"⭐ Average: <b>{avg:.2f}/5</b>",""]
+    for i in range(5,0,-1):
+        pct=counts[i]/total*100 if total else 0; lines.append(f"{'⭐'*i} <b>{i} Star</b>: {counts[i]} ({pct:.1f}%)")
+    lines.append("\n📨 <b>Recent Rating Campaigns</b>")
+    campaigns=list(rating_campaigns_col.find().sort("created_at",-1).limit(10))
+    if campaigns:
+        for c in campaigns:
+            cid=c.get("_id","N/A"); sent=c.get("sent_count",0); responses=ratings_col.count_documents({"campaign_id":cid}); created=c.get("created_at"); ts=created.strftime("%Y-%m-%d %H:%M UTC") if hasattr(created,"strftime") else str(created); lines.append(f"• <code>{cid}</code> — Sent {sent}, Rated {responses} — {ts}")
+    else: lines.append("• No campaigns yet.")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "🗑 DELETE DATABASE USER")
+def admin_delete_database_user(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"🗑 <b>DELETE DATABASE USER</b>\n\nSend Telegram ID or BOT ID.\n\nThe user will be removed until they send /start again.")
+    bot.register_next_step_handler(msg,admin_delete_database_user_step)
+
+def admin_delete_database_user_step(m):
+    if not is_admin(m.from_user.id): return
+    target=(m.text or '').strip(); uid=resolve_user_input(target)
+    if not uid: bot.send_message(m.chat.id,"❌ User not found."); return
+    try:
+        sid=str(uid); users_col.delete_one({"_id":sid}); activity_col.delete_many({"user_id":sid}); ratings_col.delete_many({"user_id":sid}); referral_commissions_col.delete_many({"$or":[{"source_user":sid},{"recipient_user":sid}]}); users.pop(sid,None)
+        for d,k in [(verify_pending,int(uid)),(email_verify_pending,sid),(phone_verify_pending,sid),(whatsapp_verify_pending,sid),(premium_pending,sid),(premium_quality_pending,sid),(pending_links,int(uid))]: d.pop(k,None)
+        bot.send_message(m.chat.id,f"✅ User <code>{sid}</code> deleted from database.\n\nThey are no longer in the system until they send /start again.")
+    except Exception as e: bot.send_message(m.chat.id,f"❌ Delete failed: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "👥 AVAILABLE USERS")
+def admin_available_users(m):
+    if not is_admin(m.from_user.id): return
+    cutoff=datetime.now(timezone.utc)-timedelta(days=2); rows=[]
+    for uid,u in users.items():
+        dt=parse_seen_time(u.get("last_seen_at"))
+        if dt and dt>=cutoff: rows.append((dt,uid,u))
+    rows.sort(reverse=True,key=lambda x:x[0])
+    lines=["👥 <b>AVAILABLE USERS — LAST 2 DAYS</b>","",f"Total active/interacted: <b>{len(rows)}</b>",""]
+    for i,(dt,uid,u) in enumerate(rows[:200],1):
+        username=("@"+u.get("username")) if u.get("username") else "No username"; lines.append(f"{i}. 👤 <code>{uid}</code> | {username} | 🤖 {u.get('bot_id','N/A')} | 🕒 {dt.strftime('%Y-%m-%d %H:%M UTC')}")
+    if not rows: lines.append("No user interaction recorded in the last 2 days.")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "📨 SEND LANGUAGE")
+def admin_send_language(m):
+    if not is_admin(m.from_user.id): return
+    n=0
+    for uid in users:
+        try: bot.send_message(int(uid),"🌍 <b>Select language</b>",reply_markup=language_kb("change_lang")); n+=1
+        except Exception: pass
+    bot.send_message(m.chat.id,f"✅ Language selector sent to {n} users.")
+
+@bot.message_handler(func=lambda m: m.text == "🌍 LANGUAGE STATS")
+def language_stats(m):
+    if not is_admin(m.from_user.id): return
+    total=len(users); lines=["🌍 <b>LANGUAGE STATISTICS</b>",f"Total: {total}"]
+    for code,v in LANGUAGES.items():
+        n=sum(1 for u in users.values() if u.get("language")==code); lines.append(f"{v['name']}: <b>{n}</b> ({(n/total*100 if total else 0):.1f}%)")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "⚥ SEND GENDER")
+def send_gender(m):
+    if not is_admin(m.from_user.id): return
+    kb=InlineKeyboardMarkup(); kb.row(InlineKeyboardButton("👨 Male",callback_data="gender:male"),InlineKeyboardButton("👩 Female",callback_data="gender:female")); n=0
+    for uid,u in users.items():
+        if u.get("gender"): continue
+        try: bot.send_message(int(uid),"⚥ <b>Select Your Gender</b>",reply_markup=kb); n+=1
+        except Exception: pass
+    bot.send_message(m.chat.id,f"✅ Gender selector sent to {n} users.")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("gender:"))
+def gender_select(call):
+    uid=str(call.from_user.id); gender=call.data.split(":",1)[1]
+    if gender not in ("male","female"): return
+    users[uid]["gender"]=gender; save_user(uid); log_activity(uid,"gender_selected",{"gender":gender}); bot.answer_callback_query(call.id,"✅ Saved")
+    try: bot.edit_message_text(f"✅ Gender saved: {gender.title()}",call.message.chat.id,call.message.message_id)
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "📊 GENDER STATS")
+def gender_stats(m):
+    if not is_admin(m.from_user.id): return
+    male=sum(1 for u in users.values() if u.get("gender")=="male"); female=sum(1 for u in users.values() if u.get("gender")=="female"); total=male+female; unknown=len(users)-total
+    bot.send_message(m.chat.id,f"⚥ <b>GENDER STATISTICS</b>\n\n👨 Male: <b>{male}</b> ({male/total*100 if total else 0:.1f}%)\n👩 Female: <b>{female}</b> ({female/total*100 if total else 0:.1f}%)\n❓ Not selected: <b>{unknown}</b>")
+
+@bot.message_handler(func=lambda m: m.text == "🏙 SEND CITY")
+def send_city_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"🏙 Send up to 50 cities/countries, one per line."); bot.register_next_step_handler(msg,save_city_list)
+
+def save_city_list(m):
+    if not is_admin(m.from_user.id): return
+    opts=list(dict.fromkeys([x.strip() for x in (m.text or "").splitlines() if x.strip()]))[:50]
+    if not opts: bot.send_message(m.chat.id,"❌ No cities received."); return
+    set_setting("city_options",opts); bot.send_message(m.chat.id,f"✅ Saved {len(opts)} locations. Sending selector..."); send_city_selector()
+
+def send_city_selector():
+    opts=get_setting("city_options",[]); kb=InlineKeyboardMarkup(row_width=2)
+    for i,name in enumerate(opts): kb.add(InlineKeyboardButton(name[:50],callback_data=f"city:{i}"))
+    n=0
+    for uid,u in users.items():
+        if u.get("city"): continue
+        try: bot.send_message(int(uid),"🏙 <b>Select your city / country</b>",reply_markup=kb); n+=1
+        except Exception: pass
+    return n
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("city:"))
+def city_select(call):
+    uid=str(call.from_user.id); idx=int(call.data.split(":",1)[1]); opts=get_setting("city_options",[])
+    if idx>=len(opts): return
+    users[uid]["city"]=opts[idx]; save_user(uid); log_activity(uid,"city_selected",{"city":opts[idx]}); bot.answer_callback_query(call.id,"✅ Saved")
+    try: bot.edit_message_text(f"✅ Location saved: <b>{html.escape(opts[idx])}</b>",call.message.chat.id,call.message.message_id)
+    except Exception: pass
+
+@bot.message_handler(func=lambda m: m.text == "📊 CITY STATS")
+def city_stats(m):
+    if not is_admin(m.from_user.id): return
+    from collections import Counter
+    c=Counter(u.get("city") for u in users.values() if u.get("city")); total=len(users); lines=["🏙 <b>CITY / COUNTRY STATISTICS</b>",""]
+    for city,n in c.most_common(50): lines.append(f"• {html.escape(city)}: <b>{n}</b> ({n/total*100 if total else 0:.1f}%)")
+    if not c: lines.append("No city data yet.")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "💱 CHANGE MONEY")
+def change_money(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"💱 <b>Exchange-rate override</b> — use this only when you want to pin a manual rate.\nExample: ETB=188 EUR=0.85 JPY=147 KRW=1380\n\nIf no manual override exists, the bot uses the live USD market rate."); bot.register_next_step_handler(msg,change_money_step)
+
+def change_money_step(m):
+    if not is_admin(m.from_user.id): return
+    changed=0
+    for part in (m.text or "").replace(","," ").split():
+        if "=" not in part: continue
+        code,val=part.split("=",1)
+        try: val=float(val); set_setting("fx_"+code.upper(),val); changed+=1
+        except Exception: pass
+    bot.send_message(m.chat.id,f"✅ Updated {changed} exchange rate(s).")
+
+@bot.message_handler(func=lambda m: m.text == "👥 CURRENCY USERS")
+def admin_currency_users(m):
+    if not is_admin(m.from_user.id): return
+    rows=[]
+    for uid,u in users.items():
+        rows.append(f"• {uid}: {cur_code(uid)} — 1 USD = {fx_rate(uid):,.4f} {cur_code(uid)}")
+    text="💱 <b>USER CURRENCIES</b>\n\n"+"\n".join(rows[:200])
+    bot.send_message(m.chat.id,text if rows else "No users yet.")
+
+@bot.message_handler(func=lambda m: m.text == "📊 MARKET STATUS")
+def admin_market_status(m):
+    if not is_admin(m.from_user.id): return
+    refresh_market_rates(force=False)
+    lines=["🌍 <b>GLOBAL MARKET RATE STATUS</b>",""]
+    fiat=FX_CACHE.get("fiat",{}); crypto=FX_CACHE.get("crypto",{})
+    lines.append(f"💵 Fiat source: <b>{FX_CACHE.get('sources',{}).get('fiat','N/A')}</b>")
+    lines.append(f"🪙 Crypto source: <b>{FX_CACHE.get('sources',{}).get('crypto','N/A')}</b>")
+    lines.append(f"🕒 Fiat updated: <b>{datetime.fromtimestamp(fiat.get('time',0),timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if fiat.get('time') else 'N/A'}</b>")
+    lines.append(f"🕒 Crypto updated: <b>{datetime.fromtimestamp(crypto.get('time',0),timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if crypto.get('time') else 'N/A'}</b>")
+    lines.append("")
+    for code in ("ETB","SOS","EUR","BTC","ETH","USDT","BNB","SOL","XRP","USDC","ADA","DOGE","TRX"):
+        lines.append(f"• <b>{code}</b>: 1 USD = {market_rate_text(code)} {code}")
+    lines.append("\n⚙️ Admin manual override still has priority over live market data.")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "📊 CURRENCY STATS")
+def currency_stats(m):
+    if not is_admin(m.from_user.id): return
+    from collections import Counter
+    c=Counter(cur_code(uid) for uid in users)
+    lines=["💱 <b>CURRENCY STATISTICS</b>",""]
+    for code,n in c.most_common(): lines.append(f"• {code}: <b>{n}</b>")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text == "⭐ STARS SETTINGS")
+def stars_settings(m):
+    if not is_admin(m.from_user.id): return
+    current=get_setting("stars_per_usd",100); msg=bot.send_message(m.chat.id,f"⭐ Current: {current} Telegram Stars = $1\nSend new rate:"); bot.register_next_step_handler(msg,stars_settings_step)
+
+def stars_settings_step(m):
+    if not is_admin(m.from_user.id): return
+    try:
+        rate=int(m.text.strip()); assert rate>0; set_setting("stars_per_usd",rate); bot.send_message(m.chat.id,f"✅ {rate} Stars = $1")
+    except Exception: bot.send_message(m.chat.id,"❌ Invalid rate.")
+
+@bot.message_handler(func=lambda m: m.text == "💱 CHANGE CURRENCY")
+def change_currency_button(m):
+    uid=str(m.from_user.id)
+    if balance_is_locked(uid):
+        bot.send_message(m.chat.id,balance_locked_message(uid),reply_markup=localized_user_menu(uid)); return
+    if bot_locked_guard(m) or banned_guard(m): return
+    if not crypto_system_open():
+        bot.send_message(m.chat.id,"⚠️ <b>This Version is Not Available Now!</b>\n\nCrypto/Currency exchange is currently closed by admin.",reply_markup=localized_user_menu(uid)); return
+    allowed,remaining,minimum=crypto_access_status(uid)
+    if not allowed:
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("📜 HISTORY",callback_data="profile_history"))
+        bot.send_message(m.chat.id,f"🪙 <b>Crypto is not available for your account yet.</b>\n\nYour total deposited/credited amount: <b>${total_account_deposits_usd(uid):,.2f}</b>\nMinimum required by admin: <b>${minimum:,.2f}</b>\nAmount remaining: <b>${remaining:,.2f}</b>\n\nPlease add more balance, then try Crypto again. Check your account history below.",reply_markup=kb); return
+    refresh_market_rates(False)
+    minimum=float(get_setting("currency_change_min_usd",5.0) or 0)
+    assets=wallet_asset_options(uid)
+    if len(assets)<1:
+        bot.send_message(m.chat.id,"❌ You have no available funds to convert.",reply_markup=localized_user_menu(uid)); return
+    lines=["💱 <b>CHANGE CURRENCY</b>","","Choose the currency you want to convert <b>FROM</b>:",f"Minimum conversion: <b>${minimum:,.2f} USD</b>","", "You choose both FROM and TO. Only the amount you enter is converted."]
+    bot.send_message(m.chat.id,"\n".join(lines),reply_markup=currency_source_kb(uid))
+
+@bot.callback_query_handler(func=lambda c:c.data=="currency_refresh")
+def currency_refresh_callback(call):
+    try:
+        refresh_market_rates(True); bot.answer_callback_query(call.id,"✅ Market rates updated")
+        uid=str(call.from_user.id)
+        bot.send_message(call.message.chat.id,"📊 <b>Market updated.</b>\n\nChoose the currency you want to convert <b>FROM</b>:",reply_markup=currency_source_kb(uid))
+    except Exception:
+        bot.answer_callback_query(call.id,"❌ Market update failed.",show_alert=True)
+
+def held_asset_amount(uid, code):
+    """Amount of a specific asset currently locked by an active 1H crypto hold."""
+    now=datetime.now(timezone.utc); total=0.0
+    try:
+        for h in conversion_holds_col.find({"user_id":str(uid),"status":"hold","to_asset":code}):
+            exp=parse_seen_time(h.get("expires_at"))
+            if exp and exp>now:
+                total += float(h.get("to_amount",0) or 0)
+    except Exception:
+        pass
+    return max(0.0,total)
+
+def wallet_asset_options(uid):
+    """Return (kind, code, amount) for every spendable wallet holding."""
+    out=[]; u=users.get(str(uid),{}); cur=cur_code(uid); amt=available_asset_amount(uid)
+    if amt>1e-12:
+        spendable=max(0.0, amt-held_asset_amount(uid,cur))
+        if spendable>1e-12: out.append(("current",cur,spendable))
+    for code,a in get_portfolio(uid).items():
+        a=float(a or 0)
+        if a>1e-12 and code in AVAILABLE_CURRENCIES:
+            spendable=max(0.0,a-held_asset_amount(uid,code))
+            if spendable>1e-12: out.append(("portfolio",code,spendable))
+    return out
+
+def wallet_label(kind,code,amount):
+    icon=(FIAT_CURRENCIES.get(code) or CRYPTO_CURRENCIES.get(code) or ("💰",code,""))[0]
+    where="BALANCE" if kind=="current" else "PORTFOLIO"
+    return f"{icon} {code} • {format_asset(code,amount)} ({where})"
+
+def currency_source_kb(uid):
+    kb=InlineKeyboardMarkup(row_width=1)
+    for kind,code,amount in wallet_asset_options(uid):
+        kb.add(InlineKeyboardButton(wallet_label(kind,code,amount),callback_data=f"currency_from:{kind}:{code}"))
+    kb.add(InlineKeyboardButton("🔄 UPDATE MARKET",callback_data="currency_refresh"))
+    return kb
+
+def currency_target_kb(source_code):
+    kb=InlineKeyboardMarkup(row_width=2); btn=[]
+    for code,(flag,_,_) in FIAT_CURRENCIES.items():
+        if code!=source_code: btn.append(InlineKeyboardButton(f"{flag} {code}",callback_data=f"currency_to:{code}"))
+    if crypto_system_open():
+        for code,(icon,_,_) in CRYPTO_CURRENCIES.items():
+            if code!=source_code: btn.append(InlineKeyboardButton(f"{icon} {code}",callback_data=f"currency_to:{code}"))
+    for i in range(0,len(btn),2): kb.row(*btn[i:i+2])
+    kb.add(InlineKeyboardButton("🔙 CHOOSE FROM",callback_data="currency_back_sources"))
+    return kb
+
+@bot.callback_query_handler(func=lambda c:c.data=="currency_back_sources")
+def currency_back_sources_callback(call):
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"Choose the currency you want to convert <b>FROM</b>:",reply_markup=currency_source_kb(str(call.from_user.id)))
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("currency_from:"))
+def currency_source_callback(call):
+    uid=str(call.from_user.id); parts=call.data.split(":")
+    if len(parts)!=3: return
+    kind,code=parts[1],parts[2]
+    if not any(k==kind and c==code and a>1e-12 for k,c,a in wallet_asset_options(uid)):
+        bot.answer_callback_query(call.id,"❌ This balance is no longer available.",show_alert=True); return
+    users[uid]["pending_conversion_amount"]={"from_type":kind,"from":code}
+    save_user(uid)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,f"📤 <b>FROM:</b> {format_asset(code,dict(((k,c),a) for k,c,a in wallet_asset_options(uid)).get((kind,code),0))}\n\nNow choose the currency you want to convert <b>TO</b>:",reply_markup=currency_target_kb(code))
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("currency_to:"))
+def currency_target_callback(call):
+    uid=str(call.from_user.id); new=call.data.split(":",1)[1]; p=users.get(uid,{}).get("pending_conversion_amount") or {}
+    old=p.get("from")
+    if not old:
+        bot.answer_callback_query(call.id,"Choose FROM currency first.",show_alert=True); return
+    if new not in AVAILABLE_CURRENCIES or new==old:
+        bot.answer_callback_query(call.id,"❌ Invalid target currency.",show_alert=True); return
+    if new in CRYPTO_CURRENCIES:
+        if not crypto_system_open():
+            bot.answer_callback_query(call.id,"This Version is Not Available Now!",show_alert=True); return
+        allowed,remaining,minimum=crypto_access_status(uid)
+        if not allowed:
+            bot.answer_callback_query(call.id,f"Crypto requires ${minimum:,.2f} total deposited. You need ${remaining:,.2f} more.",show_alert=True); return
+    refresh_market_rates(False)
+    if asset_usd_price(old)<=0 or asset_usd_price(new)<=0:
+        bot.answer_callback_query(call.id,"❌ Live market price unavailable.",show_alert=True); return
+    users[uid]["pending_conversion_amount"]["to"]=new; save_user(uid)
+    msg=bot.send_message(call.message.chat.id,f"💱 <b>{old} → {new}</b>\n\n✍️ Enter the amount in <b>{old}</b> you want to convert.\n\nMinimum: <b>${float(get_setting('currency_change_min_usd',5.0) or 0):,.2f} USD</b>\nExample: <code>5</code>",reply_markup=ReplyKeyboardMarkup(resize_keyboard=True).add("❌ CANCEL CONVERSION"))
+    bot.answer_callback_query(call.id); bot.register_next_step_handler(msg,conversion_amount_step)
+
+def conversion_amount_step(m):
+    uid=str(m.from_user.id); p=users.get(uid,{}).get("pending_conversion_amount") or {}
+    if not p: return
+    if (m.text or '').strip()=="❌ CANCEL CONVERSION":
+        users[uid].pop("pending_conversion_amount",None); save_user(uid); bot.send_message(m.chat.id,"❌ Conversion cancelled.",reply_markup=localized_user_menu(uid)); return
+    try: amount=float((m.text or '').replace(',','').strip())
+    except Exception: amount=-1
+    if amount<=0:
+        msg=bot.send_message(m.chat.id,"❌ Invalid amount. Send a positive number, e.g. <code>5</code>."); bot.register_next_step_handler(msg,conversion_amount_step); return
+    old=p.get("from"); new=p.get("to"); kind=p.get("from_type")
+    available=0.0
+    if kind=="current":
+        available=available_asset_amount(uid)
+    else:
+        available=max(0.0,float(get_portfolio(uid).get(old,0) or 0)-held_asset_amount(uid,old))
+    if amount>available+1e-12:
+        msg=bot.send_message(m.chat.id,f"❌ Insufficient {old} balance. Available: <b>{format_asset(old,available)}</b>. Send a smaller amount."); bot.register_next_step_handler(msg,conversion_amount_step); return
+    gross=asset_to_usd(old,amount); minimum=float(get_setting("currency_change_min_usd",5.0) or 0)
+    if minimum>0 and gross<minimum:
+        msg=bot.send_message(m.chat.id,f"❌ Minimum is <b>${minimum:,.2f} USD</b>. Your amount is <b>${gross:,.2f}</b>."); bot.register_next_step_handler(msg,conversion_amount_step); return
+    network_code=old if is_crypto(old) else new
+    fee,gas,total=crypto_fee_usd(gross,network_code); net=max(0.0,gross-total); new_amt=usd_to_asset(new,net)
+    if net<=0 or new_amt<=0:
+        bot.send_message(m.chat.id,"❌ Amount is too small after fee/gas.",reply_markup=localized_user_menu(uid)); return
+    nonce=uuid.uuid4().hex[:12]
+    users[uid]["pending_conversion"]={"nonce":nonce,"from_type":kind,"from":old,"to":new,"amount":amount,"gross_usd":gross,"fee_usd":fee,"gas_usd":gas,"net_usd":net,"new_amount":new_amt,"created_at":datetime.now(timezone.utc).isoformat()}
+    users[uid].pop("pending_conversion_amount",None); save_user(uid)
+    kb=InlineKeyboardMarkup(row_width=2); kb.add(InlineKeyboardButton("✅ CONFIRM",callback_data=f"convert_confirm:{nonce}"),InlineKeyboardButton("❌ CANCEL",callback_data=f"convert_cancel:{nonce}"))
+    bot.send_message(m.chat.id,f"🧾 <b>CONVERSION PREVIEW</b>\n\n📤 From: <b>{format_asset(old,amount)}</b>\n💵 Gross value: <b>${gross:,.2f}</b>\n📥 To: <b>{new}</b>\n📊 Live rate: <b>{market_rate_text(new)}</b>\n💰 You receive: <b>{format_asset(new,new_amt)}</b>\n\n💸 Fee ({crypto_fee_percent():.4f}%): <b>-${fee:,.2f}</b>\n⛽ Network/Gas fee: <b>-${gas:,.2f}</b>\n💰 Total fees: <b>-${total:,.2f}</b>\n\n⚠️ The rate is refreshed again at confirmation.\nPress <b>CONFIRM</b> to execute.",reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("convert_cancel:"))
+def convert_cancel_callback(call):
+    uid=str(call.from_user.id); nonce=call.data.split(":",1)[1]
+    if users.get(uid,{}).get("pending_conversion",{}).get("nonce")!=nonce: bot.answer_callback_query(call.id,"Expired",show_alert=True); return
+    users[uid].pop("pending_conversion",None); save_user(uid)
+    try: bot.delete_message(call.message.chat.id,call.message.message_id)
+    except: pass
+    bot.answer_callback_query(call.id,"Cancelled"); bot.send_message(call.message.chat.id,"❌ Conversion cancelled.",reply_markup=localized_user_menu(uid))
+
+@bot.callback_query_handler(func=lambda c:c.data.startswith("convert_confirm:"))
+def convert_confirm_callback(call):
+    uid=str(call.from_user.id); nonce=call.data.split(":",1)[1]; p=users.get(uid,{}).get("pending_conversion") or {}
+    if p.get("nonce")!=nonce: bot.answer_callback_query(call.id,"Expired conversion",show_alert=True); return
+    with CRYPTO_TX_LOCK:
+        if not crypto_system_open():
+            users[uid].pop("pending_conversion",None); save_user(uid); bot.answer_callback_query(call.id,"Currency exchange is currently closed.",show_alert=True); return
+        old=p.get("from"); new=p.get("to"); kind=p.get("from_type"); amount=float(p.get("amount",0));
+        available=available_asset_amount(uid) if kind=="current" else max(0.0,float(get_portfolio(uid).get(old,0) or 0)-held_asset_amount(uid,old))
+        if not old or not new or amount<=0 or amount>available+1e-12:
+            users[uid].pop("pending_conversion",None); save_user(uid); bot.answer_callback_query(call.id,"Balance changed. Start again.",show_alert=True); return
+        refresh_market_rates(True); gross=asset_to_usd(old,amount); network_code=old if is_crypto(old) else new
+        fee,gas,total=crypto_fee_usd(gross,network_code); net=gross-total; new_amt=usd_to_asset(new,net)
+        minimum=float(get_setting("currency_change_min_usd",5.0) or 0)
+        if (minimum>0 and gross<minimum) or net<=0 or new_amt<=0:
+            bot.answer_callback_query(call.id,"Conversion is no longer valid at the current rate.",show_alert=True); return
+        # Debit the exact selected source amount.
+        if kind=="current":
+            users[uid]["balance"]=round(max(0.0,balance_amount(uid)-amount),12)
+        else:
+            pfolio=get_portfolio(uid); pfolio[old]=round(max(0.0,float(pfolio.get(old,0))-amount),12); users[uid]["portfolio"]=pfolio
+        # Credit the target without overwriting any other holding.
+        if new==cur_code(uid):
+            users[uid]["balance"]=round(balance_amount(uid)+new_amt,12)
+        else:
+            add_portfolio_asset(uid,new,new_amt)
+        save_user(uid)
+        now=datetime.now(timezone.utc)
+        balance_ledger_col.insert_one({"user_id":uid,"type":"conversion","from_asset":old,"from_amount":amount,"to_asset":new,"to_amount":new_amt,"gross_usd":gross,"fee_usd":fee,"gas_fee_usd":gas,"net_usd":net,"source":"currency_conversion","time":now})
+        if fee>0 or gas>0: record_crypto_fee(uid,old,new,gross,fee,gas,amount,net)
+        hold_txt=""
+        if crypto_hold_open() and (is_crypto(old) or is_crypto(new)):
+            exp=now+timedelta(hours=1)
+            conversion_holds_col.insert_one({"user_id":uid,"status":"hold","usd_amount":net,"from_asset":old,"from_amount":amount,"to_asset":new,"to_amount":new_amt,"created_at":now,"expires_at":exp,"source":"crypto_conversion"})
+            hold_txt=f"\n🔒 <b>Amount on Hold:</b> ${net:,.2f} USD for 1 hour"
+        users[uid].pop("pending_conversion",None); save_user(uid)
+    try: bot.delete_message(call.message.chat.id,call.message.message_id)
+    except: pass
+    bot.answer_callback_query(call.id,"✅ Conversion completed")
+    bot.send_message(call.message.chat.id,f"✅ <b>CONVERSION COMPLETE</b>\n\n📤 Used: <b>{format_asset(old,amount)}</b>\n📥 Received: <b>{format_asset(new,new_amt)}</b>\n💸 Fee: <b>${fee:,.2f}</b>\n⛽ Gas fee: <b>${gas:,.2f}</b>\n💵 Net value: <b>${net:,.2f} USD</b>{hold_txt}\n\nOnly the amount you selected was converted. All other holdings remain untouched.",reply_markup=localized_user_menu(uid))
+
+
+@bot.message_handler(func=lambda m: m.text in ["📜 HISTORY"] + [v.get("history","") for v in MAIN_LABELS.values()])
+def history_button(m):
+    uid=str(m.from_user.id); rows=list(activity_col.find({"user_id":uid}).sort("time",-1).limit(20)); lines=["📜 <b>YOUR HISTORY</b>",""]
+    for r in rows:
+        t=r.get("time"); ts=t.strftime("%Y-%m-%d %H:%M") if hasattr(t,"strftime") else str(t); lines.append(f"• {str(r.get('action','event')).replace('_',' ').title()} — {ts}")
+    if not rows: lines.append("No history yet.")
+    bot.send_message(m.chat.id,"\n".join(lines))
+
+@bot.message_handler(func=lambda m: m.text in [v.get("lang","") for v in MAIN_LABELS.values()])
+def language_button(m):
+    bot.send_message(m.chat.id,"🌍 <b>Select your language</b>",reply_markup=language_kb("change_lang"))
+
+@bot.message_handler(func=lambda m: m.text in [v.get("topup","") for v in MAIN_LABELS.values()])
+def localized_topup_button(m):
+    # Reuse the callback UI directly for localized users.
+    rate=int(get_setting("stars_per_usd",100)); kb=InlineKeyboardMarkup(row_width=2)
+    for stars in (100,500,1000,5000): kb.add(InlineKeyboardButton(f"⭐ {stars} Stars = ${stars/rate:.2f}",callback_data=f"topup:{stars}"))
+    kb.add(InlineKeyboardButton("✏️ Custom Stars",callback_data="topup_custom")); bot.send_message(m.chat.id,f"💳 <b>ADD BALANCE</b>\n\n{rate} Stars = $1",reply_markup=kb)
+
+# Localized main actions.
+_ACTIONS={}
+for _lang,_d in MAIN_LABELS.items():
+    for _key,_label in _d.items(): _ACTIONS[_label]=_key
+
+@bot.message_handler(func=lambda m: bool(m.text and m.text in _ACTIONS))
+def localized_action_dispatch(m):
+    touch_user(m.from_user.id)
+    action=_ACTIONS[m.text]; uid=str(m.from_user.id)
+    if action in ("history","lang","topup"): return
+    if action=="balance": return balance_handler(m)
+    if action=="withdraw": return withdraw_menu(m)
+    if action=="ref": return refer_cmd(m)
+    if action=="id": return get_id_handler(m)
+    if action=="premium": return premium_button(m)
+    if action=="music": return music_menu_button(m)
+    if action=="profile": return profile_handler(m)
+    if action=="customer": return customer_handler(m)
+    if action=="ai": return customer_ai_handler(m)
+    if action=="promo": return promo_user_menu(m)
+    if action=="trial":
+        if not trial_available(uid):
+            bot.send_message(m.chat.id,"❌ Trial is not available right now."); return
+        days=trial_days()
+        if premium_verification_required() and not user_is_verified(uid):
+            users[uid]["trial_pending"]=True; users[uid]["trial_pending_version"]=current_trial_version(); save_user(uid)
+            kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🔐 VERIFY ACCOUNT",callback_data="start_verify_flow"))
+            bot.send_message(m.chat.id,f"🔐 <b>Verification required</b>\n\nVerify once and your {days}-Day Premium Trial will activate automatically. You will NOT need to press the trial button again.",reply_markup=kb); return
+        users[uid]["trial_pending"]=True; users[uid]["trial_pending_version"]=current_trial_version(); save_user(uid); activate_pending_trial(uid,m.chat.id)
+
+# ================= ADMIN TEXT / TELEGRAM CUSTOM EMOJI =================
+def _message_entities_to_html(message):
+    """Convert Telegram text entities to safe HTML while preserving custom emoji.
+
+    This accepts both pyTelegramBotAPI Message objects and raw Telegram API
+    dictionaries (used by the Creator Bot polling loop).
+    """
+    if isinstance(message,dict):
+        text=str(message.get("text") or message.get("caption") or "")
+        entities=message.get("entities") or message.get("caption_entities") or []
+        def val(obj,key,default=None):
+            if isinstance(obj,dict): return obj.get(key,default)
+            return getattr(obj,key,default)
+    else:
+        text=str(getattr(message,"text",None) or getattr(message,"caption",None) or "")
+        entities=getattr(message,"entities",None) or getattr(message,"caption_entities",None) or []
+        def val(obj,key,default=None): return getattr(obj,key,default)
+    if not text: return ""
+    raw=text.encode("utf-16-le")
+    def s16(a,b): return raw[a*2:b*2].decode("utf-16-le",errors="ignore")
+    spans=[]
+    for e in entities:
+        if str(val(e,"type","") or "")!="custom_emoji": continue
+        off=int(val(e,"offset",0) or 0); ln=int(val(e,"length",0) or 0); cid=str(val(e,"custom_emoji_id","") or "")
+        if cid and ln>0: spans.append((off,off+ln,cid,s16(off,off+ln)))
+    if not spans: return html.escape(text)
+    spans.sort(); out=[]; pos=0; total=len(raw)//2
+    for a,z,cid,alt in spans:
+        if a<pos: continue
+        out.append(html.escape(s16(pos,a)))
+        out.append(f'<tg-emoji emoji-id="{html.escape(cid,quote=True)}">{html.escape(alt or "💠")}</tg-emoji>')
+        pos=z
+    out.append(html.escape(s16(pos,total)))
+    return "".join(out)
+
+def _admin_text_html(message): return _message_entities_to_html(message).strip()
+
+# ================= MANAGED BOT CREATOR / MANAGEMENT =================
+
+# Telegram Bot API 9.6+ supports managed bots. The Creator bot must have
+# "Bot Management Mode" enabled in the @BotFather Mini App. The user presses a
+# native request_managed_bot button; Telegram creates the bot and sends the
+# manager a managed_bot update. We then fetch the token with getManagedBotToken.
+
+CREATOR_API_BASE = f"https://api.telegram.org/bot{CREATOR_BOT_TOKEN}" if CREATOR_BOT_TOKEN else ""
+
+
+def _creator_set_commands():
+    if not CREATOR_BOT_TOKEN: return
+    cmds=[{"command":"start","description":"Open Creator Bot"},{"command":"help","description":"Creator help"},{"command":"mybots","description":"My created bots"},{"command":"premium","description":"Downloader Premium"},{"command":"wallet","description":"Shared wallet card"}]
+    if _creation_open(): cmds.insert(2,{"command":"create","description":"Create a new downloader bot"})
+    _creator_api("setMyCommands",{"commands":cmds})
+
+def _creator_api(method, payload=None, timeout=30):
+    if not CREATOR_BOT_TOKEN:
+        return None, "CREATOR_BOT_TOKEN is not configured"
+    try:
+        r=requests.post(f"{CREATOR_API_BASE}/{method}", json=payload or {}, timeout=timeout)
+        data=r.json()
+        if data.get("ok"):
+            return data.get("result"), None
+        return None, str(data.get("description") or f"{method} failed")
+    except Exception as e:
+        return None, str(e)
+
+
+def _creator_send(chat_id, text, reply_markup=None, parse_mode="HTML", **extra):
+    payload={"chat_id":chat_id,"text":str(text),"parse_mode":parse_mode}
+    if reply_markup is not None: payload["reply_markup"]=reply_markup
+    payload.update(extra)
+    return _creator_api("sendMessage",payload)
+
+
+def _creator_answer(call_id, text="", alert=False):
+    return _creator_api("answerCallbackQuery",{"callback_query_id":call_id,"text":text[:200],"show_alert":bool(alert)})
+
+
+def _creator_edit(chat_id, message_id, text, reply_markup=None):
+    payload={"chat_id":chat_id,"message_id":message_id,"text":text,"parse_mode":"HTML"}
+    if reply_markup is not None: payload["reply_markup"]=reply_markup
+    return _creator_api("editMessageText",payload)
+
+
+def _creator_admin(uid):
+    return is_admin(uid)
+
+
+def _creator_keyboard(uid):
+    rows=[]
+    if _creation_open(): rows.append([{"text":"🤖 Create My Bot"}])
+    rows += [
+        [{"text":"🤖 My Bots"},{"text":"🗑 Delete Bot"}],
+        [{"text":"💎 Premium"},{"text":"💰 Balance"}],
+        [{"text":"💳 Wallet"}],
+        [{"text":"🆘 Help"}],
+    ]
+    if _creator_admin(uid):
+        rows += [
+            [{"text":"👑 ADMIN PANEL"}],
+        ]
+    return {"keyboard":rows,"resize_keyboard":True,"is_persistent":True}
+
+
+def _creator_admin_keyboard():
+    return {"keyboard":[
+        [{"text":"🟢 Open Creation"},{"text":"🔴 Close Creation"}],
+        [{"text":"🟢 Open Verify Create Bot"},{"text":"🔴 Close Verify Create Bot"}],
+        [{"text":"🟢 Open Create Caption"},{"text":"🔴 Close Create Caption"}],
+        [{"text":"✏️ Set Create Caption"}],
+        [{"text":"📤 Send To Create Bot"}],
+        [{"text":"🤖 See All Bots"},{"text":"📊 Bot Stats"}],
+        [{"text":"📢 Broadcast All Bot Users"}],
+        [{"text":"👑 Broadcast Bot Admins"}],
+        [{"text":"👤 Broadcast Bot Non-Admins"}],
+        [{"text":"🏆 Top Songs"},{"text":"🏆 Top Song Searchers"}],
+        [{"text":"🟢 OPEN MANAGED ADS"},{"text":"🔴 CLOSE MANAGED ADS"}],
+        [{"text":"📺 SET MONETAG ZONE"},{"text":"🔗 SET MONETAG DIRECT LINK"}],
+        [{"text":"🌐 SET AD GATE URL"}],
+        [{"text":"⏱️ AD FREQUENCY"},{"text":"⏱️ AD WATCH TIME"}],
+        [{"text":"🔢 ADS PER GATE"},{"text":"♻️ RESET ADS"}],
+        [{"text":"⭐ REMOVE ADS PLANS"}],
+        [{"text":"⭐ REMOVE ADS PRICE"}],
+        [{"text":"📊 AD STATS"}],
+        [{"text":"📢 Broadcast Creator Users"}],
+        [{"text":"💎 Premium Prices"}],
+        [{"text":"🔙 USER MENU"}],
+    ],"resize_keyboard":True,"is_persistent":True}
+
+
+def _creator_request_keyboard(request_id, name, username):
+    # This is intentionally raw JSON because older pyTelegramBotAPI releases do
+    # not know KeyboardButtonRequestManagedBot. Telegram clients render it natively.
+    return {"keyboard":[[
+        {"text":"✅ Create @"+username,"request_managed_bot":{
+            "request_id":int(request_id),
+            "suggested_name":name[:64],
+            "suggested_username":username[:32],
+        }}
+    ]],"resize_keyboard":True,"one_time_keyboard":True}
+
+
+def _creator_ensure_user(uid):
+    uid=str(uid)
+    if uid not in users:
+        users[uid]={
+            "username":"","first_name":"there","balance":0.0,"blocked":0.0,
+            "ref":random_ref(),"bot_id":random_botid(),"invited":0,"banned":False,
+            "verified":False,"email_verified":False,"phone_verified":False,"whatsapp_verified":False,
+            "verification_method":None,"balance_locked":False,"balance_activation_code":None,
+            "balance_lock_until":None,"quick_access":False,"youtube_30m":False,"premium_until":None,
+            "premium_warning_sent":False,"trial_used":False,"trial_pending":False,
+            "trial_version_used":None,"trial_pending_version":None,"referral_50_rewarded":False,
+            "referred_by":None,"joined_date":datetime.now().strftime("%Y-%m-%d"),
+            "last_seen_at":datetime.now(timezone.utc).isoformat(),"month":now_month(),
+            "language":None,"customer_ai_language":None,"currency":"USD","balance_asset":"USD",
+            "gender":None,"city":None,
+        }
+        save_user(uid)
+    users[uid]["last_seen_at"]=datetime.now(timezone.utc).isoformat()
+    try: save_user(uid)
+    except Exception: pass
+    return users[uid]
+
+def _creator_session(uid):
+    uid=str(uid)
+    d=creator_sessions_col.find_one({"_id":uid}) or {}
+    d.pop("_id",None)
+    return d
+
+
+def _creator_set_session(uid, data):
+    uid=str(uid); creator_sessions_col.update_one({"_id":uid},{"$set":data},upsert=True)
+
+
+def _creator_clear_session(uid):
+    creator_sessions_col.delete_one({"_id":str(uid)})
+
+
+def _creator_verify_gate(uid, chat_id):
+    if not _creation_verify_required() or user_is_verified(str(uid)):
+        return True
+    main_user=""
+    try: main_user=str(bot.get_me().username or "").lstrip("@")
+    except Exception: pass
+    url=f"https://t.me/{main_user}?start=verifycreate" if main_user else ""
+    kb={"inline_keyboard":[
+        ([{"text":"🔐 Verify Account","url":url}] if url else []),
+    ]}
+    if not kb["inline_keyboard"][0]: kb["inline_keyboard"]=[]
+    _creator_send(chat_id,
+        "🔐 <b>Verification Required</b>\n\n"
+        "Admin has enabled verification before creating a bot.\n"
+        "Verify your account, then return here and press <b>Create My Bot</b> again.",
+        reply_markup=kb)
+    return False
+
+
+def _creator_start_create(uid, chat_id):
+    if not _creation_open():
+        _creator_send(chat_id,"🔒 <b>Bot Creation is Closed</b>\n\nExisting bots continue working normally.",reply_markup=_creator_keyboard(uid)); return
+    if not _creator_verify_gate(uid,chat_id): return
+    _creator_set_session(uid,{"state":"type","updated_at":datetime.now(timezone.utc)})
+    _creator_send(chat_id,"🤖 <b>CREATE YOUR OWN BOT</b>\n\nChoose the type of bot you want to create:",reply_markup={"inline_keyboard":[[{"text":"🎬 Video Downloader","callback_data":"ctype:video"}],[{"text":"🎵 Music Downloader","callback_data":"ctype:music"}]]})
+
+
+def _creator_finish_request(uid, chat_id):
+    d=_creator_session(uid); name=str(d.get("name") or "").strip(); username=str(d.get("username") or "").strip().lstrip("@")
+    if not name or not username:
+        _creator_start_create(uid,chat_id); return
+    request_id=random.randint(1,2_000_000_000)
+    _creator_set_session(uid,{**d,"state":"waiting_managed_bot","request_id":request_id,"updated_at":datetime.now(timezone.utc)})
+    _creator_send(chat_id,
+        f"<b>Step 3 of 3</b>\n\nName: <b>{html.escape(name)}</b>\nUsername: <b>@{html.escape(username)}</b>\n\n"
+        "Tap the button below. Telegram will open its official bot-creation screen.\n"
+        "You do <b>not</b> need to open @BotFather or paste a token.",
+        reply_markup=_creator_request_keyboard(request_id,name,username))
+
+
+def _creator_handle_text(uid, chat_id, text):
+    _creator_ensure_user(uid)
+    text=(text or "").strip(); low=text.lower()
+    if text in ("/start", "/start creator"):
+        _creator_send(chat_id,
+            "🚀 <b>WELCOME TO BOT CREATOR</b>\n\n"
+            "Build your own Downloader Bot directly through Telegram's official managed-bot system.\n\n"
+            "<b>HOW IT WORKS</b>\n"
+            "1️⃣ Tap <b>🤖 Create My Bot</b>.\n"
+            "2️⃣ Enter your bot name.\n"
+            "3️⃣ Enter your bot username ending in <code>bot</code>.\n"
+            "4️⃣ Tap Telegram's official <b>Create</b> button.\n"
+            "5️⃣ Telegram creates the bot and sends the Creator Bot the managed-bot event.\n"
+            "6️⃣ Your bot is automatically registered, secured and started on the server.\n\n"
+            "<b>YOUR BOT FEATURES</b>\n"
+            "🎬 Video & Shorts downloads\n"
+            "🎵 Full MP3/Music downloads\n"
+            "💰 Shared balance with @Downloadvedioytibot\n"
+            "💎 Premium options\n"
+            "📊 Owner controls\n\n"
+            "Use <b>🤖 My Bots</b> to see your bots in one message, or <b>🗑 Delete Bot</b> to remove a bot from this system.",
+            reply_markup=_creator_keyboard(uid)); return
+    if low.startswith("/start "):
+        _creator_send(chat_id,"👋 Welcome to the Bot Creator.",reply_markup=_creator_keyboard(uid)); return
+    if text=="🤖 Create My Bot" or low in {"/create","/addbot","/add bot"}:
+        _creator_start_create(uid,chat_id); return
+    if text=="🤖 My Bots" or low=="/mybots":
+        _creator_my_bots(uid,chat_id); return
+    if text=="🗑 Delete Bot" or low=="/deletebot":
+        _creator_delete_menu(uid,chat_id); return
+    if text in ("💰 Balance","/balance"):
+        if uid in users:
+            _creator_send(chat_id,f"💰 <b>Shared Balance</b>\n\n{html.escape(money_text(uid,balance_usd_value(uid)))}\n\nThis is the same balance used by @Downloadvedioytibot.")
+        else: _creator_send(chat_id,"Please open @Downloadvedioytibot first so your account can be loaded.")
+        return
+    if text in ("💎 Premium","/premium"):
+        _creator_premium(uid,chat_id); return
+    if text in ("💳 Wallet","💳 Wallet Card","/wallet"):
+        rows=list(managed_bots_col.find({"owner_id":uid}).sort("created_at",-1))
+        if not rows:
+            _creator_send(chat_id,"🤖 <b>No bots yet.</b> Create a bot first.",reply_markup=_creator_keyboard(uid)); return
+        kb={"inline_keyboard":[[{"text":f"🔗 @{str(d.get('username') or 'unknown')[:30]}","callback_data":f"cwallet:{d.get('bot_id')}"}] for d in rows[:50]]}
+        _creator_send(chat_id,"💳 <b>WALLET CONNECTION</b>\n\nChoose the bot you want to connect to your main @Downloadvedioytibot balance.\n\nThe main bot will send a Confirm/Reject request. No 16-digit code is required.",reply_markup=kb); return
+    if text in ("🆘 Help","/help"):
+        _creator_send(chat_id,"🆘 <b>Creator Help</b>\n\n• Create My Bot\n• My Bots\n• Delete Bot\n• Premium\n• Balance\n\nYour created downloader bot can download videos and MP3s. Premium removes system promotional messages for the bot while active.",reply_markup=_creator_keyboard(uid)); return
+    if text=="👑 ADMIN PANEL" and _creator_admin(uid):
+        _creator_send(chat_id,"👑 <b>CREATOR ADMIN PANEL</b>\n\nChoose a control:",reply_markup=_creator_admin_keyboard()); return
+
+    sess=_creator_session(uid); state=sess.get("state")
+    if state=="type":
+        _creator_send(chat_id,"Choose <b>🎬 Video Downloader</b> or <b>🎵 Music Downloader</b> using the buttons above."); return
+    if state=="name":
+        if not 1<=len(text)<=64:
+            _creator_send(chat_id,"❌ Name must be 1–64 characters. Send it again."); return
+        _creator_set_session(uid,{"state":"username","name":text,"updated_at":datetime.now(timezone.utc)})
+        _creator_send(chat_id,"<b>Step 2 of 3</b>\n\nSend your bot username. It must end with <code>bot</code>.\n\nExample: <code>my_downloader_bot</code>"); return
+    if state=="username":
+        username=text.lstrip("@").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}bot",username,re.I):
+            _creator_send(chat_id,"❌ Username must be 5–32 characters, use letters/numbers/underscore, and end with <code>bot</code>. Try again."); return
+        # Store the requested values. Telegram itself performs the final username check.
+        _creator_set_session(uid,{**sess,"state":"ready","username":username,"updated_at":datetime.now(timezone.utc)})
+        _creator_finish_request(uid,chat_id); return
+    if state=="ready":
+        _creator_finish_request(uid,chat_id); return
+    if state=="waiting_managed_bot":
+        _creator_send(chat_id,"⏳ Please tap the Telegram Create button above. If you cancelled it, press Create My Bot again."); return
+
+    if _creator_admin(uid):
+        _creator_admin_text(uid,chat_id,text)
+    else:
+        _creator_send(chat_id,"Use the buttons below.",reply_markup=_creator_keyboard(uid))
+
+
+def _creator_my_bots(uid, chat_id):
+    rows=list(managed_bots_col.find({"owner_id":str(uid)}).sort("created_at",-1))
+    if not rows:
+        _creator_send(chat_id,"🤖 <b>MY BOTS</b>\n\nYou have no bots yet.",reply_markup=_creator_keyboard(uid)); return
+    lines=["🤖 <b>MY BOTS</b>","",f"You have <b>{len(rows)}</b> managed bot(s).","" ]
+    buttons=[]
+    for i,d in enumerate(rows[:50],1):
+        status="🟢" if d.get("active",True) and not d.get("suspended") else "🔴"
+        lines.append(f"<b>{i}.</b> {status} <b>{html.escape(str(d.get('name') or 'Downloader Bot'))}</b> — @{html.escape(str(d.get('username') or 'unknown'))}")
+        lines.append(f"   🆔 <code>{html.escape(str(d.get('bot_id') or ''))}</code>")
+        buttons.append([{"text":f"📊 {i}. @{str(d.get('username') or 'unknown')[:24]}","callback_data":f"cbotinfo:{d.get('bot_id')}"},
+                        {"text":"🗑 Delete","callback_data":f"cbotdel:{d.get('bot_id')}"}])
+    _creator_send(chat_id,"\n".join(lines),reply_markup={"inline_keyboard":buttons})
+
+def _creator_delete_menu(uid, chat_id):
+    rows=list(managed_bots_col.find({"owner_id":str(uid)}).sort("created_at",-1))
+    if not rows:
+        _creator_send(chat_id,"🗑 <b>Delete Bot</b>\n\nNo created bots found."); return
+    kb={"inline_keyboard":[[{"text":f"🗑 @{str(d.get('username') or 'unknown')[:30]}","callback_data":f"cbotdel:{d.get('bot_id')}"}] for d in rows[:20]]}
+    _creator_send(chat_id,"🗑 <b>Remove a Bot</b>\n\nThis removes the downloader bot from this system and stops its worker. Telegram's bot account itself remains owned by you.",reply_markup=kb)
+
+
+def _managed_wallet_start(m, bid, user_id=None):
+    uid=str(user_id or m.from_user.id); d=_managed_bot_doc(bid)
+    if not d or str(d.get("owner_id"))!=uid:
+        bot.send_message(m.chat.id,"🔐 <b>Wallet linking is owner-only.</b>"); return
+    if d.get("wallet_linked"):
+        bot.send_message(m.chat.id,f"✅ <b>Wallet already linked.</b>\n\n💰 Shared balance: <b>{html.escape(money_text(uid,balance_usd_value(uid)))}</b>")
+        return
+    # The main downloader bot sends the consent request. No wallet/card number is
+    # copied by the user anymore.
+    kb=InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("✅ Confirm",callback_data=f"mwconfirm:{bid}"),InlineKeyboardButton("❌ Reject",callback_data=f"mwreject:{bid}"))
+    _main_bot.send_message(
+        int(uid),
+        "💳 <b>SHARED WALLET CONNECTION</b>\n\n"
+        f"You are connecting your Downloader Bot <b>@{html.escape(str(d.get('username') or 'unknown'))}</b> to your main <b>@Downloadvedioytibot</b> account.\n\n"
+        "After you confirm, both bots will use the <b>same balance</b>. No 16-digit code is required.\n\n"
+        "<b>Confirm</b> only if you own this Downloader Bot and want it to use your main balance.",
+        parse_mode="HTML",reply_markup=kb
+    )
+    try: bot.send_message(m.chat.id,"📨 <b>Confirmation sent to your main @Downloadvedioytibot account.</b>\n\nOpen the main bot and press <b>Confirm</b> to finish linking.",parse_mode="HTML")
+    except Exception: pass
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("mwconfirm:","mwreject:")))
+def managed_wallet_consent_callback(call):
+    uid=str(call.from_user.id); data=str(call.data or ""); action,bid=data.split(":",1)
+    d=_managed_bot_doc(bid)
+    if not d or str(d.get("owner_id"))!=uid:
+        bot.answer_callback_query(call.id,"❌ This wallet request is not yours.",show_alert=True); return
+    if action=="mwreject":
+        bot.answer_callback_query(call.id,"Wallet connection rejected.")
+        try: bot.edit_message_text("❌ <b>Wallet connection rejected.</b>\n\nNo balance was shared.",call.message.chat.id,call.message.message_id,parse_mode="HTML")
+        except Exception: pass
+        return
+    managed_bots_col.update_one({"bot_id":str(bid)},{"$set":{"wallet_linked":True,"wallet_owner_id":uid,"wallet_linked_at":datetime.now(timezone.utc)}})
+    bot.answer_callback_query(call.id,"✅ Wallet linked!")
+    try: bot.edit_message_text("✅ <b>Wallet connection confirmed.</b>\n\nYour Downloader Bot and @Downloadvedioytibot now share the same balance.",call.message.chat.id,call.message.message_id,parse_mode="HTML")
+    except Exception: pass
+    mb=managed_bot_objects.get(str(bid)) or _managed_bot_start_instance(d)
+    if mb:
+        try: mb.send_message(int(uid),f"✅ <b>Wallet linked successfully.</b>\n\n💰 Shared balance: <b>{html.escape(money_text(uid,balance_usd_value(uid)))}</b>\n\nYour Downloader Bot now uses the same balance as @Downloadvedioytibot.",parse_mode="HTML")
+        except Exception: pass
+
+
+def _premium_balance_help(uid):
+    uid=str(uid); reward=referral_reward_amount(); ref=str(users.get(uid,{}).get("ref") or "").strip()
+    try: uname=str(_main_bot_username() or "Downloadvedioytibot")
+    except Exception: uname="Downloadvedioytibot"
+    link=f"https://t.me/{uname}?start={urllib.parse.quote(ref)}" if ref else f"https://t.me/{uname}"
+    return ("💡 <b>Need more balance?</b>\n\n"
+            f"👥 Share your referral link with friends:\n<code>{html.escape(link)}</code>\n\n"
+            f"🎁 Current referral reward: <b>${reward:.2f}</b> per qualifying referral.\n"
+            "💳 You can also add balance directly in @Downloadvedioytibot.\n\n"
+            "When your shared balance is insufficient, use your referral link to earn according to the current referral rules.")
+
+def _managed_premium_menu(uid, chat_id):
+    uid=str(uid)
+    if premium_verification_required() and not user_is_verified(uid):
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🔐 Verify Account",url=(f"https://t.me/{str(bot.get_me().username or '').lstrip('@')}?start=verifycreate" if getattr(bot.get_me(),'username',None) else "https://t.me/Downloadvedioytibot?start=verifycreate")))
+        bot.send_message(chat_id,"🔐 <b>Verification Required</b>\n\nVerify your account before buying Premium.",reply_markup=kb); return
+    kb=InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("💰 Wallet",callback_data="mpaymethod:wallet"),InlineKeyboardButton("⭐ Telegram Stars",callback_data="mpaymethod:stars"))
+    bot.send_message(chat_id,"💎 <b>Premium Payment</b>\n\nChoose your payment method first.\n\n💰 <b>Wallet</b> — uses the shared @Downloadvedioytibot balance.\n⭐ <b>Telegram Stars</b> — payment is sent through @Downloadvedioytibot.",reply_markup=kb,parse_mode="HTML")
+
+def _managed_premium_callback(call):
+    uid=str(call.from_user.id); data=str(call.data or '')
+    if data.startswith('mpaymethod:'):
+        method=data.split(':',1)[1].lower()
+        if method not in {'wallet','stars'}:
+            bot.answer_callback_query(call.id,'Invalid payment method.',show_alert=True); return
+        meta=_ACTIVE_MANAGED_META.get() or {}; bid=str(meta.get('bot_id') or '')
+        if not bid:
+            bot.answer_callback_query(call.id,'Managed bot context missing.',show_alert=True); return
+        d=_managed_bot_doc(bid)
+        if not d or str(d.get('owner_id'))!=uid:
+            bot.answer_callback_query(call.id,'Owner only.',show_alert=True); return
+        bot.answer_callback_query(call.id)
+        if method=='wallet':
+            prices=get_premium_prices(); rate=max(1,int(get_setting('stars_per_usd',100) or 100))
+            kb=InlineKeyboardMarkup(row_width=2)
+            for months in ('1','3','9','12'):
+                price=float(prices[months]); kb.add(InlineKeyboardButton(f'💰 {months} Month — ${price:.2f}',callback_data=f'mprem:{months}'))
+            bot.send_message(call.message.chat.id,'💰 <b>Wallet Premium</b>\n\nChoose your Premium period. Payment will use the shared @Downloadvedioytibot balance.',reply_markup=kb,parse_mode='HTML')
+            return
+        prices=get_premium_prices(); rate=max(1,int(get_setting('stars_per_usd',100) or 100)); kb=InlineKeyboardMarkup(row_width=2)
+        for months in ('1','3','9','12'):
+            stars=max(1,int(round(float(prices[months])*rate)))
+            kb.add(InlineKeyboardButton(f'⭐ {months} Month — {stars} Stars',callback_data=f'mpremstars:{months}'))
+        bot.send_message(call.message.chat.id,'⭐ <b>Telegram Stars</b>\n\nChoose your Premium period. The Stars invoice will be sent by <b>@Downloadvedioytibot</b>.',reply_markup=kb,parse_mode='HTML')
+        return
+    if data.startswith('mpremstars:'):
+        months=data.split(':',1)[1]; price=get_premium_prices().get(months)
+        if price is None:
+            bot.answer_callback_query(call.id,'Invalid plan.',show_alert=True); return
+        if premium_verification_required() and not user_is_verified(uid):
+            bot.answer_callback_query(call.id,'Verify your account first.',show_alert=True); return
+        # Resolve the managed bot from the callback message's active context.
+        meta=_ACTIVE_MANAGED_META.get() or {}
+        bid=str(meta.get("bot_id") or "")
+        if not bid:
+            bot.answer_callback_query(call.id,'Managed bot context missing.',show_alert=True); return
+        rate=max(1,int(get_setting("stars_per_usd",100) or 100)); stars=max(1,int(round(float(price)*rate)))
+        payload=f"managed_premium_stars:{bid}:{months}:{stars}"
+        try:
+            _main_bot.send_invoice(int(uid),f"Downloader Bot Premium — {months} month(s)","Premium for your managed Downloader Bot. Pay securely with Telegram Stars through @Downloadvedioytibot.",payload,"","XTR",[LabeledPrice(label=f"Premium {months} month(s)",amount=stars)])
+            bot.answer_callback_query(call.id,'⭐ Payment invoice sent by @Downloadvedioytibot')
+        except Exception as e:
+            bot.answer_callback_query(call.id,'Could not create Stars invoice.',show_alert=True); print('Managed Stars invoice error:',repr(e))
+        return
+    if data.startswith('mprem:'):
+        months=data.split(':',1)[1]; price=get_premium_prices().get(months)
+        if price is None: bot.answer_callback_query(call.id,'Invalid plan.',show_alert=True); return
+        if premium_verification_required() and not user_is_verified(uid): bot.answer_callback_query(call.id,'Verify your account first.',show_alert=True); return
+        price_asset=usd_to_asset(cur_code(uid),price); available=available_asset_amount(uid)
+        if available<price_asset:
+            bot.answer_callback_query(call.id,'Insufficient shared balance.',show_alert=True)
+            bot.send_message(call.message.chat.id,f"❌ <b>Insufficient balance</b>\n\nNeed: {html.escape(format_asset(cur_code(uid),price_asset))}\nAvailable: {html.escape(format_asset(cur_code(uid),available))}\n\n"+_premium_balance_help(uid),parse_mode="HTML")
+            return
+        kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton(f"✅ Pay ${price:.2f}",callback_data=f"mprempay:{months}"),InlineKeyboardButton("❌ Cancel",callback_data="mpremcancel"))
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id,f"💎 <b>{months} Month Premium</b>\n\nPrice: {html.escape(money_text(uid,price))}\nShared balance: {html.escape(money_text(uid,balance_usd_value(uid)))}\n\nConfirm purchase?",reply_markup=kb); return
+    if data.startswith('mprempay:'):
+        months=data.split(':',1)[1]; price=get_premium_prices().get(months)
+        if price is None: bot.answer_callback_query(call.id,'Invalid plan.',show_alert=True); return
+        if premium_verification_required() and not user_is_verified(uid): bot.answer_callback_query(call.id,'Verify your account first.',show_alert=True); return
+        price_asset=usd_to_asset(cur_code(uid),price)
+        if available_asset_amount(uid)<price_asset: bot.answer_callback_query(call.id,'Insufficient balance.',show_alert=True); return
+        now=datetime.now(timezone.utc); old=users.get(uid,{}).get('premium_until')
+        try: old_dt=datetime.fromisoformat(str(old).replace('Z','+00:00')) if old else now; old_dt=old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+        except Exception: old_dt=now
+        until=max(now,old_dt)+timedelta(days=30*int(months)); ledger_debit(uid,price_asset,'managed_bot_premium_purchase',{'price_usd':price,'months':months}); users[uid]['premium_until']=until.isoformat(); users[uid]['premium_warning_sent']=False; users[uid]['premium_source']='paid'; save_user(uid)
+        premium_logs_col.insert_one({'user_id':uid,'months':int(months),'price':price,'until':until.isoformat(),'time':now.isoformat(),'type':'managed_bot_purchase'})
+        bot.answer_callback_query(call.id,'✅ Premium activated!')
+        bot.send_message(call.message.chat.id,f"🎉 <b>Premium Activated</b>\n\n⏱️ {months} month(s)\n💵 Paid: ${price:.2f}\n⏰ Expires: <b>{html.escape(local_datetime_text(uid,until))}</b>\n\nYour managed bot will now hide Powered-by/create promotional messages while Premium is active.")
+        return
+    if data=='mpremcancel':
+        bot.answer_callback_query(call.id,'Cancelled');
+        try: bot.edit_message_text('❌ Premium purchase cancelled.',call.message.chat.id,call.message.message_id)
+        except Exception: pass
+
+def _creator_wallet_card(uid, chat_id, regenerate=False):
+    uid=str(uid)
+    if uid not in users:
+        _creator_send(chat_id,"Please open @Downloadvedioytibot first so your shared wallet can be loaded."); return
+    existing=str(users[uid].get("creator_wallet_card") or "").strip()
+    if regenerate or not re.fullmatch(r"\d{16}",existing):
+        existing="".join(str(random.randint(0,9)) for _ in range(16))
+        users[uid]["creator_wallet_card"]=existing; users[uid]["creator_wallet_created_at"]=datetime.now(timezone.utc).isoformat(); save_user(uid)
+    masked=f"{existing[:4]} {existing[4:8]} {existing[8:12]} {existing[12:]}"
+    _creator_send(chat_id,
+        "💳 <b>Creator Wallet Card</b>\n\n"
+        f"Card: <code>{masked}</code>\n"
+        f"Balance: <b>{html.escape(money_text(uid,balance_usd_value(uid)))}</b>\n\n"
+        "This is an internal virtual wallet card for linking your managed Downloader Bot. "
+        "It is <b>not a bank card</b> and has no banking/withdrawal function. The balance always stays synced with @Downloadvedioytibot.")
+
+def _creator_premium(uid, chat_id):
+    uid=str(uid); rows=list(managed_bots_col.find({"owner_id":uid}).sort("created_at",-1))
+    if not rows: _creator_send(chat_id,"🤖 <b>No bots yet</b>\n\nCreate a Video Downloader or Music Downloader first.",reply_markup=_creator_keyboard(uid)); return
+    if premium_verification_required() and not user_is_verified(uid): _creator_send(chat_id,"🔐 <b>Verification Required</b>\n\nVerify your account before purchasing Premium."); return
+    buttons=[]
+    for d in rows[:50]:
+        typ="🎵" if str(d.get("bot_type"))=="music" else "🎬"; status="💎" if _managed_premium_active_doc(d) else "🆓"
+        buttons.append([{"text":f"{typ} {status} @{str(d.get('username') or 'unknown')[:30]}","callback_data":f"cpickbot:{d.get('bot_id')}"}])
+    _creator_send(chat_id,"💎 <b>PREMIUM</b>\n\nFirst choose the bot you want to upgrade.\nThen choose <b>Wallet</b> or <b>Telegram Stars</b>.",reply_markup={"inline_keyboard":buttons})
+
+
+def _creator_admin_text(uid, chat_id, text):
+    if text=="🟢 Open Creation":
+        set_setting("bot_creation_enabled",True); _creation_commands_refresh(); _creator_set_commands(); _refresh_all_user_menus("🤖 Bot creation is now OPEN."); _creator_send(chat_id,"🟢 <b>Creation OPEN</b>",reply_markup=_creator_admin_keyboard()); return
+    if text=="🔴 Close Creation":
+        set_setting("bot_creation_enabled",False); _creation_commands_refresh(); _creator_set_commands(); _refresh_all_user_menus("🔒 Bot creation is now CLOSED."); _creator_send(chat_id,"🔴 <b>Creation CLOSED</b>\nExisting bots continue running.",reply_markup=_creator_admin_keyboard()); return
+    if text=="🟢 Open Verify Create Bot":
+        set_setting("create_bot_verify_required",True); _creator_send(chat_id,"🟢 <b>Verify-before-create OPEN</b>"); return
+    if text=="🔴 Close Verify Create Bot":
+        set_setting("create_bot_verify_required",False); _creator_send(chat_id,"🔴 <b>Verify-before-create CLOSED</b>\nUsers can create without verification."); return
+    if text=="🟢 Open Create Caption":
+        set_setting("create_bot_caption_enabled",True); _creator_send(chat_id,"🟢 <b>Create Caption OPEN</b>"); return
+    if text=="🔴 Close Create Caption":
+        set_setting("create_bot_caption_enabled",False); _creator_send(chat_id,"🔴 <b>Create Caption CLOSED</b>"); return
+    if text=="✏️ Set Create Caption":
+        _creator_set_session(uid,{"state":"admin_caption"}); _creator_send(chat_id,"✏️ Send the exact second message that should appear after a managed-bot download. HTML is allowed."); return
+    if text=="📤 Send To Create Bot":
+        _creator_set_session(uid,{"state":"admin_send_create"}); _creator_send(chat_id,"📤 Send the announcement text. It will be sent to all known users with a <b>Create Now</b> button."); return
+    if text=="🤖 See All Bots":
+        _creator_admin_bots(chat_id); return
+    if text=="📊 Bot Stats":
+        total=managed_bots_col.count_documents({}); active=managed_bots_col.count_documents({"active":True,"suspended":{"$ne":True}}); owners=len(managed_bots_col.distinct("owner_id")); users_count=sum(len(d.get("users") or []) for d in managed_bots_col.find({}, {"users":1}))
+        _creator_send(chat_id,f"📊 <b>CREATOR BOT STATS</b>\n\n🤖 Bots: <b>{total}</b>\n🟢 Active: <b>{active}</b>\n👤 Owners: <b>{owners}</b>\n👥 Bot users recorded: <b>{users_count}</b>\n\nCreation: {'OPEN' if _creation_open() else 'CLOSED'}\nVerify: {'ON' if _creation_verify_required() else 'OFF'}\nCaption: {'ON' if _create_caption_open() else 'OFF'}",reply_markup=_creator_admin_keyboard()); return
+    if text in {"📢 Broadcast All Bot Users","📢 Broadcast All Bots"}:
+        _creator_set_session(uid,{"state":"admin_broadcast_all"}); _creator_send(chat_id,"📢 Send the message to all users of active non-Premium managed bots."); return
+    if text=="👑 Broadcast Bot Admins":
+        _creator_set_session(uid,{"state":"admin_broadcast_admins"}); _creator_send(chat_id,"👑 Send the message to the owner/admin of every active non-Premium managed bot."); return
+    if text=="👤 Broadcast Bot Non-Admins":
+        _creator_set_session(uid,{"state":"admin_broadcast_nonadmins"}); _creator_send(chat_id,"👤 Send the message to users of every active non-Premium managed bot except its owner."); return
+    if text=="🏆 Top Songs":
+        _creator_send(chat_id,_song_stats_text(),reply_markup=_creator_admin_keyboard()); return
+    if text=="🏆 Top Song Searchers":
+        _creator_send(chat_id,_top_song_searchers_text(100),reply_markup=_creator_admin_keyboard()); return
+    if text=="🟢 OPEN MANAGED ADS":
+        if not _monetag_zone_id():
+            _creator_send(chat_id,"❌ <b>Monetag zone is not configured.</b>\n\nSet the Monetag main SDK zone first.",reply_markup=_creator_admin_keyboard()); return
+        set_setting("managed_ads_enabled",True); _start_managed_ad_http_server(); _creator_send(chat_id,f"🟢 <b>MANAGED ADS OPEN</b>\n\nMonetag Rewarded Interstitial is active. Gate: <b>{_managed_ads_interval()//60} min</b> • Ads/gate: <b>{_monetag_ads_per_gate()}</b> • Watch timer: <b>{_monetag_watch_seconds()}s</b>.",reply_markup=_creator_admin_keyboard()); return
+    if text=="🔴 CLOSE MANAGED ADS":
+        set_setting("managed_ads_enabled",False); _creator_send(chat_id,"🔴 <b>MANAGED ADS CLOSED</b>\n\nManaged bots will no longer require the Monetag ad gate. Existing Remove Ads purchases remain saved.",reply_markup=_creator_admin_keyboard()); return
+    if text=="📺 SET MONETAG ZONE":
+        _creator_set_session(uid,{"state":"admin_monetag_zone"}); _creator_send(chat_id,"📺 <b>SET MONETAG ZONE</b>\n\nSend the Monetag <b>main SDK zone ID</b>. Current: <code>{}</code>".format(html.escape(_monetag_zone_id()))); return
+    if text=="🔗 SET MONETAG DIRECT LINK":
+        _creator_set_session(uid,{"state":"admin_monetag_direct"}); _creator_send(chat_id,"🔗 <b>SET MONETAG DIRECT LINK</b>\n\nSend the Direct Link. This is used only by the Skip button. Current: <code>{}</code>".format(html.escape(_managed_ads_smartlink()))); return
+    if text=="🌐 SET AD GATE URL":
+        _creator_set_session(uid,{"state":"admin_ad_gate_url"}); _creator_send(chat_id,"🌐 <b>SET AD GATE URL</b>\n\nSend the public HTTPS URL of this Railway service, for example <code>https://your-app.up.railway.app</code>.\n\nThis is used so the bot can detect when the user opens the SmartLink and immediately release the pending download/search."); return
+    if text=="⏱️ AD FREQUENCY":
+        _creator_set_session(uid,{"state":"admin_ad_frequency"}); _creator_send(chat_id,f"⏱️ <b>AD FREQUENCY</b>\n\nCurrent: <b>{_managed_ads_interval()//60} minutes</b>\n\nSend minutes, for example <code>90</code>."); return
+    if text=="⏱️ AD WATCH TIME":
+        _creator_set_session(uid,{"state":"admin_monetag_watch"}); _creator_send(chat_id,f"⏱️ <b>AD WATCH TIME</b>\n\nCurrent: <b>{_monetag_watch_seconds()} seconds</b>\n\nSend <code>10</code>, <code>15</code>, or another value from 1–120. This is the local reward-gate timer; Monetag's own rewarded ad lifecycle remains controlled by Monetag."); return
+    if text=="🔢 ADS PER GATE":
+        _creator_set_session(uid,{"state":"admin_monetag_count"}); _creator_send(chat_id,f"🔢 <b>ADS PER GATE</b>\n\nCurrent: <b>{_monetag_ads_per_gate()}</b>\n\nSend 1, 2, or 3."); return
+    if text=="♻️ RESET ADS":
+        result=managed_ad_users_col.update_many({}, {"$unset":{"ad_unlocked_until":"","last_ad_opened_at":"","last_ad_token":""}})
+        with managed_ad_pending_lock:
+            managed_ad_pending.clear()
+        _creator_send(chat_id,f"♻️ <b>ADS RESET</b>\n\nCleared unpaid ad timers/sessions: <b>{getattr(result,'modified_count',0)}</b>. Paid Remove Ads records were kept.",reply_markup=_creator_admin_keyboard()); return
+    if text=="⭐ REMOVE ADS PLANS":
+        p=_managed_remove_ads_plans()
+        _creator_set_session(uid,{"state":"admin_remove_ads_plans"})
+        _creator_send(chat_id, f"⭐ <b>REMOVE ADS PLANS</b>\n\n3 months: <b>{p['3']} Stars</b>\n6 months: <b>{p['6']} Stars</b>\n12 months: <b>{p['12']} Stars</b>\n\nSend three prices separated by spaces, for example: <code>50 90 150</code>", reply_markup=_creator_admin_keyboard()); return
+    if text=="⭐ REMOVE ADS PRICE":
+        _creator_set_session(uid,{"state":"admin_remove_ads_price"}); _creator_send(chat_id,f"⭐ <b>REMOVE ADS PRICE</b>\n\nLegacy/default price: <b>{_managed_remove_ads_stars()} Stars</b>\n\nSend the new Stars price, for example <code>50</code>."); return
+    if text=="📊 AD STATS":
+        clicks=managed_ad_clicks_col.count_documents({}); removed=managed_ad_users_col.count_documents({"ads_removed":True}); active=managed_ad_users_col.count_documents({"ads_removed":{"$ne":True},"ad_unlocked_until":{"$gt":time.time()}})
+        plans=_managed_remove_ads_plans()
+        _creator_send(chat_id,f"📊 <b>MANAGED ADS STATS</b>\n\n🖱 Ad gates: <b>{clicks}</b>\n⭐ Remove Ads purchases: <b>{removed}</b>\n🟢 Users currently unlocked: <b>{active}</b>\n📢 Ads: <b>{'OPEN' if _managed_ads_enabled() else 'CLOSED'}</b>\n⏱ Gate frequency: <b>{_managed_ads_interval()//60} min</b>\n⏱ Watch timer: <b>{_monetag_watch_seconds()}s</b>\n🔢 Ads/gate: <b>{_monetag_ads_per_gate()}</b>\n📺 Monetag zone: <b>{html.escape(_monetag_zone_id() or 'NOT SET')}</b>\n🔗 Direct Link: <b>{'SET' if _managed_ads_smartlink() else 'NOT SET'}</b>\n🌐 TMA URL: <b>{'SET' if _managed_ad_base_url() else 'NOT SET'}</b>\n⭐ Plans: <b>3m {plans['3']} • 6m {plans['6']} • 12m {plans['12']} Stars</b>",reply_markup=_creator_admin_keyboard()); return
+    if text=="📢 Broadcast Creator Users":
+        _creator_set_session(uid,{"state":"admin_broadcast_creator"}); _creator_send(chat_id,"📢 Send the message to broadcast to users who have interacted with the Creator Bot."); return
+    if text=="💎 Premium Prices":
+        prices=get_premium_prices(); _creator_send(chat_id,"💎 <b>Current Premium Prices</b>\n\n"+"\n".join(f"{m} month(s): ${prices[m]:.2f}" for m in ("1","3","9","12"))+"\n\nUse the main bot Premium Prices control to change them."); return
+    if text=="🔙 USER MENU":
+        _creator_send(chat_id,"👤 <b>User Menu</b>",reply_markup=_creator_keyboard(uid)); return
+    sess=_creator_session(uid); state=sess.get("state")
+    if state=="admin_monetag_zone":
+        value=str(text or "").strip()
+        if not re.fullmatch(r"\d{3,20}",value): _creator_send(chat_id,"❌ Send a numeric Monetag main SDK zone ID."); return
+        set_setting("monetag_zone_id",value); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Monetag zone saved: <code>{html.escape(value)}</code>",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_monetag_direct":
+        value=str(text or "").strip()
+        if not re.match(r"^https?://",value,re.I): _creator_send(chat_id,"❌ Send a valid Direct Link URL."); return
+        set_setting("managed_ads_direct_link",value); _creator_clear_session(uid); _creator_send(chat_id,"✅ Monetag Direct Link saved.",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_monetag_watch":
+        try:
+            sec=int(str(text).strip());
+            if sec<1 or sec>120: raise ValueError
+            set_setting("monetag_watch_seconds",sec); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Ad watch timer set to <b>{sec}s</b>.",reply_markup=_creator_admin_keyboard()); return
+        except Exception: _creator_send(chat_id,"❌ Send seconds between 1 and 120."); return
+    if state=="admin_monetag_count":
+        try:
+            count=int(str(text).strip());
+            if count<1 or count>3: raise ValueError
+            set_setting("monetag_ads_per_gate",count); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Ads per gate set to <b>{count}</b>.",reply_markup=_creator_admin_keyboard()); return
+        except Exception: _creator_send(chat_id,"❌ Only 1, 2, or 3 is allowed."); return
+    if state=="admin_ad_smartlink":
+        value=str(text or "").strip()
+        if not re.match(r"^https?://",value,re.I):
+            _creator_send(chat_id,"❌ Send a valid http(s) Direct Link URL."); return
+        set_setting("managed_ads_direct_link",value)
+        _creator_clear_session(uid); _creator_send(chat_id,"✅ Monetag Direct Link saved. It is used by Skip.",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_ad_gate_url":
+        value=str(text or "").strip().rstrip("/")
+        if not re.match(r"^https://",value,re.I):
+            _creator_send(chat_id,"❌ Use a public HTTPS URL."); return
+        set_setting("managed_ads_base_url",value); _creator_clear_session(uid)
+        _start_managed_ad_http_server()
+        _creator_send(chat_id,"✅ Ad gate URL saved. The click-tracking server is ready for the next ad gate.",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_ad_frequency":
+        try:
+            minutes=float(str(text).strip()); seconds=int(minutes*60)
+            if seconds<60 or seconds>86400: raise ValueError
+            set_setting("managed_ads_interval_seconds",seconds); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Ad frequency set to <b>{minutes:g} minutes</b>.",reply_markup=_creator_admin_keyboard()); return
+        except Exception:
+            _creator_send(chat_id,"❌ Invalid value. Send minutes between 1 and 1440."); return
+    if state=="admin_remove_ads_plans":
+        try:
+            vals=[int(x) for x in str(text).replace(","," ").split()]
+            if len(vals)!=3 or any(v<1 or v>100000 for v in vals): raise ValueError
+            plans={"3":vals[0],"6":vals[1],"12":vals[2]}
+            set_setting("managed_remove_ads_plans",plans); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Remove Ads plans saved.\n\n3 months: <b>{vals[0]} Stars</b>\n6 months: <b>{vals[1]} Stars</b>\n12 months: <b>{vals[2]} Stars</b>",reply_markup=_creator_admin_keyboard()); return
+        except Exception:
+            _creator_send(chat_id,"❌ Invalid plans. Send exactly three whole-number prices: <code>50 90 150</code>."); return
+    if state=="admin_remove_ads_price":
+        try:
+            stars=int(str(text).replace("Stars","").strip())
+            if stars<1 or stars>10000: raise ValueError
+            set_setting("managed_remove_ads_stars",stars); _creator_clear_session(uid); _creator_send(chat_id,f"✅ Legacy/default Remove Ads price set to <b>{stars} Stars</b>.",reply_markup=_creator_admin_keyboard()); return
+        except Exception:
+            _creator_send(chat_id,"❌ Invalid Stars price. Send an integer between 1 and 10000."); return
+    if state=="admin_caption":
+        set_setting("create_bot_caption_text",text); set_setting("create_bot_caption_enabled",True); _creator_clear_session(uid); _creator_send(chat_id,"✅ Create caption saved and opened.",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_send_create":
+        _creator_broadcast_create_invite(text); _creator_clear_session(uid); _creator_send(chat_id,"✅ Create announcement sent.",reply_markup=_creator_admin_keyboard()); return
+    if state in {"admin_broadcast_all","admin_broadcast_bots"}:
+        sent,failed=_creator_broadcast_all_bots(text); _creator_clear_session(uid); _creator_send(chat_id,f"✅ <b>Broadcast completed</b>\n\n📨 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_broadcast_admins":
+        sent,failed=_creator_broadcast_bot_segment(text,"admins"); _creator_clear_session(uid); _creator_send(chat_id,f"✅ <b>Admin broadcast completed</b>\n\n📨 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_broadcast_nonadmins":
+        sent,failed=_creator_broadcast_bot_segment(text,"nonadmins"); _creator_clear_session(uid); _creator_send(chat_id,f"✅ <b>Non-admin broadcast completed</b>\n\n📨 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=_creator_admin_keyboard()); return
+    if state=="admin_broadcast_creator":
+        _creator_broadcast_creator_users(text); _creator_clear_session(uid); _creator_send(chat_id,"✅ Creator-user broadcast completed.",reply_markup=_creator_admin_keyboard()); return
+    _creator_send(chat_id,"Use the admin buttons.",reply_markup=_creator_admin_keyboard())
+
+
+def _creator_admin_bots(chat_id):
+    rows=list(managed_bots_col.find().sort("created_at",-1).limit(100));
+    if not rows: _creator_send(chat_id,"🤖 No managed bots yet.",reply_markup=_creator_admin_keyboard()); return
+    lines=["🤖 <b>ALL CREATED BOTS</b>",""]
+    for d in rows:
+        lines.append(f"• @{html.escape(str(d.get('username') or 'unknown'))} — owner <code>{html.escape(str(d.get('owner_id') or ''))}</code> — {'🟢' if d.get('active',True) and not d.get('suspended') else '🔴'}")
+    _creator_send(chat_id,"\n".join(lines),reply_markup=_creator_admin_keyboard())
+
+
+def _creator_broadcast_create_invite(text_msg):
+    url=_creator_bot_url()
+    if not url: return
+    kb={"inline_keyboard":[[{"text":"🚀 Create Now","url":url}]]}
+    sent=0
+    for uid in list(users.keys()):
+        try: _creator_send(int(uid),text_msg,reply_markup=kb); sent+=1
+        except Exception: pass
+    return sent
+
+
+def _creator_broadcast_all_bots(text_msg):
+    sent=failed=0
+    for d in managed_bots_col.find({"active":True,"suspended":{"$ne":True}}):
+        if _managed_premium_active_doc(d): continue
+        mb=managed_bot_objects.get(str(d.get("bot_id"))) or _managed_bot_start_instance(d)
+        if not mb: continue
+        for target in d.get("users") or []:
+            try: mb.send_message(int(target),text_msg,parse_mode="HTML"); sent+=1
+            except Exception: failed+=1
+    return sent,failed
+
+def _creator_broadcast_bot_segment(text_msg, segment):
+    sent=failed=0
+    for d in managed_bots_col.find({"active":True,"suspended":{"$ne":True}}):
+        if _managed_premium_active_doc(d): continue
+        mb=managed_bot_objects.get(str(d.get("bot_id"))) or _managed_bot_start_instance(d)
+        if not mb: continue
+        owner=str(d.get("owner_id") or "")
+        targets=[owner] if segment=="admins" and owner else [str(x) for x in (d.get("users") or []) if str(x)!=owner]
+        for target in targets:
+            try: mb.send_message(int(target),text_msg,parse_mode="HTML"); sent+=1
+            except Exception: failed+=1
+    return sent,failed
+
+
+def _creator_broadcast_creator_users(text_msg):
+    sent=failed=0
+    for uid in list(users.keys()):
+        try: _creator_send(int(uid),text_msg); sent+=1
+        except Exception: failed+=1
+    return sent,failed
+
+
+def _creator_on_managed_bot_created(msg):
+    info=((msg or {}).get("managed_bot_created") or {}).get("bot") or {}
+    bot_id=info.get("id"); owner_id=((msg or {}).get("from") or {}).get("id")
+    if not bot_id or not owner_id: return
+    uid=str(owner_id); sess=_creator_session(uid); username=str(info.get("username") or sess.get("username") or "").lstrip("@"); name=str(info.get("first_name") or sess.get("name") or "Downloader Bot"); bot_type=str(sess.get("bot_type") or "video").lower(); bot_type=bot_type if bot_type in {"video","music"} else "video"
+    token,err=_creator_api("getManagedBotToken",{"user_id":int(bot_id)})
+    if err:
+        _creator_send(owner_id,"❌ Telegram created the bot, but the Creator Bot could not fetch its management token. Please contact admin.")
+        print("getManagedBotToken error:",err); return
+    doc={
+        "bot_id":str(bot_id),"owner_id":uid,"token_enc":_encrypt_managed_token(token),
+        "username":username,"name":name,"bot_type":bot_type,"active":True,"suspended":False,
+        "premium_until":None,"wallet_linked":False,"created_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc),"users":[],
+    }
+    managed_bots_col.update_one({"bot_id":str(bot_id)},{"$set":doc},upsert=True)
+    _creator_clear_session(uid)
+    d=managed_bots_col.find_one({"bot_id":str(bot_id)}); _managed_bot_start_instance(d)
+    _creator_send(owner_id,
+        f"🎉 <b>Bot Created Successfully!</b>\n\n🤖 <b>{html.escape(name)}</b>\n🔗 @{html.escape(username or 'unknown')}\n🆔 <code>{bot_id}</code>\n\n"
+        "Your downloader bot is now running.\n\n"
+        "💎 Premium uses your shared @Downloadvedioytibot balance.",
+        reply_markup=_creator_keyboard(uid))
+
+
+def _creator_on_managed_update(update):
+    obj=(update.get("managed_bot") or {})
+    info=obj.get("bot") or {}; owner=(obj.get("user") or {})
+    bot_id=info.get("id"); owner_id=owner.get("id")
+    if not bot_id: return
+    d=managed_bots_col.find_one({"bot_id":str(bot_id)}) or {}
+    if owner_id and not d.get("owner_id"): d["owner_id"]=str(owner_id)
+    token,err=_creator_api("getManagedBotToken",{"user_id":int(bot_id)})
+    if not err and token:
+        d.update({"bot_id":str(bot_id),"owner_id":str(d.get("owner_id") or owner_id or ""),"token_enc":_encrypt_managed_token(token),"username":info.get("username") or d.get("username"),"name":info.get("first_name") or d.get("name") or "Downloader Bot","active":True,"updated_at":datetime.now(timezone.utc)})
+        d.setdefault("created_at",datetime.now(timezone.utc)); d.setdefault("users",[]); d.setdefault("suspended",False)
+        managed_bots_col.update_one({"bot_id":str(bot_id)},{"$set":d},upsert=True)
+        _managed_bot_start_instance(d)
+
+
+def _creator_callback(call):
+    uid=str((call.get("from") or {}).get("id") or ""); chat_id=((call.get("message") or {}).get("chat") or {}).get("id"); mid=((call.get("message") or {}).get("message_id")); data=str(call.get("data") or "")
+    _creator_answer(call.get("id"),"")
+    if data.startswith("ctype:"):
+        btype=data.split(":",1)[1].lower(); sess=_creator_session(uid)
+        if btype not in {"video","music"} or sess.get("state")!="type": _creator_answer(call.get("id"),"Creation session expired.",True); return
+        _creator_set_session(uid,{**sess,"state":"name","bot_type":btype,"updated_at":datetime.now(timezone.utc)})
+        _creator_send(chat_id,f"<b>{'🎬 Video Downloader' if btype=='video' else '🎵 Music Downloader'}</b> selected.\n\n<b>Step 1 of 3</b>\nSend the name you want for your bot."); return
+    if data.startswith("cwallet:"):
+        bid=data.split(":",1)[1]; d=managed_bots_col.find_one({"bot_id":bid})
+        if not d or str(d.get("owner_id"))!=uid: _creator_answer(call.get("id"),"This is not your bot.",True); return
+        kb=InlineKeyboardMarkup(row_width=2); kb.add(InlineKeyboardButton("✅ Confirm",callback_data=f"mwconfirm:{bid}"),InlineKeyboardButton("❌ Reject",callback_data=f"mwreject:{bid}"))
+        try: _main_bot.send_message(int(uid),"💳 <b>SHARED WALLET CONNECTION</b>\n\n"+f"Connect <b>@{html.escape(str(d.get('username') or 'your bot'))}</b> to your <b>@Downloadvedioytibot</b> balance?\n\nAfter confirmation both systems use the same balance. No wallet code is required.",parse_mode="HTML",reply_markup=kb); _creator_answer(call.get("id"),"Confirmation sent to @Downloadvedioytibot")
+        except Exception as e: _creator_answer(call.get("id"),"Could not send wallet confirmation.",True); print("Creator wallet request error:",repr(e))
+        return
+    if data.startswith("cbotinfo:"):
+        bid=data.split(":",1)[1]; d=managed_bots_col.find_one({"bot_id":bid})
+        if not d or str(d.get("owner_id"))!=uid:
+            _creator_answer(call.get("id"),"Not your bot.",True); return
+        _creator_send(chat_id,f"🤖 <b>Bot Information</b>\n\nName: <b>{html.escape(str(d.get('name') or 'Downloader Bot'))}</b>\nUsername: @{html.escape(str(d.get('username') or 'unknown'))}\nStatus: {'🟢 Active' if d.get('active',True) and not d.get('suspended') else '🔴 Suspended'}\nPremium: {'💎 Active' if is_premium(uid) else '🆓 Standard'}")
+        return
+    if data.startswith("cbotdel:"):
+        bid=data.split(":",1)[1]; d=managed_bots_col.find_one({"bot_id":bid})
+        if not d or str(d.get("owner_id"))!=uid:
+            _creator_answer(call.get("id"),"Not your bot.",True); return
+        _managed_bot_remove_from_system(bid)
+        _creator_send(chat_id,"🗑 <b>Bot deleted from this system.</b>\n\nIts polling worker, database record and local management entry have been removed. Telegram itself does not provide a Bot API method for deleting the bot account permanently.",reply_markup=_creator_keyboard(uid)); return
+    if data.startswith("cpickbot:"):
+        bid=data.split(":",1)[1]; d=managed_bots_col.find_one({"bot_id":bid})
+        if not d or str(d.get("owner_id"))!=uid: _creator_answer(call.get("id"),"Not your bot.",True); return
+        _creator_send(chat_id,f"💎 <b>Premium — @{html.escape(str(d.get('username') or 'unknown'))}</b>\n\nChoose payment method first:",reply_markup={"inline_keyboard":[[{"text":"💰 Wallet","callback_data":f"cpaymethod:{bid}:wallet"},{"text":"⭐ Telegram Stars","callback_data":f"cpaymethod:{bid}:stars"}],[{"text":"💳 Link Wallet","callback_data":f"cwallet:{bid}"}]]}); return
+    if data.startswith("cpaymethod:"):
+        parts=data.split(":",2); bid=parts[1] if len(parts)>1 else ""; method=parts[2] if len(parts)>2 else ""; d=managed_bots_col.find_one({"bot_id":bid})
+        if not d or str(d.get("owner_id"))!=uid or method not in {"wallet","stars"}: _creator_answer(call.get("id"),"Invalid request.",True); return
+        if method=="wallet" and not d.get("wallet_linked"):
+            _creator_send(chat_id,"💳 <b>Wallet is not connected</b>\n\nConnect this bot to your @Downloadvedioytibot balance first.",reply_markup={"inline_keyboard":[[{"text":"🔗 CONNECT WALLET","callback_data":f"cwallet:{bid}"}]]}); return
+        prices=get_premium_prices(); rate=max(1,int(get_setting("stars_per_usd",100) or 100)); rows=[]
+        for months in ("1","3","9","12"):
+            if method=="wallet": rows.append([{"text":f"💰 {months} Month — ${float(prices[months]):.2f}","callback_data":f"cprem:{bid}:{months}"}])
+            else:
+                stars=max(1,int(round(float(prices[months])*rate))); rows.append([{"text":f"⭐ {months} Month — {stars} Stars","callback_data":f"cpremstars:{bid}:{months}"}])
+        _creator_send(chat_id,f"Choose Premium period for <b>@{html.escape(str(d.get('username') or 'unknown'))}</b>:",reply_markup={"inline_keyboard":rows}); return
+    if data.startswith("cpremstars:"):
+        parts=data.split(":"); bid=parts[1] if len(parts)>1 else ""; months=parts[2] if len(parts)>2 else ""; d=managed_bots_col.find_one({"bot_id":bid}); price=get_premium_prices().get(months)
+        if not d or str(d.get("owner_id"))!=uid or price is None: _creator_answer(call.get("id"),"Invalid plan.",True); return
+        stars=max(1,int(round(float(price)*max(1,int(get_setting("stars_per_usd",100) or 100))))); payload=f"managed_creator_premium_stars:{bid}:{months}:{stars}"
+        try:
+            rr=requests.post(f"https://api.telegram.org/bot{TOKEN}/createInvoiceLink",json={"title":f"Downloader Premium {months} month(s)","description":f"Premium for @{d.get('username','unknown')}","payload":payload,"provider_token":"","currency":"XTR","prices":[{"label":f"Premium {months} month(s)","amount":stars}]},timeout=20); body=rr.json()
+            if not body.get("ok"): raise RuntimeError(body.get("description") or "createInvoiceLink failed")
+            _creator_send(chat_id,f"⭐ <b>Telegram Stars Payment</b>\n\nBot: <b>@{html.escape(str(d.get('username') or 'unknown'))}</b>\nPlan: <b>{months} month(s)</b>\nPrice: <b>{stars} Stars</b>\n\nPayment is handled by <b>@Downloadvedioytibot</b>.",reply_markup={"inline_keyboard":[[{"text":"⭐ PAY NOW","url":str(body.get('result') or '')}]]})
+            _creator_answer(call.get("id"),"Payment link ready")
+        except Exception as e: print("Creator createInvoiceLink error:",repr(e)); _creator_answer(call.get("id"),"Could not create payment link.",True)
+        return
+    if data.startswith("cprem:"):
+        parts=data.split(":"); bid=parts[1] if len(parts)>1 else ""; months=parts[2] if len(parts)>2 else ""; d=managed_bots_col.find_one({"bot_id":bid}); price=get_premium_prices().get(months)
+        if not d or str(d.get("owner_id"))!=uid or price is None: _creator_answer(call.get("id"),"Invalid plan.",True); return
+        pa=usd_to_asset(cur_code(uid),price)
+        if available_asset_amount(uid)<pa: _creator_send(chat_id,f"❌ <b>Insufficient balance</b>\n\nNeed: {html.escape(format_asset(cur_code(uid),pa))}\nAvailable: {html.escape(format_asset(cur_code(uid),available_asset_amount(uid)))}\n\n{_premium_balance_help(uid)}"); return
+        _creator_send(chat_id,f"💰 <b>Wallet Premium</b>\n\nBot: @{html.escape(str(d.get('username') or 'unknown'))}\nPlan: {months} month(s)\nPrice: ${price:.2f}",reply_markup={"inline_keyboard":[[{"text":f"✅ Pay ${price:.2f}","callback_data":f"cprempay:{bid}:{months}"},{"text":"❌ Cancel","callback_data":"cpremcancel"}]]}); return
+    if data.startswith("cprempay:"):
+        parts=data.split(":"); bid=parts[1] if len(parts)>1 else ""; months=parts[2] if len(parts)>2 else ""; d=managed_bots_col.find_one({"bot_id":bid}); price=get_premium_prices().get(months)
+        if not d or str(d.get("owner_id"))!=uid or price is None: _creator_answer(call.get("id"),"Invalid plan.",True); return
+        pa=usd_to_asset(cur_code(uid),price)
+        if available_asset_amount(uid)<pa: _creator_answer(call.get("id"),"Insufficient balance.",True); return
+        now=datetime.now(timezone.utc); old=d.get("premium_until")
+        try: old_dt=datetime.fromisoformat(str(old).replace("Z","+00:00")) if old else now; old_dt=old_dt if old_dt.tzinfo else old_dt.replace(tzinfo=timezone.utc)
+        except Exception: old_dt=now
+        until=max(now,old_dt)+timedelta(days=30*int(months)); ledger_debit(uid,pa,"managed_bot_premium_purchase",{"bot_id":bid,"price_usd":price,"months":months}); managed_bots_col.update_one({"bot_id":bid},{"$set":{"premium_until":until.isoformat(),"premium_source":"wallet","premium_updated_at":now}}); premium_logs_col.insert_one({"user_id":uid,"bot_id":bid,"months":int(months),"price":price,"until":until.isoformat(),"time":now,"type":"managed_bot_wallet_purchase"})
+        _creator_send(chat_id,f"🎉 <b>Premium Activated</b>\n\n🤖 @{html.escape(str(d.get('username') or 'unknown'))}\n💰 Paid: ${price:.2f}\n⏱️ {months} month(s)\n⏰ {html.escape(local_datetime_text(uid,until))}",reply_markup=_creator_keyboard(uid)); return
+    if data=="cpremcancel": _creator_answer(call.get("id"),"Cancelled"); return
+
+
+
+
+# ================= MANAGED-BOT MONETAG TMA / REMOVE ADS =================
+def _managed_ad_base_url():
+    saved=str(get_setting("managed_ads_base_url", "") or "").strip().rstrip("/")
+    return saved or str(AD_GATE_BASE_URL or "").strip().rstrip("/")
+
+def _managed_ads_smartlink():
+    # Backward-compatible function name; this now returns Monetag Direct Link.
+    return str(get_setting("managed_ads_direct_link", MONETAG_DIRECT_LINK) or MONETAG_DIRECT_LINK or "").strip()
+
+def _monetag_zone_id():
+    return str(get_setting("monetag_zone_id", MONETAG_ZONE_ID) or MONETAG_ZONE_ID).strip()
+
+def _managed_ads_enabled():
+    return bool(get_setting("managed_ads_enabled", False)) and bool(_monetag_zone_id())
+
+def _managed_ads_interval():
+    try:
+        return max(60, int(get_setting("managed_ads_interval_seconds", AD_SHOW_INTERVAL_SECONDS) or AD_SHOW_INTERVAL_SECONDS))
+    except Exception:
+        return AD_SHOW_INTERVAL_SECONDS
+
+def _monetag_watch_seconds():
+    try:
+        return max(1, min(120, int(get_setting("monetag_watch_seconds", MONETAG_WATCH_SECONDS_DEFAULT) or MONETAG_WATCH_SECONDS_DEFAULT)))
+    except Exception:
+        return MONETAG_WATCH_SECONDS_DEFAULT
+
+def _monetag_ads_per_gate():
+    try:
+        return max(1, min(3, int(get_setting("monetag_ads_per_gate", MONETAG_ADS_PER_GATE_DEFAULT) or MONETAG_ADS_PER_GATE_DEFAULT)))
+    except Exception:
+        return MONETAG_ADS_PER_GATE_DEFAULT
+
+def _monetag_require_valued():
+    return bool(get_setting("monetag_require_valued", MONETAG_REQUIRE_VALUED_DEFAULT))
+
+def _managed_remove_ads_stars():
+    try:
+        return max(1, int(get_setting("managed_remove_ads_stars", REMOVE_ADS_STARS_DEFAULT) or REMOVE_ADS_STARS_DEFAULT))
+    except Exception:
+        return REMOVE_ADS_STARS_DEFAULT
+
+def _managed_remove_ads_plans():
+    raw=get_setting("managed_remove_ads_plans", REMOVE_ADS_PLAN_DEFAULTS)
+    out=dict(REMOVE_ADS_PLAN_DEFAULTS)
+    if isinstance(raw,dict):
+        for months in ("3","6","12"):
+            try:
+                v=int(raw.get(months,out[months]));
+                if 1 <= v <= 100000: out[months]=v
+            except Exception: pass
+    return out
+
+def _managed_remove_ads_active(bid, uid):
+    state=_managed_ad_state(bid,uid)
+    if not state: return False
+    try:
+        until=state.get("ads_until")
+        if until is None:
+            return bool(state.get("ads_removed",False))
+        dt=until if isinstance(until,datetime) else datetime.fromisoformat(str(until).replace("Z","+00:00"))
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        return dt > datetime.now(timezone.utc)
+    except Exception:
+        return bool(state.get("ads_removed",False))
+
+def _managed_ad_state(bid, uid):
+    return managed_ad_users_col.find_one({"bot_id":str(bid),"user_id":str(uid)}) or {}
+
+def _managed_ads_removed(bid, uid):
+    return _managed_remove_ads_active(bid,uid)
+
+def _managed_ad_required(bid, uid):
+    uid=str(uid); bid=str(bid)
+    if not _managed_ads_enabled(): return False
+    if is_admin(uid): return False
+    d=_managed_bot_doc(bid) or {}
+    if _managed_premium_active_doc(d): return False
+    if _managed_remove_ads_active(bid,uid): return False
+    state=_managed_ad_state(bid,uid)
+    try: until=float(state.get("ad_unlocked_until",0) or 0)
+    except Exception: until=0
+    return until <= time.time()
+
+def _managed_ad_mark_opened(bid, uid, token=""):
+    now=time.time(); until=now+_managed_ads_interval()
+    managed_ad_users_col.update_one(
+        {"bot_id":str(bid),"user_id":str(uid)},
+        {"$set":{"ad_unlocked_until":until,"last_ad_opened_at":datetime.now(timezone.utc),"last_ad_token":str(token or "")}},
+        upsert=True,
+    )
+    managed_ad_clicks_col.insert_one({"bot_id":str(bid),"user_id":str(uid),"token":str(token or ""),"time":datetime.now(timezone.utc),"interval_seconds":_managed_ads_interval(),"ads_count":_monetag_ads_per_gate()})
+
+def _managed_tma_url(token):
+    base=_managed_ad_base_url()
+    if not base: return ""
+    return f"{base}/miniapp/{urllib.parse.quote(str(token),safe='')}"
+
+def _managed_ad_create_pending(bid, uid, action, **payload):
+    token=secrets.token_urlsafe(24).replace("-","").replace("_","")[:32]
+    count=_monetag_ads_per_gate()
+    row={
+        "bot_id":str(bid),"uid":str(uid),"action":str(action),
+        "created":time.time(),"expires":time.time()+900,
+        "ads_required":count,"verified_ads":0,"verified_ymids":[],
+        "watch_seconds":_monetag_watch_seconds(),"status":"pending",
+    }
+    row.update(payload)
+    with managed_ad_pending_lock:
+        managed_ad_pending[token]=row
+        if len(managed_ad_pending)>5000:
+            now=time.time()
+            for k,v in list(managed_ad_pending.items()):
+                if float(v.get("expires",0) or 0)<now:
+                    managed_ad_pending.pop(k,None)
+    return token
+
+def _managed_ad_message(mb, chat_id, bid, uid, token):
+    url=_managed_tma_url(token)
+    rows=[]
+    if url:
+        rows.append([InlineKeyboardButton("👉 Watch ad",web_app=telebot.types.WebAppInfo(url=url))])
+    rows.append([
+        InlineKeyboardButton("💎 Premium",callback_data="mremoveads"),
+        InlineKeyboardButton("⏭️ Skip",url=_managed_ads_smartlink() or "https://omg10.com/4/11909123"),
+    ])
+    count=_monetag_ads_per_gate(); secs=_monetag_watch_seconds(); mins=max(1,int(round(_managed_ads_interval()/60)))
+    text=("To continue, watch a short ad or use Premium.\n\n"
+          f"📢 Ads required: <b>{count}</b>\n"
+          f"⏱️ Gate timer: <b>{secs}s</b>\n"
+          f"🔄 Ads reset after about <b>{mins} minutes</b>.\n\n"
+          "💎 Premium users and users who removed ads do not see this gate.")
+    mb.send_message(chat_id,text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(rows))
+
+def _managed_ads_gate_or_continue(mb, chat_id, bid, uid, action, **payload):
+    if not _managed_ad_required(bid,uid): return False
+    token=_managed_ad_create_pending(bid,uid,action,chat_id=int(chat_id),**payload)
+    _managed_ad_message(mb,chat_id,bid,uid,token)
+    return True
+
+def _managed_ad_gate_or_continue(mb, chat_id, bid, uid, action, **payload):
+    return _managed_ads_gate_or_continue(mb, chat_id, bid, uid, action, **payload)
+
+def _managed_execute_ad_pending(token):
+    with managed_ad_pending_lock:
+        row=managed_ad_pending.pop(str(token),None)
+    if not row or float(row.get("expires",0) or 0)<time.time(): return False
+    bid=str(row.get("bot_id") or ""); uid=str(row.get("uid") or ""); mb=managed_bot_objects.get(bid) or _managed_bot_start_instance(_managed_bot_doc(bid) or {})
+    if not mb: return False
+    _managed_ad_mark_opened(bid,uid,token)
+    action=str(row.get("action") or "")
+    chat_id=int(row.get("chat_id") or uid)
+    if action=="download":
+        link=str(row.get("link") or "")
+        def job():
+            tok=_ACTIVE_BOT.set(mb); meta_doc=_managed_bot_doc(bid) or {}; meta=_ACTIVE_MANAGED_META.set({"bot_id":bid,"owner_id":str(meta_doc.get("owner_id") or ""),"username":str(meta_doc.get("username") or ""),"name":str(meta_doc.get("name") or "Downloader Bot"),"bot_type":str(meta_doc.get("bot_type") or "video")})
+            try: download_media(chat_id,link,None,None)
+            finally:
+                try: _ACTIVE_MANAGED_META.reset(meta)
+                except Exception: pass
+                try: _ACTIVE_BOT.reset(tok)
+                except Exception: pass
+        download_executor_for(uid).submit(job)
+    elif action=="music_search":
+        q=_music_clean_text(row.get("query") or "")
+        def music_job():
+            try:
+                rows=_rapidapi_youtube_song_search(q,30) if RAPIDAPI_YT_KEY else _song_search_all(q,30)
+                rows=[x for x in rows if _parse_duration_value(x.get("duration"))>0][:30]
+                if not rows:
+                    mb.send_message(chat_id,"❌ No matching songs found. Try another title or artist."); return
+                token2=uuid.uuid4().hex[:12]; pending=_MANAGED_MUSIC_PENDING.get(bid)
+                if pending is None: pending={}; _MANAGED_MUSIC_PENDING[bid]=pending
+                pending[token2]={"uid":uid,"rows":rows,"created":time.time()}; _managed_music_show(mb,chat_id,token2,0,pending)
+            except Exception as e:
+                print("Managed gated music search error:",repr(e)); mb.send_message(chat_id,"❌ Music search failed. Please try again.")
+        threading.Thread(target=music_job,daemon=True).start()
+    return True
+
+def _managed_create_remove_ads_invoice(mb, chat_id, bid, uid, months="3"):
+    plans=_managed_remove_ads_plans(); months=str(months)
+    if months not in plans: months="3"
+    stars=plans[months]
+    d=_managed_bot_doc(bid) or {}
+    payload=f"managed_remove_ads:{bid}:{uid}:{months}:{stars}"
+    try:
+        rr=requests.post(f"https://api.telegram.org/bot{TOKEN}/createInvoiceLink",json={
+            "title":f"Remove Ads — {months} Months",
+            "description":f"Remove ads on @{d.get('username','your bot')} for {months} months.",
+            "payload":payload,
+            "currency":"XTR",
+            "prices":[{"label":f"Remove Ads {months} months","amount":stars}],
+        },timeout=20)
+        body=rr.json()
+        if not body.get("ok"): raise RuntimeError(body.get("description") or "createInvoiceLink failed")
+        link=str(body.get("result") or "")
+        if not link: raise RuntimeError("empty invoice link")
+        mb.send_message(chat_id,
+            f"⭐ <b>REMOVE ADS</b>\n\nChoose how long you want ads removed from <b>@{html.escape(str(d.get('username') or 'your bot'))}</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"3 Months — ⭐ {plans['3']}",url=link if months=="3" else _managed_invoice_url(bid,uid,"3")),InlineKeyboardButton(f"6 Months — ⭐ {plans['6']}",url=_managed_invoice_url(bid,uid,"6"))],[InlineKeyboardButton(f"12 Months — ⭐ {plans['12']}",url=_managed_invoice_url(bid,uid,"12"))]]))
+        return True
+    except Exception as e:
+        print("Managed Remove Ads invoice error:",repr(e)); mb.send_message(chat_id,"❌ Could not create the Telegram Stars payment link. Please try again."); return False
+
+def _managed_invoice_url(bid, uid, months):
+    plans=_managed_remove_ads_plans(); months=str(months)
+    if months not in plans: return ""
+    d=_managed_bot_doc(bid) or {}
+    payload=f"managed_remove_ads:{bid}:{uid}:{months}:{plans[months]}"
+    try:
+        rr=requests.post(f"https://api.telegram.org/bot{TOKEN}/createInvoiceLink",json={
+            "title":f"Remove Ads — {months} Months",
+            "description":f"Remove ads on @{d.get('username','your bot')} for {months} months.",
+            "payload":payload,"currency":"XTR",
+            "prices":[{"label":f"Remove Ads {months} months","amount":plans[months]}],
+        },timeout=20); body=rr.json()
+        return str(body.get("result") or "") if body.get("ok") else ""
+    except Exception as e:
+        print("Managed invoice link error:",repr(e)); return ""
+
+def _validate_webapp_init_data(init_data, bot_token):
+    if not init_data or not bot_token: return None
+    try:
+        vals=urllib.parse.parse_qsl(init_data,keep_blank_values=True)
+        data=dict(vals); received=data.pop("hash",None)
+        if not received: return None
+        check="\n".join(f"{k}={v}" for k,v in sorted(data.items()))
+        secret=hmac.new(b"WebAppData",str(bot_token).encode(),hashlib.sha256).digest()
+        calc=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc,received): return None
+        auth=int(data.get("auth_date","0") or 0)
+        if auth and time.time()-auth>86400: return None
+        raw=data.get("user")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+def _managed_pending_get(token):
+    with managed_ad_pending_lock:
+        row=managed_ad_pending.get(str(token))
+        if row and float(row.get("expires",0) or 0)<time.time():
+            managed_ad_pending.pop(str(token),None); return None
+        return row
+
+def _managed_pending_verified_count(row):
+    return len(set(str(x) for x in (row or {}).get("verified_ymids",[]) if x))
+
+def _managed_postback_record(params):
+    token=""; ymid=str(params.get("ymid") or "").strip()
+    # ymid format: tma:<token>:<index>:<nonce>
+    if ymid.startswith("tma:"):
+        parts=ymid.split(":")
+        if len(parts)>=3: token=parts[1]
+    if not token: return False
+    event=str(params.get("event") or params.get("event_type") or "").strip().lower()
+    value=str(params.get("value") or params.get("reward_event_type") or "").strip().lower()
+    if event!="impression": return False
+    if value!="valued": return False
+    with managed_ad_pending_lock:
+        row=managed_ad_pending.get(token)
+        if not row or float(row.get("expires",0) or 0)<time.time(): return False
+        arr=list(row.get("verified_ymids") or [])
+        if ymid not in arr: arr.append(ymid)
+        row["verified_ymids"]=arr
+        row["verified_ads"]=_managed_pending_verified_count(row)
+        row["last_postback"]={"event":event,"value":value,"zone":params.get("zone") or params.get("zone_id"),"price":params.get("price") or params.get("estimated_price"),"time":time.time()}
+        return True
+
+def _managed_execute_verified_pending(token):
+    with managed_ad_pending_lock:
+        row=managed_ad_pending.get(str(token))
+        if not row: return False
+        if _managed_pending_verified_count(row) < int(row.get("ads_required",1) or 1): return False
+        row=dict(row); managed_ad_pending.pop(str(token),None)
+    bid=str(row.get("bot_id") or ""); uid=str(row.get("uid") or ""); mb=managed_bot_objects.get(bid) or _managed_bot_start_instance(_managed_bot_doc(bid) or {})
+    if not mb: return False
+    _managed_ad_mark_opened(bid,uid,token)
+    action=str(row.get("action") or ""); chat_id=int(row.get("chat_id") or uid)
+    if action=="download":
+        link=str(row.get("link") or "")
+        def job():
+            tok=_ACTIVE_BOT.set(mb); meta_doc=_managed_bot_doc(bid) or {}; meta=_ACTIVE_MANAGED_META.set({"bot_id":bid,"owner_id":str(meta_doc.get("owner_id") or ""),"username":str(meta_doc.get("username") or ""),"name":str(meta_doc.get("name") or "Downloader Bot"),"bot_type":str(meta_doc.get("bot_type") or "video")})
+            try: download_media(chat_id,link,None,None)
+            finally:
+                try: _ACTIVE_MANAGED_META.reset(meta)
+                except Exception: pass
+                try: _ACTIVE_BOT.reset(tok)
+                except Exception: pass
+        download_executor_for(uid).submit(job)
+    elif action=="music_search":
+        q=_music_clean_text(row.get("query") or "")
+        def music_job():
+            try:
+                rows=_rapidapi_youtube_song_search(q,30) if RAPIDAPI_YT_KEY else _song_search_all(q,30)
+                rows=[x for x in rows if _parse_duration_value(x.get("duration"))>0][:30]
+                if not rows: mb.send_message(chat_id,"❌ No matching songs found. Try another title or artist."); return
+                token2=uuid.uuid4().hex[:12]; pending=_MANAGED_MUSIC_PENDING.get(bid)
+                if pending is None: pending={}; _MANAGED_MUSIC_PENDING[bid]=pending
+                pending[token2]={"uid":uid,"rows":rows,"created":time.time()}; _managed_music_show(mb,chat_id,token2,0,pending)
+            except Exception as e: print("Managed verified music search error:",repr(e)); mb.send_message(chat_id,"❌ Music search failed. Please try again.")
+        threading.Thread(target=music_job,daemon=True).start()
+    return True
+
+class _ManagedAdGateHandler(BaseHTTPRequestHandler):
+    def _json(self, code, obj):
+        raw=json.dumps(obj,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+        self.send_response(code); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def _html(self, code, raw):
+        raw=raw.encode("utf-8") if isinstance(raw,str) else raw
+        self.send_response(code); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
+    def do_GET(self):
+        parsed=urllib.parse.urlparse(self.path); path=parsed.path; qs=urllib.parse.parse_qs(parsed.query)
+        if path.startswith("/miniapp/"):
+            token=urllib.parse.unquote(path[len("/miniapp/"):].strip("/")); row=_managed_pending_get(token)
+            if not row: return self._html(410,"<h2>Ad session expired</h2><p>Return to Telegram and send the request again.</p>")
+            html_path=Path(__file__).resolve().parent/"miniapp"/"index.html"
+            try:
+                page=html_path.read_text(encoding="utf-8")
+                zone=_monetag_zone_id() or MONETAG_ZONE_ID
+                page=page.replace("11909176",zone).replace("show_11909176",f"show_{zone}")
+                return self._html(200,page)
+            except Exception as e: return self._html(500,f"<h2>Mini App unavailable</h2><p>{html.escape(str(e))}</p>")
+        if path=="/api/tma/status":
+            token=str((qs.get("token") or [""])[0]); row=_managed_pending_get(token)
+            if not row: return self._json(404,{"ok":False,"error":"expired"})
+            return self._json(405,{"ok":False,"error":"POST required"})
+        if path=="/postback":
+            ok=_managed_postback_record(qs)
+            return self._json(200,{"ok":bool(ok)})
+        if path=="/healthz": return self._json(200,{"ok":True,"service":"quickdl-tma"})
+        # Backward compatibility with the previous ad-open endpoint: do NOT
+        # auto-release downloads from a URL anymore; opening a URL alone is not
+        # proof of a rewarded ad.
+        if path.startswith("/ad/open/"):
+            return self._html(410,"<h2>Ad flow updated</h2><p>Please use the Watch ad button in Telegram.</p>")
+        return self._html(404,"Not found")
+    def do_POST(self):
+        parsed=urllib.parse.urlparse(self.path); path=parsed.path
+        try: length=int(self.headers.get("Content-Length","0") or 0); body=self.rfile.read(length) if length else b"{}"; data=json.loads(body.decode("utf-8") or "{}")
+        except Exception: return self._json(400,{"ok":False,"error":"invalid json"})
+        if path in {"/api/tma/session","/api/tma/status","/api/tma/ad-result","/api/tma/complete"}:
+            token=str(data.get("token") or "").strip(); init_data=str(data.get("initData") or "")
+            row=_managed_pending_get(token)
+            if not row: return self._json(404,{"ok":False,"error":"expired"})
+            bid=str(row.get("bot_id") or ""); uid=str(row.get("uid") or "")
+            doc=_managed_bot_doc(bid) or {}; bot_token=_decrypt_managed_token(doc)
+            tg_user=_validate_webapp_init_data(init_data,bot_token)
+            if not tg_user or str(tg_user.get("id"))!=uid: return self._json(403,{"ok":False,"error":"telegram user mismatch"})
+            if path=="/api/tma/session":
+                return self._json(200,{"ok":True,"user_id":int(uid),"ads_required":int(row.get("ads_required",1) or 1),"watch_seconds":int(row.get("watch_seconds",15) or 15),"verified_ads":_managed_pending_verified_count(row),"require_valued":_monetag_require_valued(),"zone_id":_monetag_zone_id()})
+            if path=="/api/tma/status":
+                return self._json(200,{"ok":True,"verified_ads":_managed_pending_verified_count(row),"required":int(row.get("ads_required",1) or 1),"completed":False})
+            if path=="/api/tma/ad-result":
+                # Frontend result is UI evidence only. Real verification comes from
+                # Monetag's server-side postback; ymid is stored for correlation.
+                ymid=str(data.get("ymid") or "").strip(); result=data.get("result") or {}
+                if ymid:
+                    row.setdefault("frontend_results",{})[ymid]={"result":result,"time":time.time()}
+                return self._json(200,{"ok":True,"verified_ads":_managed_pending_verified_count(row),"required":int(row.get("ads_required",1) or 1)})
+            # complete: only releases when all required Monetag impressions were
+            # confirmed as valued via postback.
+            count=_managed_pending_verified_count(row); required=int(row.get("ads_required",1) or 1)
+            if count < required:
+                return self._json(409,{"ok":False,"verified_ads":count,"required":required,"error":"waiting_for_monetag_confirmation"})
+            ok=_managed_execute_verified_pending(token)
+            return self._json(200 if ok else 409,{"ok":bool(ok),"verified_ads":count,"required":required})
+        return self._json(404,{"ok":False,"error":"not found"})
+    def log_message(self, fmt, *args): return
+
+def _start_managed_ad_http_server():
+    global managed_ad_http_server
+    if managed_ad_http_server is not None: return
+    if not _managed_ad_base_url():
+        print("⚠️ Managed TMA disabled: set AD_GATE_BASE_URL or RAILWAY_PUBLIC_DOMAIN."); return
+    try:
+        managed_ad_http_server=ThreadingHTTPServer(("0.0.0.0",AD_GATE_PORT),_ManagedAdGateHandler)
+        threading.Thread(target=managed_ad_http_server.serve_forever,daemon=True,name="managed-tma-server").start()
+        print(f"📢 Managed Monetag TMA listening on 0.0.0.0:{AD_GATE_PORT} -> {_managed_ad_base_url()}")
+    except Exception as e: print("Managed TMA HTTP server failed:",repr(e))
+
+def _managed_bot_remove_from_system(bot_id):
+    bid=str(bot_id); doc=managed_bots_col.find_one({"bot_id":bid}) or {}
+    mb=managed_bot_objects.pop(bid,None)
+    if mb:
+        try: mb.stop_polling()
+        except Exception: pass
+    managed_bot_threads.pop(bid,None)
+    # Ask Telegram to close the managed bot's cloud session when possible.
+    try:
+        token=_decrypt_managed_token(doc)
+        if token:
+            requests.post(f"https://api.telegram.org/bot{token}/close",json={},timeout=10)
+    except Exception as e:
+        print("Managed bot close on delete skipped:",repr(e))
+    # Remove the bot completely from this application's database/system. Telegram
+    # does not expose a Bot API method for deleting the bot account itself.
+    try: managed_bots_col.delete_one({"bot_id":bid})
+    except Exception: pass
+
+
+def _managed_bot_doc(bot_id):
+    return managed_bots_col.find_one({"bot_id":str(bot_id)})
+
+
+def _managed_bot_is_owner(bot_id, uid):
+    d=_managed_bot_doc(bot_id); return bool(d and str(d.get("owner_id"))==str(uid))
+
+
+_MANAGED_MUSIC_PENDING = {}
+
+def _managed_bot_start_instance(doc):
+    token=_decrypt_managed_token(doc or {})
+    if not token: return None
+    bid=str(doc.get("bot_id")); btype=str(doc.get("bot_type") or "video").lower(); btype=btype if btype in {"video","music"} else "video"
+    if doc.get("suspended"): return None
+    with managed_bot_lock:
+        if bid in managed_bot_objects: return managed_bot_objects[bid]
+        try:
+            mb=telebot.TeleBot(token,parse_mode="HTML",threaded=True); me=mb.get_me(); username=(me.username or doc.get("username") or "").strip().lstrip("@")
+            meta={"bot_id":bid,"owner_id":str(doc.get("owner_id") or ""),"username":username,"name":doc.get("name") or me.first_name or username,"bot_type":btype}
+            managed_bots_col.update_one({"bot_id":bid},{"$set":{"username":username,"bot_type":btype,"active":True,"updated_at":datetime.now(timezone.utc)}},upsert=False); managed_bot_objects[bid]=mb
+            def _ctx(): _ACTIVE_BOT.set(mb); _ACTIVE_MANAGED_META.set(meta)
+            def _menu(owner=False, uid=None):
+                uid=str(uid or "")
+                kb=ReplyKeyboardMarkup(resize_keyboard=True)
+                if _creation_open(): kb.add("🤖 Create Your Own Bot")
+                if owner: kb.add("👑 ADMIN PANEL")
+                return kb
+            def _start(m):
+                _ctx(); managed_bots_col.update_one({"bot_id":bid},{"$addToSet":{"users":int(m.from_user.id)}}); owner=str(doc.get("owner_id") or "")==str(m.from_user.id)
+                if btype=="music":
+                    text="🎵 <b>WELCOME TO MUSIC DOWNLOADER</b> 🎵\n\nSearch and download songs by title, part of title or artist.\n\n🎵 Full song download\n🎤 Artist + title metadata\n🖼 Cover artwork\n⚡ Fast search\n\n🚀 Send a song name now."
+                else:
+                    text="🎬 <b>WELCOME TO VIDEO DOWNLOADER</b> 🎬\n\nDownload supported videos and photos quickly.\n\n📥 Copy a supported link and send it here.\n🌐 YouTube • TikTok • Instagram • Facebook • Pinterest • Snapchat • X/Twitter and other supported platforms.\n⚡ The download starts immediately.\n\n🚀 Send your link now."
+                inline=[]
+                if not _managed_premium_active_doc(_managed_bot_doc(bid) or {}) and not _managed_ads_removed(bid,m.from_user.id):
+                    inline.append([InlineKeyboardButton("⭐ REMOVE ADS",callback_data="mremoveads")])
+                if _creation_open():
+                    inline.append([InlineKeyboardButton("🤖 Create Your Own Bot",url=_creator_bot_url())] if _creator_bot_url() else [])
+                if owner:
+                    inline.append([InlineKeyboardButton("👑 ADMIN PANEL",callback_data=f"mbotinfo:{bid}")])
+                inline=[row for row in inline if row]
+                mb.send_message(m.chat.id,text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline) if inline else None)
+            def _help(m): _ctx(); _start(m)
+            def _create(m):
+                _ctx(); url=_creator_bot_url()
+                if not _creation_open(): mb.send_message(m.chat.id,"🔒 <b>Bot creation is currently closed.</b>",parse_mode="HTML"); return
+                if url: mb.send_message(m.chat.id,"🤖 <b>Create Your Own Bot</b>\n\nOpen the Creator Bot to choose Video Downloader or Music Downloader.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Creator Bot",url=url)]]),parse_mode="HTML")
+            def _admin(m):
+                _ctx()
+                if str(doc.get("owner_id") or "")!=str(m.from_user.id): mb.send_message(m.chat.id,"🔐 <b>Owner only.</b>",parse_mode="HTML"); return
+                typ="🎵 Music Downloader" if btype=="music" else "🎬 Video Downloader"; prem="💎 Active" if _managed_premium_active_doc(_managed_bot_doc(bid) or {}) else "🆓 Standard"
+                kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("📊 Bot Info",callback_data=f"mbotinfo:{bid}"))
+                mb.send_message(m.chat.id,f"👑 <b>BOT ADMIN PANEL</b>\n\nType: <b>{typ}</b>\nPremium: <b>{prem}</b>\n\nPremium and Wallet are managed only from the Creator Bot.",reply_markup=kb,parse_mode="HTML")
+            _MANAGED_MUSIC_PENDING.setdefault(bid,{})
+            managed_music_pending=_MANAGED_MUSIC_PENDING[bid]
+            def _music_search(m):
+                _ctx(); uid=str(m.from_user.id); q=_music_clean_text(m.text)
+                if not q or len(q)<2: return
+                managed_bots_col.update_one({"bot_id":bid},{"$addToSet":{"users":int(m.from_user.id)}})
+                if _managed_ads_gate_or_continue(mb,m.chat.id,bid,uid,"music_search",query=q):
+                    return
+                try:
+                    rows=_rapidapi_youtube_song_search(q,30) if RAPIDAPI_YT_KEY else _song_search_all(q,30)
+                    rows=[x for x in rows if _parse_duration_value(x.get("duration"))>0][:30]
+                    if not rows: mb.send_message(m.chat.id,"❌ No matching songs found. Try another title or artist."); return
+                    token2=uuid.uuid4().hex[:12]; managed_music_pending[token2]={"uid":uid,"rows":rows,"created":time.time()}; _managed_music_show(mb,m.chat.id,token2,0,managed_music_pending)
+                except Exception as e: print("Managed music search error:",repr(e)); mb.send_message(m.chat.id,"❌ Music search failed. Please try again.")
+            def _music_page(call):
+                _ctx(); p=str(call.data).split(":"); token2=p[1] if len(p)>1 else ""; page=int(p[2]) if len(p)>2 else 0; data=managed_music_pending.get(token2)
+                if not data or str(data.get("uid"))!=str(call.from_user.id): mb.answer_callback_query(call.id,"Search expired.",show_alert=True); return
+                mb.answer_callback_query(call.id); _managed_music_show(mb,call.message.chat.id,token2,page,managed_music_pending,edit_message=call.message)
+            def _music_pick(call):
+                _ctx(); p=str(call.data).split(":"); token2=p[1] if len(p)>1 else ""; idx=int(p[2]) if len(p)>2 else -1; data=managed_music_pending.get(token2)
+                if not data or str(data.get("uid"))!=str(call.from_user.id): mb.answer_callback_query(call.id,"Search expired.",show_alert=True); return
+                rows=data.get("rows") or []
+                if idx<0 or idx>=len(rows): mb.answer_callback_query(call.id,"Song unavailable.",show_alert=True); return
+                mb.answer_callback_query(call.id,"⬇️ Downloading..."); ctx=contextvars.copy_context(); download_executor_for(call.from_user.id).submit(ctx.run,_managed_download_song,mb,call.message.chat.id,rows[idx],str(call.from_user.id),bid)
+            def _text(m):
+                _ctx(); uid=str(m.from_user.id); managed_bots_col.update_one({"bot_id":bid},{"$addToSet":{"users":int(m.from_user.id)}}); link=extract_url(str(m.text or ""))
+                if not link: return
+                if _managed_ad_gate_or_continue(mb,m.chat.id,bid,uid,"download",link=link):
+                    return
+                try:
+                    if detect_platform(link)=="youtube" and not _managed_premium_active_doc(_managed_bot_doc(bid) or {}) and not is_admin(uid) and not is_quick_access(uid):
+                        duration,_=_youtube_duration_fast(link)
+                        if duration and duration>YOUTUBE_FREE_MAX_MINUTES*60 and not youtube_is_short(link):
+                            kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("💎 OPEN PREMIUM",url=_creator_bot_url() or "https://t.me/Downloadvedioytibot")); mb.send_message(m.chat.id,premium_gate_message(uid,"youtube",duration),parse_mode="HTML",reply_markup=kb); return
+                except Exception as e: print("Managed YouTube premium probe error:",repr(e))
+                ctx=contextvars.copy_context(); download_executor_for(uid).submit(ctx.run,download_media,m.chat.id,link,None,None)
+            def _remove_ads(m):
+                _ctx(); uid=str(m.from_user.id); managed_bots_col.update_one({"bot_id":bid},{"$addToSet":{"users":int(m.from_user.id)}})
+                if _managed_premium_active_doc(_managed_bot_doc(bid) or {}):
+                    mb.send_message(m.chat.id,"💎 <b>Premium is active</b> — you already have ads disabled.",parse_mode="HTML"); return
+                if _managed_ads_removed(bid,uid):
+                    mb.send_message(m.chat.id,"✅ <b>Ads are already removed permanently for this bot.</b>",parse_mode="HTML"); return
+                _managed_create_remove_ads_invoice(mb,m.chat.id,bid,uid,"3")
+            def _remove_ads_callback(call):
+                _ctx(); uid=str(call.from_user.id); mb.answer_callback_query(call.id)
+                if _managed_premium_active_doc(_managed_bot_doc(bid) or {}):
+                    mb.send_message(call.message.chat.id,"💎 <b>Premium is active</b> — advertisements are already disabled.",parse_mode="HTML"); return
+                if _managed_ads_removed(bid,uid):
+                    mb.send_message(call.message.chat.id,"✅ <b>Ads are already removed permanently for this bot.</b>",parse_mode="HTML"); return
+                _managed_create_remove_ads_invoice(mb,call.message.chat.id,bid,uid,"3")
+            def _ad_continue(call):
+                _ctx(); token=str(call.data or "").split(":",1)[1] if ":" in str(call.data or "") else ""
+                with managed_ad_pending_lock:
+                    row=managed_ad_pending.get(token)
+                if not row or str(row.get("uid"))!=str(call.from_user.id) or str(row.get("bot_id"))!=bid:
+                    mb.answer_callback_query(call.id,"This ad request expired. Send the request again.",show_alert=True); return
+                mb.answer_callback_query(call.id,"⚡ Starting...")
+                _managed_execute_ad_pending(token)
+            def _managed_video_music_callback(call):
+                _ctx(); parts=str(call.data or "").split(":",2); token2=parts[2] if len(parts)==3 else ""
+                rows_for_bid=managed_video_music_pending.get(bid) or {}
+                now_ts=time.time()
+                for old_token,old_row in list(rows_for_bid.items()):
+                    if now_ts-float(old_row.get("created",now_ts) or now_ts)>MUSIC_PENDING_TTL:
+                        rows_for_bid.pop(old_token,None)
+                data=rows_for_bid.get(token2)
+                if not data or str(data.get("uid"))!=str(call.from_user.id):
+                    mb.answer_callback_query(call.id,"This MUSIC button has expired. Download the video again.",show_alert=True); return
+                mb.answer_callback_query(call.id,"🎵 Converting to MP3...")
+                ctx=contextvars.copy_context()
+                def job():
+                    _ACTIVE_BOT.set(mb); _ACTIVE_MANAGED_META.set({"bot_id":bid,"owner_id":str(doc.get("owner_id") or ""),"username":username,"name":doc.get("name") or username,"bot_type":btype})
+                    try:
+                        status=mb.send_message(call.message.chat.id,"🎵 <b>Converting video to MP3...</b>",parse_mode="HTML")
+                        convert_link_to_mp3(call.message.chat.id,data.get("link") or "",status.message_id,data.get("local_source"),data.get("cache_dir"),data.get("source_title") or "",data.get("source_artist") or "")
+                    finally:
+                        managed_video_music_pending.get(bid,{}).pop(token2,None)
+                download_executor_for(call.from_user.id).submit(ctx.run,job)
+
+            def _info(call):
+                _ctx(); d2=_managed_bot_doc(bid) or {}; mb.answer_callback_query(call.id); mb.send_message(call.message.chat.id,f"🤖 <b>{html.escape(str(d2.get('name') or 'Downloader Bot'))}</b>\n@{html.escape(username or 'unknown')}\n\nType: <b>{'Music Downloader' if btype=='music' else 'Video Downloader'}</b>",parse_mode="HTML")
+            mb.message_handler(commands=["start"])(_start); mb.message_handler(commands=["help"])(_help); mb.message_handler(func=lambda m:m.text=="🤖 Create Your Own Bot")(_create); mb.message_handler(func=lambda m:m.text=="⭐ Remove ads")(_remove_ads); mb.message_handler(func=lambda m:m.text=="👑 ADMIN PANEL")(_admin)
+            if btype=="music": mb.message_handler(func=lambda m:bool(m.text and not str(m.text).startswith("/") and m.text not in {"🤖 Create Your Own Bot","👑 ADMIN PANEL"} and not extract_url(str(m.text))))(_music_search)
+            else: mb.message_handler(func=lambda m:bool(m.text and extract_url(str(m.text))))(_text)
+            mb.callback_query_handler(func=lambda c:c.data.startswith("msong:"))(_music_pick); mb.callback_query_handler(func=lambda c:c.data.startswith("mspage:"))(_music_page); mb.callback_query_handler(func=lambda c:c.data.startswith("mmusic:"))(_managed_video_music_callback); mb.callback_query_handler(func=lambda c:c.data=="mremoveads")(_remove_ads_callback); mb.callback_query_handler(func=lambda c:c.data.startswith("madcontinue:"))(_ad_continue); mb.callback_query_handler(func=lambda c:c.data.startswith("mbotinfo:"))(_info)
+            def _run():
+                try: mb.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=25)
+                except Exception as e: print(f"Managed bot {bid} stopped:",repr(e))
+            th=threading.Thread(target=_run,daemon=True,name=f"managed-bot-{bid}"); managed_bot_threads[bid]=th; th.start(); return mb
+        except Exception as e:
+            print("Managed bot start failed:",repr(e)); managed_bots_col.update_one({"bot_id":bid},{"$set":{"active":False,"error":str(e)[:500]}}); return None
+
+def _managed_music_show(mb,chat_id,token2,page,pending,edit_message=None):
+    data=pending.get(token2) or {}; rows=data.get("rows") or []; start=page*10; end=min(start+10,len(rows)); lines=["🔍 <b>Music Search</b>",""]
+    for i in range(start,end):
+        x=rows[i]; dur=_parse_duration_value(x.get("duration")); title=_music_clean_text(x.get("title"))
+        if dur>0 and title: lines.append(f"<b>{i+1}.</b> {html.escape(title)} {_song_duration(dur)}")
+    kb=InlineKeyboardMarkup(row_width=5)
+    for i in range(start,end): kb.insert(InlineKeyboardButton(str(i+1),callback_data=f"msong:{token2}:{i}"))
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅️",callback_data=f"mspage:{token2}:{page-1}"))
+    if end<len(rows): nav.append(InlineKeyboardButton("➡️",callback_data=f"mspage:{token2}:{page+1}"))
+    if nav: kb.row(*nav)
+    if edit_message:
+        try: mb.edit_message_text("\n".join(lines),edit_message.chat.id,edit_message.message_id,parse_mode="HTML",reply_markup=kb); return
+        except Exception: pass
+    mb.send_message(chat_id,"\n".join(lines),parse_mode="HTML",reply_markup=kb)
+
+def _best_song_cover(song, title, artist, tmp, vid=""):
+    """Resolve genuine album artwork first, then safe provider artwork fallbacks."""
+    song=song or {}
+    cover_url=""
+    try:
+        if title and artist and artist.lower()!="unknown artist":
+            meta=_music_deezer_lookup(title,artist)
+            if meta.get("artwork"): cover_url=str(meta.get("artwork"))
+            if not cover_url:
+                meta=_music_itunes_lookup(title,artist)
+                if meta.get("artwork"): cover_url=str(meta.get("artwork"))
+    except Exception as e: print("Album cover lookup skipped:",repr(e))
+    if not cover_url:
+        cover_url=str(song.get("cover") or song.get("thumbnail") or "").strip()
+    if not cover_url and vid: cover_url=_youtube_artwork_url(vid)
+    return _music_download_image(cover_url,tmp,"cover.jpg") if cover_url else None
+
+def _managed_download_song(mb,chat_id,song,uid,bid):
+    tmp=None
+    try:
+        vid=str(song.get("id") or _extract_youtube_video_id(song.get("download") or "")); rapid=_rapidapi_youtube_details(vid) if RAPIDAPI_YT_KEY and vid else None; formats=_rapid_formats(rapid) if rapid else []
+        audios=[z for z in formats if z.get("audio") and not z.get("video")]; videos=[z for z in formats if z.get("video")]; source_url=(audios[0].get("url") if audios else (videos[0].get("url") if videos else None))
+        if not source_url: raise RuntimeError("No downloadable audio")
+        tmp=os.path.join("downloads","managed_music_"+uuid.uuid4().hex); os.makedirs(tmp,exist_ok=True); raw=os.path.join(tmp,"source"); _rapid_download_file(source_url,raw,max_bytes=0)
+        title,artist=_song_audio_metadata(song)
+        catalog=_music_deezer_lookup(title,artist) or _music_itunes_lookup(title,artist)
+        if catalog.get("title"): title=_music_clean_text(catalog.get("title"))
+        if catalog.get("artist"): artist=_music_clean_text(catalog.get("artist"))
+        if catalog.get("album") and not song.get("album"): song={**song,"album":catalog.get("album")}
+        out=os.path.join(tmp,_music_safe_filename(title,artist)+".mp3"); _ffmpeg_convert_to_mp3(raw,out,bitrate="192k",timeout=180)
+        cover=_best_song_cover(song,title,artist,tmp,vid); _embed_music_metadata(out,title,artist,cover_path=cover,album=song.get("album"))
+        kwargs={"title":title,"performer":artist,"duration":int(song.get("duration") or 0),"caption":_song_caption(song),"parse_mode":"HTML"}
+        with open(out,"rb") as fh:
+            if cover and os.path.isfile(cover): kwargs["thumb"]=cover
+            try: mb.send_audio(chat_id,fh,**kwargs)
+            except Exception: kwargs.pop("thumb",None); fh.seek(0); mb.send_audio(chat_id,fh,**kwargs)
+        _record_song_download(uid,song)
+    except Exception as e: print("Managed music download error:",repr(e)); mb.send_message(chat_id,"❌ Music download failed. Please try another song.")
+    finally:
+        if tmp: shutil.rmtree(tmp,ignore_errors=True)
+
+
+def _managed_bots_startup():
+    try:
+        for d in managed_bots_col.find({"active":True,"suspended":{"$ne":True}}):
+            # Migrate the previous owner-level Premium expiry once into the bot-level field.
+            if not d.get("premium_until"):
+                owner=str(d.get("owner_id") or ""); old_until=users.get(owner,{}).get("premium_until")
+                if old_until:
+                    managed_bots_col.update_one({"bot_id":str(d.get("bot_id"))},{"$set":{"premium_until":old_until,"premium_source":"legacy_migration"}})
+                    d["premium_until"]=old_until
+            d.setdefault("bot_type","video")
+            d.setdefault("wallet_linked",False)
+            _managed_bot_start_instance(d)
+    except Exception as e: print("Managed bots startup error:",repr(e))
+
+
+def _creator_poll_loop():
+    if not CREATOR_BOT_TOKEN:
+        print("❌ CREATOR_BOT_TOKEN is not configured; managed-bot Creator is DISABLED.")
+        return
+    offset=0
+    _creator_api("deleteWebhook",{"drop_pending_updates":False})
+    me,me_err=_creator_api("getMe",{})
+    if me_err:
+        print("❌ Creator Bot getMe failed:",me_err); return
+    if not bool((me or {}).get("can_manage_bots")):
+        print("⚠️ CREATOR_BOT_TOKEN works, but Bot Management Mode is OFF. Enable it in the @BotFather Mini App.")
+    else:
+        print("✅ Creator Bot Bot Management Mode is ON.")
+    _creator_set_commands()
+    print("🤖 Creator Bot is starting...")
+    while True:
+        try:
+            updates,err=_creator_api("getUpdates",{"offset":offset,"timeout":25,"allowed_updates":["message","callback_query","managed_bot"]},timeout=35)
+            if err:
+                print("Creator getUpdates error:",err); time.sleep(3); continue
+            for upd in updates or []:
+                offset=int(upd.get("update_id",offset))+1
+                try:
+                    if upd.get("managed_bot"):
+                        _creator_on_managed_update(upd)
+                    msg=upd.get("message") or {}
+                    if msg.get("managed_bot_created"):
+                        _creator_on_managed_bot_created(msg)
+                    if upd.get("callback_query"):
+                        _creator_callback(upd["callback_query"])
+                    if msg.get("text") is not None:
+                        uid=str((msg.get("from") or {}).get("id") or ""); chat=msg.get("chat",{}).get("id")
+                        if uid and chat:
+                            sess=_creator_session(uid); st=str(sess.get("state") or "")
+                            _creator_handle_text(uid,chat,_message_entities_to_html(msg) if st.startswith("admin_") else msg.get("text"))
+                except Exception as e:
+                    print("Creator update error:",repr(e))
+        except Exception as e:
+            print("Creator polling loop error:",repr(e)); time.sleep(3)
+
+
+def _creation_commands_refresh():
+    try:
+        cmds=[BotCommand("start","Start the downloader"),BotCommand("help","Show commands")]
+        if _creation_open(): cmds.append(BotCommand("addbot","Create and manage your downloader bots"))
+        _main_bot.set_my_commands(cmds)
+    except Exception as e: print("Main bot command refresh failed:",repr(e))
+
+
+# Main-bot admin controls for the dedicated Creator Bot.
+@bot.message_handler(func=lambda m: m.text == "📤 SEND TO CREATE BOT")
+def admin_send_to_creator_start(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"📤 <b>SEND TO CREATE BOT</b>\n\nSend the announcement text. Every main-bot user will receive it with a <b>Create Now</b> button.")
+    bot.register_next_step_handler(msg,admin_send_to_creator_process)
+
+def admin_send_to_creator_process(m):
+    if not is_admin(m.from_user.id): return
+    text_msg=_admin_text_html(m); url=_creator_bot_url()
+    if not text_msg or not url:
+        bot.send_message(m.chat.id,"❌ Creator Bot is not configured. Set CREATOR_BOT_TOKEN (and optionally CREATOR_BOT_USERNAME) in Railway."); return
+    kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🚀 Create Now",url=url))
+    sent=failed=0
+    for uid in list(users.keys()):
+        try: bot.send_message(int(uid),text_msg,reply_markup=kb,parse_mode="HTML"); sent+=1
+        except Exception: failed+=1
+    bot.send_message(m.chat.id,f"✅ <b>Creator announcement sent</b>\n\n📨 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🟢 OPEN VERIFY CREATE BOT")
+def admin_open_verify_create_bot(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("create_bot_verify_required",True)
+    bot.send_message(m.chat.id,"🟢 <b>VERIFY-BEFORE-CREATE OPEN</b>\n\nNew bot creators must verify first.",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔴 CLOSE VERIFY CREATE BOT")
+def admin_close_verify_create_bot(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("create_bot_verify_required",False)
+    bot.send_message(m.chat.id,"🔴 <b>VERIFY-BEFORE-CREATE CLOSED</b>\n\nUsers are no longer required to verify before creating a bot.",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🟢 OPEN CREATE CAPTION")
+def admin_open_create_caption(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("create_bot_caption_enabled",True)
+    bot.send_message(m.chat.id,"🟢 <b>CREATE CAPTION OPEN</b>\n\nManaged downloader bots will send the configured creation/promotion message after downloads.",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔴 CLOSE CREATE CAPTION")
+def admin_close_create_caption(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("create_bot_caption_enabled",False)
+    bot.send_message(m.chat.id,"🔴 <b>CREATE CAPTION CLOSED</b>\n\nThe creation/promotion message is hidden. Existing bots continue downloading.",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "✏️ SET CREATE CAPTION")
+def admin_set_create_caption(m):
+    if not is_admin(m.from_user.id): return
+    current=_create_caption_text()
+    msg=bot.send_message(m.chat.id,"✏️ <b>SET CREATE CAPTION</b>\n\nSend the new message. HTML is allowed.\n\nCurrent:\n"+current)
+    bot.register_next_step_handler(msg,admin_set_create_caption_process)
+
+def admin_set_create_caption_process(m):
+    if not is_admin(m.from_user.id): return
+    text=_admin_text_html(m)
+    if not text:
+        bot.send_message(m.chat.id,"❌ Message cannot be empty."); return
+    set_setting("create_bot_caption_text",text); set_setting("create_bot_caption_enabled",True)
+    bot.send_message(m.chat.id,"✅ <b>Create caption saved and opened.</b>",reply_markup=admin_menu())
+
+@bot.message_handler(commands=['verifycreate'])
+def verifycreate_command(m):
+    uid=str(m.from_user.id)
+    if user_is_verified(uid):
+        bot.send_message(m.chat.id,"✅ <b>Your account is already verified.</b>\n\nReturn to the Creator Bot and press <b>Create My Bot</b>.")
+        return
+    kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🔐 VERIFY ACCOUNT",callback_data="start_verify_flow"))
+    bot.send_message(m.chat.id,"🔐 <b>Verify before creating a bot</b>\n\nChoose one of the available verification methods below. After verification, return to the Creator Bot.",reply_markup=kb)
+
+# Compatibility aliases retained so older callback/menu references do not crash.
+@bot.message_handler(func=lambda m: m.text == "🤖 Open Creation")
+def legacy_open_creation(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("bot_creation_enabled",True); _creation_commands_refresh(); _refresh_all_user_menus("🤖 Bot creation is now OPEN.")
+    bot.send_message(m.chat.id,"🟢 <b>BOT CREATION OPEN</b>",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🔒 Close Creation")
+def legacy_close_creation(m):
+    if not is_admin(m.from_user.id): return
+    set_setting("bot_creation_enabled",False); _creation_commands_refresh(); _refresh_all_user_menus("🔒 Bot creation is now CLOSED.")
+    bot.send_message(m.chat.id,"🔴 <b>BOT CREATION CLOSED</b>\nExisting managed bots continue running.",reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "🤖 See All Bots")
+def legacy_see_all_bots(m):
+    if not is_admin(m.from_user.id): return
+    rows=list(managed_bots_col.find().sort("created_at",-1).limit(100)); lines=["🤖 <b>ALL CREATED BOTS</b>",""]
+    if not rows: lines.append("No bots yet.")
+    for d in rows: lines.append(f"• @{html.escape(str(d.get('username') or 'unknown'))} — owner <code>{html.escape(str(d.get('owner_id') or ''))}</code> — {'🟢' if d.get('active',True) and not d.get('suspended') else '🔴'}")
+    bot.send_message(m.chat.id,"\n".join(lines),reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.text == "📢 Broadcast All Bots")
+def legacy_broadcast_all_bots(m):
+    if not is_admin(m.from_user.id): return
+    msg=bot.send_message(m.chat.id,"📢 Send the message to broadcast through all active created bots. Premium owners are skipped for promotional broadcasts.")
+    bot.register_next_step_handler(msg,lambda x:_legacy_broadcast_step(x))
+
+def _legacy_broadcast_step(m):
+    if not is_admin(m.from_user.id): return
+    sent,failed=_creator_broadcast_all_bots((m.text or '').strip()); bot.send_message(m.chat.id,f"📢 <b>Broadcast complete</b>\n\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=admin_menu())
+
+# Main-bot entry points for the dedicated Creator Bot.
+@bot.message_handler(commands=['help'])
+def main_help_command(m):
+    lines=[
+        "🆘 <b>AVAILABLE COMMANDS</b>","",
+        "/start — Start the downloader",
+        "/help — Show commands",
+        "/view — View profile",
+        "/balance — Check balance",
+        "/refer — Referral link",
+        "/ping — Check speed",
+        "/language — Change language",
+    ]
+    if _creation_open(): lines += ["/addbot — Open Bot Creator", "/add bot — Open Bot Creator"]
+    lines += ["", "🔗 Send a supported video link to download.", "🎵 After a video download, tap MUSIC for MP3."]
+    bot.send_message(m.chat.id,"\n".join(lines),parse_mode="HTML")
+
+@bot.message_handler(commands=['addbot'])
+@bot.message_handler(commands=['add'])
+def main_addbot_command(m):
+    text=(m.text or '').strip().lower()
+    if text.startswith('/add ') and text.split(maxsplit=1)[1] != 'bot': return
+    if not _creation_open():
+        bot.send_message(m.chat.id,"🔒 <b>Bot Creation is Closed</b>\n\nExisting created bots continue working.")
+        return
+    url=_creator_bot_url()
+    if not url:
+        bot.send_message(m.chat.id,"❌ Creator Bot is not configured yet. Admin must set <code>CREATOR_BOT_TOKEN</code> in Railway.")
+        return
+    kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🚀 Open Creator Bot",url=url))
+    bot.send_message(m.chat.id,"🤖 <b>Bot Creator</b>\n\nCreate your own downloader bot directly through Telegram's official Managed Bot system.",reply_markup=kb)
+
+@bot.message_handler(func=lambda m: m.text == "🤖 Create Your Own Bot")
+def main_create_bot_button(m):
+    if not _creation_open():
+        bot.send_message(m.chat.id,"🔒 <b>Bot Creation is Closed</b>")
+        return
+    url=_creator_bot_url()
+    if not url:
+        bot.send_message(m.chat.id,"❌ Creator Bot is not configured. Set <code>CREATOR_BOT_TOKEN</code> in Railway.")
+        return
+    kb=InlineKeyboardMarkup(); kb.add(InlineKeyboardButton("🚀 Create Now",url=url))
+    bot.send_message(m.chat.id,"🤖 <b>Create Your Own Downloader Bot</b>\n\nThe Creator Bot will guide you through name, username and Telegram's official creation screen.",reply_markup=kb)
+
+# ================= START HANDLER =================
+
+
+
+
+
+
+
+# ================= VERIFY BOT START =================
+
+
+# ================= CHECK MEMBERSHIP =================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Backward-compatible handler for old keyboards.
+
+# ================= CUSTOMER AI — DEDICATED, ACCOUNT-AWARE SUPPORT BOT =================
+# The Customer AI is a separate BotFather bot. It shares the same MongoDB user
+# database as the main bot, so it can answer using the user's live account data.
+# No reply/inline keyboards are used inside the Customer AI: users operate it
+# with /commands or normal natural-language messages.
+
+AI_SUPPORT_PENDING=set()
+_CUSTOMER_AI_USERNAME_CACHE=None
+
+CUSTOMER_AI_SYSTEM_PROMPT = """
+You are the dedicated Customer AI for this Telegram service. Be accurate,
+helpful, calm and professional. Understand English, Somali, Arabic, French and Spanish. Never invent
+account data, balances, Premium expiry, verification state, withdrawal status,
+crypto prices, bans, or system settings. Use live MongoDB/system data when
+available. The Customer AI knows the complete user-facing system: account,
+profile, balance, blocked/hold, balance lock, Premium/trial, verification,
+Gmail/D7 SMS/WaForge WhatsApp, crypto, fees, deposits, YouTube Premium-only,
+downloads, music/MP3, referral, withdrawal, Force Join, language and support.
+For admins it can also inspect system health and user reports through admin-only
+commands. It must never expose another user's private data to a normal user.
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------- Main bot entry: opens the dedicated Customer AI bot ----------
+
+
+
+# ---------- Dedicated Customer AI bot handlers ----------
+if customer_ai_bot:
+    @customer_ai_bot.message_handler(commands=['start'])
+    def customer_ai_start(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            users[uid]={"username":message.from_user.username or "","first_name":message.from_user.first_name or "User",
+                        "balance":0.0,"blocked":0.0,"ref":random_ref(),"bot_id":random_botid(),"invited":0,"banned":False,
+                        "verified":False,"email_verified":False,"phone_verified":False,"whatsapp_verified":False,"verification_method":None,
+                        "balance_locked":False,"balance_activation_code":None,"balance_lock_until":None,"quick_access":False,"youtube_30m":False,
+                        "premium_until":None,"premium_warning_sent":False,"trial_used":False,"trial_pending":False,"trial_version_used":None,
+                        "trial_pending_version":None,"referral_50_rewarded":False,"referred_by":None,"joined_date":datetime.now().strftime("%Y-%m-%d"),
+                        "last_seen_at":datetime.now(timezone.utc).isoformat(),"month":now_month(),"language":None,"customer_ai_language":None,"currency":"USD","balance_asset":"USD",
+                        "gender":None,"city":None}
+            save_user(uid)
+        else:
+            users[uid]["username"]=message.from_user.username or users[uid].get("username","")
+            users[uid]["first_name"]=message.from_user.first_name or users[uid].get("first_name","User")
+            touch_user(uid)
+        if users[uid].get("banned"):
+            customer_ai_bot.send_message(message.chat.id,"🚫 You are banned from this service. / Waxaad ka mamnuucan tahay adeeggan."); return
+        if not _ai_language(uid):
+            customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text(),reply_markup=_ai_language_keyboard()); return
+        lang=_ai_language(uid)
+        customer_ai_bot.send_message(message.chat.id,
+            ("🤖 <b>SOO DHAWOW CUSTOMER SUPPORT</b>\n\nQor dhibaatadaada si caadi ah. Waxaan kaa caawin karaa downloads, account, lacag, Premium, referral, verification iyo khaladaadka system-ka.\n\n<code>/help</code> — Cawimaad\n<code>/language</code> — Beddel luqadda."
+             if lang=="so" else
+             "🤖 <b>WELCOME TO CUSTOMER SUPPORT</b>\n\nDescribe your problem naturally. I can help with downloads, account, balance, Premium, referrals, verification and common service problems.\n\nUse <code>/help</code> or tap Contact admin directly for human support."),reply_markup=_support_start_keyboard(lang))
+
+    @customer_ai_bot.message_handler(commands=['english','en','somali','so','arabic','ar','french','fr','spanish','es'])
+    def customer_ai_language_commands(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        cmd=(message.text or "").split()[0].lower()
+        mapping={"/english":"en","/en":"en","/somali":"so","/so":"so","/arabic":"ar","/ar":"ar","/french":"fr","/fr":"fr","/spanish":"es","/es":"es"}
+        code=mapping.get(cmd)
+        if code:
+            _set_ai_language(uid,code)
+            customer_ai_bot.send_message(message.chat.id,{"en":"🇬🇧 <b>English selected.</b>","so":"🇸🇴 <b>Soomaali ayaa la doortay.</b>","ar":"🇸🇦 <b>تم اختيار العربية.</b>","fr":"🇫🇷 <b>Français sélectionné.</b>","es":"🇪🇸 <b>Español seleccionado.</b>"}[code])
+
+    @customer_ai_bot.message_handler(commands=['language','lang'])
+    def customer_ai_language(message):
+        customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text(),reply_markup=_ai_language_keyboard())
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith('cai_lang:'))
+    def customer_ai_language_callback(call):
+        uid=str(call.from_user.id); code=call.data.split(':',1)[1]
+        if uid not in users or code not in LANGUAGES:
+            customer_ai_bot.answer_callback_query(call.id,'Language unavailable.',show_alert=True); return
+        _set_ai_language(uid,code)
+        customer_ai_bot.answer_callback_query(call.id,'✅')
+        customer_ai_bot.edit_message_text(f"✅ {LANGUAGES[code]['name']} selected.",call.message.chat.id,call.message.message_id,parse_mode='HTML')
+
+    @customer_ai_bot.message_handler(commands=['help'])
+    def customer_ai_help(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_help_text(lang,is_admin(uid)))
+
+    @customer_ai_bot.message_handler(commands=['balance'])
+    def customer_ai_balance(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_chat_action(message.chat.id,"typing"); customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"balance",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['profile','id'])
+    def customer_ai_profile(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_user_report(uid,False,lang))
+
+    @customer_ai_bot.message_handler(commands=['premium','trial'])
+    def customer_ai_premium(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"premium trial",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['verification','verify','otp'])
+    def customer_ai_verification(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"verification otp",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['crypto'])
+    def customer_ai_crypto(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"crypto usdt btc",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['downloads','download'])
+    def customer_ai_downloads(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"download video tiktok youtube instagram",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['music','mp3'])
+    def customer_ai_music(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"music mp3",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['withdrawal','withdraw'])
+    def customer_ai_withdrawal(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_withdrawal_report(uid,lang))
+
+    @customer_ai_bot.message_handler(commands=['referral','refer'])
+    def customer_ai_referral(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"referral",is_admin(uid),lang))
+
+    @customer_ai_bot.message_handler(commands=['system'])
+    def customer_ai_system(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,_ai_intent_answer(uid,"system dashboard",True,lang))
+        else:
+            customer_ai_bot.send_message(message.chat.id,_ai_system_overview(lang,False))
+
+    @customer_ai_bot.message_handler(commands=['user'])
+    def customer_ai_user(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command." if lang=="en" else "❌ Command-kan Admin oo keliya ayaa isticmaali kara."); return
+        parts=message.text.split(maxsplit=1)
+        if len(parts)<2:
+            customer_ai_bot.send_message(message.chat.id,"Usage: <code>/user USER_ID</code> or <code>/user BOT_ID</code> or <code>/user @username</code>"); return
+        found=_ai_find_user(parts[1])
+        customer_ai_bot.send_message(message.chat.id,_ai_user_report(found,True,lang) if found else ("❌ User not found." if lang=="en" else "❌ User-ka lama helin."))
+
+    @customer_ai_bot.message_handler(commands=['panel','admin','stats'])
+    def customer_ai_admin_panel(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command."); return
+        kb=InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("📊 USERS",callback_data="cai:users"),InlineKeyboardButton("💰 BALANCES",callback_data="cai:balances"))
+        kb.add(InlineKeyboardButton("💸 WITHDRAWALS",callback_data="cai:withdrawals"),InlineKeyboardButton("👑 ADMINS",callback_data="cai:admins"))
+        kb.add(InlineKeyboardButton("📢 BROADCAST",callback_data="cai:broadcast"),InlineKeyboardButton("🔄 REFRESH",callback_data="cai:users"))
+        customer_ai_bot.send_message(message.chat.id,"🤖 <b>CUSTOMER AI ADMIN PANEL</b>\n\nChoose an admin action:",reply_markup=kb)
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith("cai:"))
+    def customer_ai_admin_callback(call):
+        uid=str(call.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.answer_callback_query(call.id,"Admin only",show_alert=True); return
+        action=call.data.split(":",1)[1]
+        if action=="broadcast":
+            msg=customer_ai_bot.send_message(call.message.chat.id,"📢 Send the broadcast text for all users:")
+            customer_ai_bot.register_next_step_handler(msg,customer_ai_broadcast_process)
+            customer_ai_bot.answer_callback_query(call.id)
+            return
+        customer_ai_bot.answer_callback_query(call.id)
+        customer_ai_bot.send_message(call.message.chat.id,_admin_stats_text(action if action in {"users","balances","withdrawals","admins"} else "users","en"))
+
+    def customer_ai_broadcast_process(message):
+        if not is_admin(message.from_user.id): return
+        text=(message.text or "").strip()
+        if not text:
+            customer_ai_bot.send_message(message.chat.id,"❌ Empty message."); return
+        sent=0
+        for uid in list(users):
+            try: customer_ai_bot.send_message(int(uid),text); sent+=1
+            except: pass
+        customer_ai_bot.send_message(message.chat.id,f"✅ Broadcast sent to {sent} users.")
+
+    @customer_ai_bot.message_handler(commands=['streak','health','broadcast'])
+    def customer_ai_extra_admin_commands(message):
+        uid=str(message.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command."); return
+        cmd=(message.text or "").split()[0].lower()
+        if cmd=="/streak":
+            customer_ai_bot.send_message(message.chat.id,"🔥 Streak control is available in the main bot Admin Panel → 🔥 STREAK SYSTEM.")
+        elif cmd=="/health":
+            customer_ai_bot.send_message(message.chat.id,f"🟢 <b>HEALTH</b>\n\nUsers: {len(users)}\nDownloads: {int(videos_data.get('total',0) or 0)}\nAdmins: {len(get_admin_ids())}\nCustomer AI: {'ONLINE' if customer_ai_bot else 'OFFLINE'}")
+        elif cmd=="/broadcast":
+            msg=customer_ai_bot.send_message(message.chat.id,"📢 Send broadcast text:"); customer_ai_bot.register_next_step_handler(msg,customer_ai_broadcast_process)
+
+    @customer_ai_bot.message_handler(commands=['users','balances','withdrawals','withdrawal_stats','banned','locks','admins'])
+    def customer_ai_admin_reports(message):
+        uid=str(message.from_user.id); lang=_ai_language(uid) or "en"
+        if not is_admin(uid):
+            customer_ai_bot.send_message(message.chat.id,"❌ Admin-only command." if lang=="en" else "❌ Command-kan Admin oo keliya ayaa isticmaali kara."); return
+        cmd=(message.text or "").split()[0].lower()
+        kind={"/users":"users","/balances":"balances","/withdrawals":"withdrawals","/withdrawal_stats":"withdrawals","/banned":"banned","/locks":"locks","/admins":"admins"}.get(cmd,"users")
+        customer_ai_bot.send_message(message.chat.id,_admin_stats_text(kind,lang))
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text and m.text.strip() in _support_button_labels()))
+    def customer_ai_support_button(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        _support_begin(customer_ai_bot,message)
+
+    @customer_ai_bot.callback_query_handler(func=lambda c:c.data.startswith("ticket:"))
+    def customer_ai_ticket_admin_callback(call):
+        uid=str(call.from_user.id)
+        if not is_admin(uid):
+            customer_ai_bot.answer_callback_query(call.id,"❌ Admin only",show_alert=True); return
+        parts=(call.data or "").split(":",2)
+        if len(parts)!=3: return
+        action,code=parts[1],parts[2]
+        ticket=_support_get_ticket(code)
+        if not ticket:
+            customer_ai_bot.answer_callback_query(call.id,"Ticket not found",show_alert=True); return
+        if action in ("fix","reject"):
+            status="fixed" if action=="fix" else "rejected"
+            updated=_support_update_status(code,status,uid) or ticket
+            _support_notify_user(updated,action)
+            customer_ai_bot.answer_callback_query(call.id,"✅ Fixed" if action=="fix" else "❌ Rejected")
+            try: customer_ai_bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+            except Exception: pass
+            customer_ai_bot.send_message(call.message.chat.id,("🔧" if action=="fix" else "❌")+f" <b>Ticket {html.escape(code)} marked {status.upper()}.</b>",parse_mode="HTML")
+        elif action=="contact":
+            updated=_support_update_status(code,"contacting",uid) or ticket
+            SUPPORT_ADMIN_CONTACT_PENDING[uid]={"ticket_code":code,"user_id":str(updated.get("user_id"))}
+            customer_ai_bot.answer_callback_query(call.id,"💬 Send your message")
+            customer_ai_bot.send_message(call.message.chat.id,f"💬 <b>Contact User</b>\n\nSend the message you want to send to ticket <code>{html.escape(code)}</code>.",parse_mode="HTML")
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text and str(m.from_user.id) in SUPPORT_ADMIN_CONTACT_PENDING))
+    def customer_ai_admin_contact_send(message):
+        aid=str(message.from_user.id)
+        if not is_admin(aid): return
+        state=SUPPORT_ADMIN_CONTACT_PENDING.pop(aid,None)
+        if not state: return
+        target=int(state["user_id"]); code=state["ticket_code"]; text=(message.text or "").strip()
+        if not text: return
+        try:
+            customer_ai_bot.send_message(target,f"👤 <b>Admin message</b>\n\n{html.escape(text)}\n\n🎫 Ticket: <code>{html.escape(code)}</code>",parse_mode="HTML")
+            customer_ai_bot.send_message(message.chat.id,f"✅ Message sent to user for ticket <code>{html.escape(code)}</code>.",parse_mode="HTML")
+        except Exception as e:
+            customer_ai_bot.send_message(message.chat.id,f"❌ Could not contact user: <code>{html.escape(str(e))}</code>",parse_mode="HTML")
+
+    @customer_ai_bot.message_handler(content_types=["contact"])
+    def customer_ai_support_contact(message):
+        uid=str(message.from_user.id); ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+        if not ticket: return
+        contact=getattr(message,"contact",None)
+        if contact and getattr(contact,"user_id",None) not in (None,int(uid)):
+            customer_ai_bot.send_message(message.chat.id,"❌ Please share your own phone number using Telegram's contact button.")
+            return
+        ticket["phone"]=str(getattr(contact,"phone_number","") or "Not provided")
+        _support_email_step(customer_ai_bot,message,uid)
+
+    @customer_ai_bot.message_handler(func=lambda m: str(m.from_user.id) in SUPPORT_TICKET_REQUESTS and bool(m.text))
+    def customer_ai_support_flow(message):
+        uid=str(message.from_user.id); ticket=SUPPORT_TICKET_REQUESTS.get(uid)
+        if not ticket: return
+        text=(message.text or "").strip()
+        if not ticket.get("phone"):
+            if text.lower() in {"skip","skip phone","⏭️ skip phone"}:
+                ticket["phone"]="Not provided"; _support_email_step(customer_ai_bot,message,uid)
+            return
+        if not ticket.get("email"):
+            if text.lower() in {"skip","skip gmail","⏭️ skip gmail"}:
+                ticket["email"]="Not provided"; _support_issue_step(customer_ai_bot,message,uid); return
+            if re.match(r"^[^\s@]+@gmail\.com$",text,re.I) or re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$",text):
+                ticket["email"]=text; _support_issue_step(customer_ai_bot,message,uid)
+            else: customer_ai_bot.send_message(message.chat.id,"❌ Please enter a valid Gmail/email address or tap Skip Gmail.")
+            return
+        if text.lower() in {"cancel","❌ cancel","/cancel"}:
+            SUPPORT_TICKET_REQUESTS.pop(uid,None); customer_ai_bot.send_message(message.chat.id,"❌ Ticket cancelled.",reply_markup=ReplyKeyboardRemove()); return
+        ticket["issue"]=text; _finish_support_ticket(customer_ai_bot,message,uid)
+
+    @customer_ai_bot.message_handler(func=lambda m: bool(m.text))
+    def customer_ai_message(message):
+        uid=str(message.from_user.id)
+        if uid not in users:
+            customer_ai_start(message); return
+        if users[uid].get("banned"):
+            customer_ai_bot.send_message(message.chat.id,"🚫 You are banned from this service."); return
+        touch_user(uid)
+        lang=_ai_language(uid)
+        if not lang:
+            customer_ai_bot.send_message(message.chat.id,_ai_choose_language_text()); return
+        customer_ai_bot.send_chat_action(message.chat.id,"typing")
+        answer=_ai_intent_answer(uid,message.text or "",is_admin(uid),lang)
+        customer_ai_bot.send_message(message.chat.id,answer)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================= NEW FEATURE: CUSTOM REFERRAL CODES & PAY =================
+
+
+
+
+
+
+
+
+
+
+# ================= NEW FEATURE: SEND VERIFY BROADCAST =================
+
+
+
+# ================= LINK HANDLER =================
+
+
+# ================= PREMIUM SYSTEM =================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================= PREMIUM EXTRA PLATFORMS =================
+PLATFORM_PATTERNS.update({
+    "reddit": ("reddit.com", "redd.it"),
+    "threads": ("threads.net",),
+    "likee": ("likee.video", "like.video"),
+    "vimeo": ("vimeo.com",),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+    "soundcloud": ("soundcloud.com",),
+    "twitch": ("twitch.tv",),
+    "tumblr": ("tumblr.com",),
+    "streamable": ("streamable.com",),
+    "odnoklassniki": ("ok.ru",),
+})
+PREMIUM_EXTRA_PLATFORMS = ["Reddit", "Threads", "Likee", "Vimeo", "Dailymotion", "SoundCloud", "Twitch", "Tumblr", "Streamable", "OK.ru"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================= PREMIUM VERIFICATION CONTROL =================
+
+# ================= ADMIN BALANCE LOCK / VIEW MANAGEMENT =================
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================= ADMIN PREMIUM MANAGEMENT =================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ================= NEW USER FEATURES =================
+
+
+
+
+
+
+
+
+
+# ================= TRIAL / REFERRAL / RATING / USER ADMIN =================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Localized main actions.
+_ACTIONS={}
+for _lang,_d in MAIN_LABELS.items():
+    for _key,_label in _d.items(): _ACTIONS[_label]=_key
+
+
+
+
+# ================= MAIN RUN LOOP =================
+
+if __name__ == "__main__":
+    try: _creation_commands_refresh()
+    except Exception as e: print("Creation command refresh warning:",repr(e))
+    try: _start_managed_ad_http_server()
+    except Exception as e: print("Managed ad gate startup warning:",repr(e))
+    threading.Thread(target=_managed_bots_startup, daemon=True, name="managed-bot-startup").start()
+    threading.Thread(target=_creator_poll_loop, daemon=True, name="creator-bot-poller").start()
+    threading.Thread(target=premium_expiry_worker, daemon=True).start()
+    threading.Thread(target=market_refresh_worker, daemon=True).start()
+    threading.Thread(target=conversion_hold_worker, daemon=True).start()
+    threading.Thread(target=balance_lock_worker, daemon=True).start()
+    threading.Thread(target=streak_worker, daemon=True).start()
+    try: refresh_market_rates(force=True)
+    except Exception as e: print("Initial market refresh failed:", e)
+    try: migrate_legacy_ledger_once()
+    except Exception as e: print("Ledger migration warning:", e)
+    print("🤖 Bot 1 and Bot 2 are starting...")
+    print(f"🟢 WaForge WhatsApp configured: {bool(WAFORGE_API_KEY)} | D7 SMS configured: {bool(D7_TOKEN)}")
+    print("📦 Telegram upload limits: Admin-controlled FREE/TRIAL/PREMIUM values stored in MongoDB")
+    
+    def run_bot2():
+        try:
+            bot2.infinity_polling(skip_pending=True)
+        except Exception as e:
+            print(f"Bot 2 Error: {e}")
+            
+    threading.Thread(target=run_bot2, daemon=True).start()
+
+    if customer_ai_bot:
+        def run_customer_ai_bot():
+            try:
+                print("🤖 Dedicated Customer AI bot is starting...")
+                customer_ai_bot.infinity_polling(skip_pending=True)
+            except Exception as e:
+                print(f"Customer AI Bot Error: {e}")
+        threading.Thread(target=run_customer_ai_bot, daemon=True).start()
+    else:
+        print("⚠️ CUSTOMER_AI_BOT_TOKEN is not configured; dedicated Customer AI bot is disabled.")
+    
+    try:
+        bot.infinity_polling(skip_pending=True)
+    except Exception as e:
+        print(f"Bot 1 Error: {e}")
